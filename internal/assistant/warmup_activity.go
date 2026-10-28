@@ -3,6 +3,7 @@ package assistant
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"io"
 	"io/fs"
 	"os"
@@ -15,46 +16,73 @@ import (
 // postpone a synthetic request, never proof that a particular live identity
 // owns a task. A normal user request will start the window without our ping.
 func (r Reader) recentActivity(sources []string, now time.Time) bool {
+	busy, err := r.activityStatus(sources, now)
+	return busy || err != nil
+}
+
+func (r Reader) activityStatus(sources []string, now time.Time) (bool, error) {
+	if len(sources) == 0 {
+		return false, errors.New("账号活动来源未知，暂缓预热")
+	}
 	// A stashed login does not identify a running client. Conservatively check
 	// both session roots instead of assuming the backup account is idle.
 	for _, source := range sources {
 		if source == "CC Switch 暂存" {
-			return r.recentActivity([]string{"Desktop", "CLI"}, now)
+			return r.activityStatus([]string{"Desktop", "CLI"}, now)
 		}
 	}
 	for _, source := range sources {
+		if source != "Desktop" && source != "CLI" {
+			return false, errors.New("账号活动来源未知，暂缓预热")
+		}
 		dir := ".codex"
 		if source == "CLI" {
 			dir = ".codex-cli"
 		}
 		root := filepath.Join(r.Home, dir, "sessions")
-		if real, err := filepath.EvalSymlinks(root); err == nil {
-			root = real
+		real, err := filepath.EvalSymlinks(root)
+		if err != nil {
+			if os.IsNotExist(err) {
+				// A genuinely absent history root is normal for an unused client.
+				// An existing broken link or inaccessible directory is unknown.
+				if _, statErr := os.Lstat(root); os.IsNotExist(statErr) {
+					continue
+				}
+			}
+			return false, errors.New(source + " 会话目录无法读取，活动状态未知；暂缓预热")
 		}
+		root = real
 		busy := false
-		_ = filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
-			if err != nil || entry.IsDir() || !strings.HasSuffix(path, ".jsonl") {
+		walkErr := filepath.WalkDir(root, func(path string, entry fs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if entry.IsDir() || !strings.HasSuffix(path, ".jsonl") {
 				return nil
 			}
 			info, err := entry.Info()
-			if err != nil || now.Sub(info.ModTime()) > 5*time.Minute {
+			if err != nil {
+				return err
+			}
+			if now.Sub(info.ModTime()) > 5*time.Minute {
 				return nil
 			}
 			file, err := os.Open(path)
 			if err != nil {
-				busy = true
-				return fs.SkipAll
+				return err
 			}
 			start := info.Size() - (256 << 10)
 			if start < 0 {
 				start = 0
 			}
-			_, _ = file.Seek(start, io.SeekStart)
+			if _, err := file.Seek(start, io.SeekStart); err != nil {
+				_ = file.Close()
+				return err
+			}
 			data, err := io.ReadAll(io.LimitReader(file, 256<<10))
 			_ = file.Close()
 			if err != nil {
-				busy = true
-				return fs.SkipAll
+				return err
 			}
 			found, open := false, false
 			for _, line := range bytes.Split(data, []byte("\n")) {
@@ -82,9 +110,12 @@ func (r Reader) recentActivity(sources []string, now time.Time) bool {
 			}
 			return nil
 		})
+		if walkErr != nil {
+			return false, errors.New(source + " 会话记录无法读取，活动状态未知；暂缓预热")
+		}
 		if busy {
-			return true
+			return true, nil
 		}
 	}
-	return false
+	return false, nil
 }

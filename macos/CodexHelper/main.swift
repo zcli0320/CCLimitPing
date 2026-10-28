@@ -205,6 +205,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         warmup = NSButton(checkboxWithTitle: "自动预热五小时窗口", target: self, action: #selector(toggleWarmup))
         warmup.isEnabled = false
         warmupCheck.target = self; warmupCheck.action = #selector(checkWarmupNow); warmupCheck.bezelStyle = .rounded
+        warmupCheck.toolTip = "立即重新查询账号额度，仅检查，不发送预热请求；自动预热继续按原策略调度。"
         warmupCheck.isEnabled = false
         add(row([warmup, spacer(), warmupCheck]), to: stack)
         scheduleLabel.font = .systemFont(ofSize: 11); scheduleLabel.textColor = .secondaryLabelColor
@@ -212,7 +213,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         scheduleButton.target = self; scheduleButton.action = #selector(editWarmupSchedule); scheduleButton.bezelStyle = .rounded
         add(row([scheduleLabel, spacer(), scheduleButton]), to: stack)
         warmupStatus.font = .systemFont(ofSize: 11); warmupStatus.textColor = .secondaryLabelColor
-        warmupStatus.maximumNumberOfLines = 3
+        warmupStatus.maximumNumberOfLines = 4
         add(warmupStatus, to: stack)
         add(separator(), to: stack)
         add(row([label("会话 · 按项目收纳", size: 13, weight: .semibold, color: .labelColor), spacer(), countLabel]), to: stack)
@@ -613,15 +614,16 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         }
     }
 
-    @objc func checkWarmupNow() { lastWarmupCheck = .distantPast; runWarmupCheckIfDue() }
-    func runWarmupCheckIfDue() {
+    @objc func checkWarmupNow() { lastWarmupCheck = .distantPast; runWarmupCheckIfDue(refreshOnly: true) }
+    func runWarmupCheckIfDue(refreshOnly: Bool = false) {
         guard fixture == nil, warmupReport?.enabled == true, !warmupChecking, !shuttingDown,
               Date().timeIntervalSince(lastWarmupCheck) >= 60 else { return }
         warmupChecking = true; lastWarmupCheck = Date(); updateWarmupUI()
         let revision = warmupControlRevision
         let bridge = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/codex-helper")
+        let arguments = ["warmup", refreshOnly ? "refresh" : "check"]
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let report = try? JSONDecoder().decode(WarmupReport.self, from: BridgeClient.read(executable: bridge, arguments: ["warmup","check"], timeout: 220, maximumBytes: 1 << 20, onStart: { process in
+            let report = try? JSONDecoder().decode(WarmupReport.self, from: BridgeClient.read(executable: bridge, arguments: arguments, timeout: 220, maximumBytes: 1 << 20, onStart: { process in
                 DispatchQueue.main.sync {
                     if self?.shuttingDown == true { process.terminate() }
                     else { self?.warmupProcess = process }

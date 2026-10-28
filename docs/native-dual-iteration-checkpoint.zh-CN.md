@@ -4,7 +4,7 @@
 
 ## 当前结论（优先于下方历史时间线）
 
-当前安装为0.3.9/build21，含手动替代核查、独立CLI进程清理、退出请求10秒时限。手动切号已由用户确认，原prepared事务已完整归档；state=off/enabled=false，10%阈值，无活动原生事务/执行器。两端磁盘仍同号，本轮不修复或重试。安装版Desktop只读环境检查ready=true（含后续准备时修复同号的能力，不代表当前账号已分开），CLI检查因待用Desktop仍在工作而ready=false。
+当前安装为0.3.10/build22：本轮增加预热修复，原生交接仍沿用先前手动替代核查、独立CLI清理和退出请求10秒时限；完整实机验收边界未改变。手动切号已由用户确认，原prepared事务已完整归档；state=off/enabled=false，10%阈值，无活动原生事务/执行器。两端磁盘仍同号，本轮不修复或重试。安装版Desktop只读环境检查ready=true（含后续准备时修复同号的能力，不代表当前账号已分开），CLI检查因待用Desktop仍在工作而ready=false。
 
 两个GUI入口及对应Prepare/Run均接入原生后端；完整实机验收仍未通过。逐项交付审计存私有部署目录build20-manual-review/acceptance-audit.json，goal_achieved=false。需要人工处理的完整退出与双账号实机步骤继续搁置，不重跑已结束实验；没有新的长期运行命令。
 

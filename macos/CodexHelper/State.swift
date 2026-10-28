@@ -93,10 +93,18 @@ struct WarmupAccount: Decodable {
     let name: String
     let status: String
     let message: String
+    let last_check: String?
     let last_attempt: String?
     let next_check: String?
     let attempts: Int
     let execution: WarmupExecution?
+    var lastCheckCaption: String? {
+        guard let value = last_check, !value.hasPrefix("0001-") else { return nil }
+        let parser = ISO8601DateFormatter(); parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        guard let date = parser.date(from: value) ?? ISO8601DateFormatter().date(from: value) else { return nil }
+        let formatter = DateFormatter(); formatter.timeZone = TimeZone(identifier: "Asia/Singapore"); formatter.dateFormat = "MM/dd HH:mm"
+        return "最后核查 \(formatter.string(from: date))"
+    }
 }
 struct WarmupSchedule: Decodable {
     let enabled: Bool
@@ -119,15 +127,20 @@ struct WarmupReport: Decodable {
     let error: String?
     var summary: String {
         if !enabled { return message }
+        let accountLines = accounts.map { account in
+            let time = account.lastCheckCaption.map { " · \($0)" } ?? ""
+            return "\(account.name)：\(account.message)\(time)"
+        }.joined(separator: "\n")
         if schedule_allowed == false {
             guard let next = next_opening else { return message }
             let parser = ISO8601DateFormatter(); parser.formatOptions = [.withInternetDateTime,.withFractionalSeconds]
             guard let date = parser.date(from: next) ?? ISO8601DateFormatter().date(from: next) else { return message }
             let formatter = DateFormatter(); formatter.timeZone = TimeZone(identifier: "Asia/Singapore"); formatter.dateFormat = "MM/dd HH:mm"
-            return "\(message)；下次允许时间 \(formatter.string(from: date))（UTC+8）。"
+            let scheduleMessage = "\(message)；下次允许时间 \(formatter.string(from: date))（UTC+8）。"
+            return accountLines.isEmpty ? scheduleMessage : scheduleMessage + "\n" + accountLines
         }
         if accounts.isEmpty { return "已开启，等待首次检查；仅预热启用时已有账号。" }
-        return accounts.map { "\($0.name)：\($0.message)" }.joined(separator: "\n")
+        return accountLines
     }
 }
 

@@ -5,7 +5,7 @@ package assistant
 
 import "time"
 
-const Version = "0.3.9"
+const Version = "0.3.10"
 
 type Capability struct {
 	Available bool   `json:"available"`

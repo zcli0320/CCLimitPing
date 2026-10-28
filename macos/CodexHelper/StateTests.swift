@@ -106,6 +106,14 @@ enum Tests {
         """
         let waiting = try JSONDecoder().decode(WarmupReport.self, from: Data(scheduleJSON.utf8))
         precondition(waiting.summary.contains("22:00") && waiting.summary.contains("时段外等待"))
+        let refreshedWarmup = try JSONDecoder().decode(WarmupReport.self, from: Data("""
+        {"enabled":true,"message":"已检查","available":true,"accounts":[{"key":"fixture","name":"账号 A","status":"window_running","message":"窗口运行中","last_check":"2026-10-28T02:03:04.125Z","attempts":2}]}
+        """.utf8))
+        precondition(refreshedWarmup.summary.contains("最后核查 10/28 10:03"), "Warmup must show the persisted check time in UTC+8")
+        let legacyWarmup = try JSONDecoder().decode(WarmupReport.self, from: Data("""
+        {"enabled":true,"message":"旧状态","available":true,"accounts":[{"key":"fixture","name":"账号 A","status":"window_running","message":"窗口运行中","attempts":2}]}
+        """.utf8))
+        precondition(!legacyWarmup.summary.contains("最后核查"), "Legacy warmup state must not invent a check time")
         do {
             _ = try BridgeClient.read(executable: URL(fileURLWithPath: "/bin/sleep"), arguments: ["5"], timeout: 0.1)
             preconditionFailure("Hung bridge was not timed out")

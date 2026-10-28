@@ -257,6 +257,8 @@ func warmupCommand() {
 		report, err = r.ConfigureWarmup(ctx, false)
 	case "check":
 		report, err = r.CheckWarmup(ctx, "")
+	case "refresh":
+		report, err = r.RefreshWarmup(ctx)
 	case "schedule":
 		if len(os.Args) != 6 || (os.Args[3] != "on" && os.Args[3] != "off") {
 			fmt.Fprintln(os.Stderr, "Usage: codex-helper warmup schedule on|off HH:MM HH:MM")
@@ -270,7 +272,7 @@ func warmupCommand() {
 		}
 		report, err = r.CheckWarmup(ctx, os.Args[3])
 	default:
-		fmt.Fprintln(os.Stderr, "Usage: codex-helper warmup status|enable|disable|check|probe <account>")
+		fmt.Fprintln(os.Stderr, "Usage: codex-helper warmup status|enable|disable|check|refresh|probe <account>")
 		os.Exit(2)
 	}
 	if err != nil {
