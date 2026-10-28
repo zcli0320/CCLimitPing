@@ -9,7 +9,7 @@ import (
 )
 
 func TestPrepareCLIHandoffBindsAndRevokesExactSession(t *testing.T) {
-	r := warmupFixtureReader(t)
+	r, backend, _ := nativeFixture(t)
 	work := filepath.Join(r.Home, "work")
 	if err := os.Mkdir(work, 0700); err != nil {
 		t.Fatal(err)
@@ -20,13 +20,13 @@ func TestPrepareCLIHandoffBindsAndRevokesExactSession(t *testing.T) {
 	if out, err := exec.Command("/usr/bin/sqlite3", db, `INSERT INTO threads VALUES('session-a','Title','Question','`+work+`',1,'cli',0,''); INSERT INTO threads VALUES('archived','Old','Old','`+work+`',1,'cli',1,'');`).CombinedOutput(); err != nil {
 		t.Fatalf("fixture: %s", out)
 	}
-	if _, err := r.PrepareCLIHandoff(context.Background(), "missing", 10); err == nil {
+	if _, err := r.prepareCLIHandoff(context.Background(), "missing", 10, backend); err == nil {
 		t.Fatal("missing session accepted")
 	}
-	if _, err := r.PrepareCLIHandoff(context.Background(), "archived", 10); err == nil {
+	if _, err := r.prepareCLIHandoff(context.Background(), "archived", 10, backend); err == nil {
 		t.Fatal("archived session accepted")
 	}
-	state, err := r.PrepareCLIHandoff(context.Background(), "session-a", 10)
+	state, err := r.prepareCLIHandoff(context.Background(), "session-a", 10, backend)
 	if err != nil || !state.Enabled || state.AuthorizationID == "" || state.SessionID != "session-a" {
 		t.Fatal("valid session was not bound")
 	}

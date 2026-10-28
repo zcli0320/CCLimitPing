@@ -305,6 +305,11 @@ func (r Reader) CheckWarmup(ctx context.Context, probeID string) (WarmupReport, 
 	return r.checkWarmup(ctx, probeID, warmupDependencies{now: time.Now, quota: func(ctx context.Context, c quotaCredential) AccountQuota { return queryAccountQuota(ctx, client, c) }, run: runIsolatedWarmup, busy: func(s []string) bool { return r.recentActivity(s, time.Now()) }})
 }
 func (r Reader) checkWarmup(ctx context.Context, probeID string, d warmupDependencies) (WarmupReport, error) {
+	if _, err := os.Lstat(r.nativeTransactionPath()); !os.IsNotExist(err) {
+		report := r.WarmupStatus()
+		report.Message = "双端账号交换或恢复核查期间暂停预热"
+		return report, nil
+	}
 	unlock, err := lockWarmup(filepath.Join(r.warmupRoot(), "execution.lock"))
 	if err != nil {
 		return r.WarmupStatus(), err

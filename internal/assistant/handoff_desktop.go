@@ -8,7 +8,7 @@ import (
 	"strings"
 )
 
-const desktopHandoffStopText = "请在当前操作的安全边界暂停，不要开始新的长任务。简要记录已完成、待完成及仍在运行的命令，然后结束本轮等待继续。"
+const desktopHandoffStopText = "这是已授权的自动切号交接。请在当前操作的安全边界收尾，不要开始新的长任务。简要记录已完成、待完成及仍在运行的命令，然后结束当前轮次，等待小助手自动继续。本请求只收尾当前轮次，不取消或暂停长期目标。"
 
 // requestHandoffStop is an experimental protocol adapter, not an authorization
 // or a production runner. The installed Desktop follower interface selects its
@@ -79,7 +79,11 @@ func desktopHandoffStopObserved(home, id, expectedTurn, expectedOwner, provider 
 // it with the exact owner/turn and persisted completion fence above.
 func desktopHandoffLimitedTurn(v desktopConversation) bool {
 	turn, limited := v.limitedTurn()
-	if !limited || turn.Items == nil {
+	return limited && desktopTurnToolsStopped(turn)
+}
+
+func desktopTurnToolsStopped(turn resumeTurn) bool {
+	if turn.Items == nil {
 		return false
 	}
 	encoded, err := json.Marshal(turn.Items)
@@ -182,7 +186,7 @@ func inspectDesktopHandoff(ipc desktopHandoffSnapshot, id, provider string) (Des
 	result.Blockers = append(result.Blockers,
 		"暂停指令不能原子绑定轮次；返回不匹配时停止交接，子代理可能受到影响",
 		"触发时会退出整个 Desktop；其他会话及未提交输入可能受影响",
-		"重启账号根据冷启动、配置目录及 CC Switch 写出的完整凭证核验；实机交接已在模拟触发条件下通过",
+		"重启账号根据冷启动、配置目录及原生后端写出的完整凭证核验；待用端不自动继续",
 	)
 	return result, nil
 }

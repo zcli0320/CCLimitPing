@@ -7,7 +7,7 @@
 [English](README.md) | **中文**
 
 > 本 fork 的个人改造计划：[Codex 小助手：个人需求与实施计划](docs/personal-codex-assistant-plan.zh-CN.md)。
-> 当前个人版 **Codex 小助手 0.3.8 / build 17** 提供原生 macOS 窗口、双账号额度、每日时段预热、Desktop／CLI 会话分区及指定 Desktop 会话自动切号。Desktop 交接依次请求暂停、确认退出、调用 CC Switch 切换、冷启动并继续原会话；完整实机交接已在模拟低额度触发条件下通过，真实自然耗尽后的交接仍待实机验收。0.3.8 修复额度错误后等待、凭证正常刷新后备用检查失效及执行器停止后状态误报。见[小助手使用与构建](docs/macos-helper.zh-CN.md)、[交接验收记录](docs/auto-handoff-plan.zh-CN.md)、[会话续跑](docs/resume.zh-CN.md)及[预热功能](docs/warmup.zh-CN.md)。原生切号后端目前是[可行性方案](docs/native-account-switch-feasibility.zh-CN.md)，尚未替代 CC Switch 按钮控制。
+> 当前个人版 **Codex 小助手 0.3.9 / build 18** 已接入原生双端账号协调：Desktop／CLI目录隔离，优先保持账号不同，只恢复选定工作端；CC Switch固定管理CLI。双向隔离测试、真实CLI进程＋本地模型全链路及真实账号分配修复通过。完整真实Desktop冷启动交接因退出条件未满足暂时搁置，自动切号保持关闭。见[0.3.9使用与验证边界](docs/native-dual-handoff.zh-CN.md)、[小助手构建](docs/macos-helper.zh-CN.md)及[历史交接记录](docs/auto-handoff-plan.zh-CN.md)。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![CI](https://github.com/wavever/CCLimitPing/actions/workflows/ci.yml/badge.svg)](https://github.com/wavever/CCLimitPing/actions/workflows/ci.yml)

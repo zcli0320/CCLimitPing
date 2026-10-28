@@ -187,6 +187,7 @@ struct Snapshot: Decodable {
     let warmup: WarmupReport?
     let resume: ResumeReport?
     let handoff: HandoffReport?
+	let allocation: AccountAllocationReport?
 
     func sessions(in scope: String) -> [HelperSession] { sessions.filter { $0.sessionScope == scope } }
     func complete(in scope: String) -> Bool {
@@ -205,6 +206,25 @@ struct Snapshot: Decodable {
     }
 }
 
+struct ClientAccountReport: Decodable {
+    let scope: String
+    let home: String
+    let account_id: String?
+    let name: String?
+    let status: String
+    let message: String
+}
+struct AccountAllocationReport: Decodable {
+    let clients: [ClientAccountReport]
+    let distinct: Bool
+    let working_scope: String?
+    let message: String
+    var caption: String {
+        let rows = clients.map { "\($0.scope == "desktop" ? "Desktop" : "CLI")：\($0.name?.isEmpty == false ? $0.name! : "身份未确认")" }
+        return rows.joined(separator: " · ") + "\n" + message
+    }
+}
+
 // Observation is a separate concept from permission to switch accounts. The
 // first iteration has no execution adapter and can never grant that permission.
 struct SelectionState: Codable {
@@ -215,9 +235,10 @@ struct SelectionState: Codable {
     var activeScope = "desktop"
     var selectedByScope: [String: String] = [:]
     var initializedScopes: [String] = []
+	var handoffThreshold: String?
 
     init() {}
-    enum CodingKeys: String, CodingKey { case selectedKey, observing, expandedProjects, projectLayoutInitialized, activeScope, selectedByScope, initializedScopes }
+    enum CodingKeys: String, CodingKey { case selectedKey, observing, expandedProjects, projectLayoutInitialized, activeScope, selectedByScope, initializedScopes, handoffThreshold }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         selectedKey = try values.decodeIfPresent(String.self, forKey: .selectedKey)
@@ -228,6 +249,7 @@ struct SelectionState: Codable {
         activeScope = scope == "cli" ? "cli" : "desktop"
         selectedByScope = try values.decodeIfPresent([String: String].self, forKey: .selectedByScope) ?? [:]
         initializedScopes = try values.decodeIfPresent([String].self, forKey: .initializedScopes) ?? []
+		handoffThreshold = try values.decodeIfPresent(String.self, forKey: .handoffThreshold)
     }
 
     mutating func select(_ key: String?) {

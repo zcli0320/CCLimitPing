@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"math"
-	"net/http"
 	"time"
 )
 
@@ -105,34 +104,14 @@ func (r Reader) CheckHandoffPreflight(ctx context.Context, scope, id string, thr
 	r.ReadAccountQuotas(ctx, &s)
 	targetID := handoffQuotaEvidence(&out, s.Accounts, sourceID)
 	out.Limitations = append(out.Limitations, "磁盘认证不证明当前运行实例的实际账号；尚未核验。")
-	if targetID != "" && scope == "desktop" {
-		bridge, e := newDesktopCCSwitch(r)
-		if e == nil {
-			e = bridge.inspect(ctx, targetID)
-		}
+	if targetID != "" {
+		e := newNativeDualSwitcher(r).inspect(ctx, scope)
 		if e != nil {
 			out.Limitations = append(out.Limitations, e.Error())
 		} else {
 			out.CandidateReady = true
-			out.CandidateSource = "CC Switch 账号管理器（切换时生成完整登录记录）"
-			out.Limitations = append(out.Limitations, "退出 Desktop 后调用 CC Switch 原有切换流程；写出目标登录记录后再次核验。")
-		}
-	} else if targetID != "" {
-		candidate, e := r.findHandoffAuthCandidate(targetID, time.Now())
-		if e != nil {
-			out.Limitations = append(out.Limitations, e.Error())
-		} else {
-			client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
-			q := queryAccountQuota(ctx, client, candidate.quotaCredential())
-			if handoffTargetQuotaOK(q, threshold) && resumeQuotaReady(q) {
-				out.CandidateReady = true
-				out.CandidateSource = candidate.source
-				five, _ := handoffWindow(&q, 18000)
-				out.TargetRemaining = &five
-				out.Limitations = append(out.Limitations, "完整凭证已匹配并通过额度查询；刷新凭证仍须在实际使用中验证。")
-			} else {
-				out.Limitations = append(out.Limitations, "完整凭证未通过备用账号额度检查，请在 CC Switch 更新后重试。")
-			}
+			out.CandidateSource = "原生双端账号协调器"
+			out.Limitations = append(out.Limitations, "工作端使用候选账号，待用端分配原账号并保持停止；CC Switch 固定管理 CLI 目录。")
 		}
 	} else {
 		out.Limitations = append(out.Limitations, "未找到额度满足条件的备用账号；尚未检查完整认证。")

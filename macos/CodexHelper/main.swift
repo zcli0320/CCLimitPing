@@ -28,6 +28,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
     let archived = NSButton(checkboxWithTitle: "包括归档", target: nil, action: nil)
     let sourceTabs = NSSegmentedControl(labels: ["Desktop", "CLI"], trackingMode: .selectOne, target: nil, action: nil)
     let sourceHint = NSTextField(wrappingLabelWithString: "")
+	let allocationHint = NSTextField(wrappingLabelWithString: "")
     let table = NSOutlineView()
     let selection = NSTextField(wrappingLabelWithString: "选择一个会话后，可以开始观察其记录更新。")
     let detail = NSTextField(wrappingLabelWithString: "")
@@ -222,6 +223,8 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         sourceHint.font = .systemFont(ofSize: 11); sourceHint.textColor = .secondaryLabelColor
         sourceHint.maximumNumberOfLines = 2
         add(sourceHint, to: stack)
+		allocationHint.font = .systemFont(ofSize: 11); allocationHint.textColor = .secondaryLabelColor
+		allocationHint.maximumNumberOfLines = 3; add(allocationHint, to: stack)
         search.placeholderString = "搜索标题、项目或会话 ID"
         search.delegate = self; search.sendsSearchStringImmediately = true
         archived.target = self; archived.action = #selector(filterChanged)
@@ -261,6 +264,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         add(resumeStatus, to: stack)
         add(separator(), to: stack)
         handoffThreshold.alignment = .right
+		handoffThreshold.stringValue = state.handoffThreshold ?? "10"; handoffThreshold.delegate = self
         handoffThreshold.widthAnchor.constraint(equalToConstant: 44).isActive = true
         handoffPreflight.target = self; handoffPreflight.action = #selector(checkHandoffPreflight)
         handoffPreflight.bezelStyle = .rounded
@@ -348,7 +352,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
 
     @objc func showDetails() {
         let alert = NSAlert(); alert.messageText = "接入说明"
-        alert.informativeText = "账号与额度沿用 CC Switch。预热在独立临时进程执行；CLI 可为所选会话启动托管切号，Desktop 切号仍在开发。"
+        alert.informativeText = "选中的 Desktop 或托管 CLI 作为工作端。原生交接保持两端账号不同，待用端须空闲，交换后仅继续工作端。"
         var lines = ["观察记录不能判断任务是否运行、实际使用账号或是否触及额度。"]
         if let snapshot = snapshot {
             for source in snapshot.sources ?? [] {
@@ -356,7 +360,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
                 lines += source.warnings.map { "• \($0)" }
             }
             lines += ["", "CC Switch 配置目录：\(snapshot.codex_home)", "两端仅按目录分隔历史；账号卡片来自 CC Switch，不证明运行实例身份。"]
-            lines += ["", "额度每 2 分钟自动查询，点刷新可立即查询。只读使用已签发的有效访问凭证；凭证过期需在 CC Switch 刷新，不复制或轮换刷新凭证。"]
+            lines += ["", "额度每 2 分钟自动查询，点刷新可立即查询。账号准备期间正常退出 CC Switch，再核对或更新登录；遇到需要重新登录或系统授权的步骤会停止并保留记录。"]
             if let report = warmupReport {
                 lines += ["", "预热：" + report.summary, "开启时每分钟检查；关闭窗口后仍在菜单栏运行。退出应用停止后续检查。"]
                 for account in report.accounts {
@@ -437,16 +441,16 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
                         self.updateHandoffUI()
                     }
                     if self.resumeReport?.enabled == true && (self.resumeReport?.key != self.state.selectedKey || self.selected?.archived != false || !snapshot.complete(in: self.state.activeScope)) { self.stopResumeForTargetChange() }
-                    let switchingDesktop = self.handoffReport?.scope == "desktop" && ["pending", "waiting_exit", "ready_switch", "waiting_switch", "ready_restart", "waiting_restart", "ready_continue", "waiting_continue"].contains(self.handoffReport?.stage ?? "")
+                    let switchingHandoff = ["desktop", "cli"].contains(self.handoffReport?.scope ?? "") && ["pending", "ready_prepare", "waiting_exit", "ready_switch", "waiting_switch", "ready_restart", "waiting_restart", "ready_continue", "waiting_continue"].contains(self.handoffReport?.stage ?? "")
                     let selectionChanged = self.handoffReport?.scope != self.state.activeScope || (snapshot.complete(in: self.state.activeScope) && (self.handoffReport?.session_id != self.selected?.id || self.selected?.archived != false))
-                    if self.handoffReport?.hasAuthorization == true && (selectionChanged || (!switchingDesktop && !snapshot.complete(in: self.state.activeScope))) { self.stopHandoffForTargetChange() }
+                    if self.handoffReport?.hasAuthorization == true && (selectionChanged || (!switchingHandoff && !snapshot.complete(in: self.state.activeScope))) { self.stopHandoffForTargetChange() }
                     self.updateObservation(); self.render(); self.save()
                 case .failure(let error):
                     // Fail closed: an old list cannot silently remain actionable.
                     self.readError = (error as? BridgeError) == .timedOut ? "读取超时，请点刷新重试。" : "读取失败，请检查本机数据后点刷新重试。"
                     self.stopResumeForTargetChange()
-                    let switchingDesktop = self.handoffReport?.scope == "desktop" && ["pending", "waiting_exit", "ready_switch", "waiting_switch", "ready_restart", "waiting_restart", "ready_continue", "waiting_continue"].contains(self.handoffReport?.stage ?? "")
-                    if !switchingDesktop { self.stopHandoffForTargetChange() }
+                    let switchingHandoff = ["desktop", "cli"].contains(self.handoffReport?.scope ?? "") && ["pending", "ready_prepare", "waiting_exit", "ready_switch", "waiting_switch", "ready_restart", "waiting_restart", "ready_continue", "waiting_continue"].contains(self.handoffReport?.stage ?? "")
+                    if !switchingHandoff { self.stopHandoffForTargetChange() }
                     self.snapshot = nil; self.state.pauseObservation(); self.updateObservation(); self.render(); self.save()
                 }
             }
@@ -456,6 +460,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
     func render(preserveScroll: Bool = true) {
         for view in accountStack.arrangedSubviews { accountStack.removeArrangedSubview(view); view.removeFromSuperview() }
         guard let snapshot = snapshot else {
+			allocationHint.stringValue = ""
             sourceHint.stringValue = "\(state.activeScope == "cli" ? "CLI · ~/.codex-cli" : "Desktop · ~/.codex") · 数据暂不可用"
             status.textColor = .systemOrange
             status.stringValue = readError ?? "正在读取本机数据…"
@@ -471,6 +476,8 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
             sourceHint.stringValue = "\(source.label) 目录：\((source.home as NSString).abbreviatingWithTildeInPath) · 按存放目录归类历史"
             sourceHint.toolTip = source.home
         } else { sourceHint.stringValue = "按目录分隔会话；旧快照仅支持 Desktop 数据。" }
+		allocationHint.stringValue = snapshot.allocation?.caption ?? ""
+		allocationHint.textColor = snapshot.allocation?.distinct == false ? .systemOrange : .secondaryLabelColor
         status.textColor = warnings.isEmpty ? .secondaryLabelColor : .systemOrange
         let iso = ISO8601DateFormatter(); iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let captured = iso.date(from: snapshot.captured_at) ?? ISO8601DateFormatter().date(from: snapshot.captured_at)
@@ -729,7 +736,10 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         updateSelection(); layoutDocument()
     }
 
-    func controlTextDidChange(_ obj: Notification) { filterChanged() }
+    func controlTextDidChange(_ obj: Notification) {
+		if let field=obj.object as? NSTextField,field===handoffThreshold{save();return}
+		filterChanged()
+	}
     func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
         (item as? ProjectItem)?.children.count ?? (item == nil ? projects.count : 0)
     }
@@ -851,6 +861,8 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
     }
 
     func save() {
+		let value=handoffThreshold.stringValue.trimmingCharacters(in:.whitespacesAndNewlines)
+		if let number=Double(value),number.isFinite,number>0,number<100{state.handoffThreshold=value}
         do { try store.save(state) }
         catch { feedback.stringValue = "选择状态保存失败；本次窗口内仍可使用。" }
     }
@@ -922,7 +934,7 @@ extension Assistant {
         let needsReview = handoffReport?.stage == "uncertain" || (handoffReport?.stage == "completed" && handoffReport?.recovery_pending == true)
         handoffStart.isHidden = false
         handoffStart.title = state.activeScope == "desktop" ? "为选中会话开启切号" : "托管并开启切号"
-        handoffStart.toolTip = state.activeScope == "desktop" ? "触发时会退出整个 Desktop；其他会话和未提交的输入可能受影响。" : "在托管终端中使用所选会话。"
+        handoffStart.toolTip = "选中端作为工作端；另一端须空闲，交换账号后保持停止。准备期间会正常退出 CC Switch，完成后恢复。"
         handoffStop.isHidden = !active
         handoffAcknowledge.isHidden = !needsReview || active
         handoffAcknowledge.title = handoffReport?.recovery_pending == true ? "保留当前账号并解除暂停" : "已检查，解除暂停"

@@ -51,11 +51,15 @@ type desktopHandoffCoordinator struct {
 	owner                        string
 	continuedTurn                string
 	ccswitch                     *desktopCCSwitch
+	native                       *nativeDualSwitcher
 	lastObservation              HandoffObservation
 	observationFailed            bool
 }
 
 func (d *desktopHandoffCoordinator) targetEvidence(ctx context.Context, threshold float64) (AccountQuota, bool) {
+	if d.native != nil {
+		return d.native.evidence(ctx, d.r.HandoffStatus())
+	}
 	if d.ccswitch != nil {
 		credential, found := d.r.quotaCredentials(time.Now())[d.target]
 		if !found || d.quota == nil {
@@ -99,6 +103,9 @@ func (d *desktopHandoffCoordinator) targetEvidence(ctx context.Context, threshol
 }
 
 func (d *desktopHandoffCoordinator) targetInstalled() bool {
+	if d.native != nil {
+		return d.native.installed(d.r.HandoffStatus())
+	}
 	if d.ccswitch != nil {
 		return d.ccswitch.installed(d.r.HandoffStatus())
 	}
@@ -114,6 +121,10 @@ func (d *desktopHandoffCoordinator) targetInstalled() bool {
 }
 
 func (d *desktopHandoffCoordinator) preparedStillValid() bool {
+	if d.native != nil {
+		_, ok := d.native.evidence(context.Background(), d.r.HandoffStatus())
+		return ok
+	}
 	if !d.preparedOK {
 		return false
 	}
@@ -219,10 +230,14 @@ func (d *desktopHandoffCoordinator) Observe(ctx context.Context, s HandoffState)
 	o.TurnID = turn.ID
 	o.Directory, o.Model, o.Effort, o.Permissions = e.Directory, e.Model, e.Effort, e.Permissions
 	o.Running = e.View.Runtime.Type == "active" && turn.Status == "inProgress" && len(e.View.Requests) == 0
+	if d.native != nil {
+		o.NeedsPreparation = !d.native.ready
+		o.AllocationConflict = !d.r.AccountAllocation().Distinct
+	}
 	if s.Stage == "watching" && o.Running {
 		d.active, d.activeOwner, d.activeUsers = o, e.Owner, desktopUserItems(d.id, turn)
 	}
-	if (s.Stage == "watching" || s.Stage == "ready_stop") && d.limitedMatches(e, turn.ID) {
+	if (s.Stage == "watching" || s.Stage == "ready_prepare" || s.Stage == "ready_stop") && d.limitedMatches(e, turn.ID) {
 		d.owner, d.limitedTurn = e.Owner, turn.ID
 		o.AlreadyLimited, o.StopConfirmed, o.StoppedForHandoff = true, true, true
 		o.OtherSessionsIdle = e.OtherWorkIdle || e.WholeAppExitAccepted
@@ -264,7 +279,7 @@ func (d *desktopHandoffCoordinator) Execute(ctx context.Context, action HandoffA
 		return errors.New("交接目标不可确认")
 	}
 	if action == HandoffSwitch {
-		if !d.preparedOK {
+		if !d.preparedOK && d.native == nil {
 			return errors.New("备用认证未准备")
 		}
 		stopped := func(ctx context.Context) error {
@@ -273,6 +288,9 @@ func (d *desktopHandoffCoordinator) Execute(ctx context.Context, action HandoffA
 				return errors.New("旧实例尚未确认退出")
 			}
 			return nil
+		}
+		if d.native != nil {
+			return d.native.switchAccount(ctx, s, stopped)
 		}
 		if d.ccswitch != nil {
 			return d.ccswitch.switchAccount(ctx, s, stopped)
@@ -285,6 +303,11 @@ func (d *desktopHandoffCoordinator) Execute(ctx context.Context, action HandoffA
 		return errors.New("无法确认运行状态")
 	}
 	switch action {
+	case HandoffPrepareTarget:
+		if d.native == nil {
+			return errors.New("原生切号后端不存在")
+		}
+		return d.native.prepare(ctx, s)
 	case HandoffRequestStop:
 		turn, ok := e.View.latest()
 		if !ok || e.View.ID != d.id || e.Owner == "" || e.View.ModelProvider != d.provider || e.View.ResumeState != "resumed" || e.View.Mode == "durable" || len(e.View.Requests) != 0 || e.View.Runtime.Type != "active" || turn.ID != s.TurnID || turn.Status != "inProgress" || e.Directory != s.Directory || e.Model != s.Model || e.Effort != s.Effort || e.Permissions != s.Permissions {
@@ -378,7 +401,9 @@ func (d *desktopHandoffCoordinator) finishCompleted(ctx context.Context, complet
 		return nil
 	}
 	var finishErr error
-	if d.ccswitch != nil {
+	if d.native != nil {
+		finishErr = d.native.finish(ctx, completed, verify)
+	} else if d.ccswitch != nil {
 		finishErr = d.ccswitch.finish(ctx, completed, verify)
 	} else {
 		finishErr = d.r.finishHandoffAuth(ctx, verify)

@@ -21,6 +21,7 @@ type desktopSingleSessionRuntime struct {
 	baselineUsers                                                         map[string]bool
 	baselineDirectory, baselineModel, baselineEffort, baselinePermissions string
 	launchRequested                                                       bool
+	exitRequested                                                         bool
 	continuedTurn                                                         string
 }
 
@@ -99,6 +100,13 @@ func (d *desktopSingleSessionRuntime) observe(ctx context.Context, id string) (d
 		e.OldExited = d.lifecycle.observeExit(ctx)
 	}
 	if e.OldExited && !d.launchRequested {
+		e.InterventionKnown = true
+		return e, nil
+	}
+	// The IPC owner can disappear before the app and its process tree finish
+	// exiting. Exit confirmation must depend on those captured processes, not
+	// on a conversation snapshot which no longer exists during shutdown.
+	if d.exitRequested && !d.launchRequested {
 		e.InterventionKnown = true
 		return e, nil
 	}
@@ -213,7 +221,11 @@ func (d *desktopSingleSessionRuntime) bindLimitedStop(ctx context.Context, id, o
 }
 
 func (d *desktopSingleSessionRuntime) requestExit(ctx context.Context) error {
-	return d.lifecycle.requestExit(ctx)
+	if err := d.lifecycle.requestExit(ctx); err != nil {
+		return err
+	}
+	d.exitRequested = true
+	return nil
 }
 func (d *desktopSingleSessionRuntime) requestRestart(ctx context.Context, id string) error {
 	if err := d.lifecycle.requestRestart(ctx, id); err != nil {
