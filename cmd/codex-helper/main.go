@@ -69,10 +69,16 @@ func accountsCommand() {
 		_ = json.NewEncoder(os.Stdout).Encode(r.AccountAllocation())
 		return
 	}
-	if len(os.Args) == 3 && os.Args[2] == "recover-preparation" {
+	if (len(os.Args) == 3 || (len(os.Args) == 4 && os.Args[3] == "--manual-switch")) && os.Args[2] == "recover-preparation" {
 		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 		defer cancel()
-		s, e := r.ReviewNativePreparation(ctx)
+		var s assistant.HandoffState
+		var e error
+		if len(os.Args) == 4 {
+			s, e = r.ReviewManualNativePreparation(ctx)
+		} else {
+			s, e = r.ReviewNativePreparation(ctx)
+		}
 		if e != nil {
 			s.Message = e.Error()
 		}
@@ -85,7 +91,7 @@ func accountsCommand() {
 		_ = json.NewEncoder(os.Stdout).Encode(r.CheckNativeAccounts(ctx, os.Args[3]))
 		return
 	}
-	fmt.Fprintln(os.Stderr, "Usage: codex-helper accounts status | check desktop|cli | recover-preparation")
+	fmt.Fprintln(os.Stderr, "Usage: codex-helper accounts status | check desktop|cli | recover-preparation [--manual-switch]")
 	os.Exit(2)
 }
 

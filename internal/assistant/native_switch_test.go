@@ -581,6 +581,123 @@ func TestNativePublishedPreparationCannotBeDiscardedByReview(t *testing.T) {
 	}
 }
 
+func TestNativeManualSwitchReviewPreservesNewCredentialsAndProcesses(t *testing.T) {
+	r, n, env := nativeFixture(t)
+	s := nativeState(t, r, "desktop")
+	if err := n.prepare(context.Background(), s); err != nil {
+		t.Fatal(err)
+	}
+	txn, err := n.txn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	n.close()
+	// A manual switch writes a newer target generation to both clients and
+	// restarts CC Switch. The old prepared bundle must never be restored.
+	store, err := r.readNativeStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := n.prepared
+	a.Tokens.Refresh = "synthetic-manual-new-generation"
+	store.adopt(s.TargetAccount, a, time.Now().UnixMilli())
+	if err = r.saveNativeStore(store); err != nil {
+		t.Fatal(err)
+	}
+	for _, root := range []string{".codex", ".codex-cli"} {
+		writeFixture(t, filepath.Join(r.Home, root, "auth.json"), string(nativeAuthBytes(a)))
+	}
+	env.cc = true
+	s.Enabled, s.Stage, s.PendingAction = false, "uncertain", ""
+	if err = writeState(r.handoffPath(), s); err != nil {
+		t.Fatal(err)
+	}
+	paths := []string{".codex/auth.json", ".codex-cli/auth.json", ".codex/config.toml", ".codex-cli/config.toml", ".cc-switch/codex_oauth_auth.json", ".cc-switch/cc-switch.db", ".cc-switch/settings.json"}
+	before := map[string]string{}
+	for _, path := range paths {
+		raw, err := os.ReadFile(filepath.Join(r.Home, path))
+		if err != nil {
+			t.Fatal(err)
+		}
+		before[path] = digestString(raw)
+	}
+	if _, err = r.reviewNativePreparation(context.Background(), n); err == nil {
+		t.Fatal("automatic recovery accepted manually changed identities")
+	}
+	state, err := r.reviewNativePreparationMode(context.Background(), n, true)
+	if err != nil || state.Enabled || state.Stage != "off" || state.Threshold != s.Threshold {
+		t.Fatalf("manual review: %v", err)
+	}
+	for path, want := range before {
+		raw, err := os.ReadFile(filepath.Join(r.Home, path))
+		if err != nil || digestString(raw) != want {
+			t.Fatalf("manual review modified %s", path)
+		}
+	}
+	if !env.cc || env.restored != 0 {
+		t.Fatal("manual review changed application lifecycle")
+	}
+	for _, name := range []string{"reviewed-native-transaction.json", "reviewed-handoff.json", "manual-switch-review.json", "target-auth.json", "store-before.json"} {
+		if _, err = os.Stat(filepath.Join(n.dir(txn), name)); err != nil {
+			t.Fatalf("recovery evidence missing: %s", name)
+		}
+	}
+	if _, err = os.Stat(r.nativeTransactionPath()); !os.IsNotExist(err) {
+		t.Fatal("superseded transaction still active")
+	}
+	if r.AccountAllocation().Distinct {
+		t.Fatal("review unexpectedly repaired account assignment")
+	}
+}
+
+func TestNativeManualReviewRefusesUncertainOrUnboundTransactions(t *testing.T) {
+	for _, mode := range []string{"refreshing", "publishing", "installed", "files", "pending", "enabled", "authorization", "source", "unknown-account"} {
+		t.Run(mode, func(t *testing.T) {
+			r, n, _ := nativeFixture(t)
+			s := nativeState(t, r, "desktop")
+			if err := n.prepare(context.Background(), s); err != nil {
+				t.Fatal(err)
+			}
+			txn, err := n.txn()
+			if err != nil {
+				t.Fatal(err)
+			}
+			n.close()
+			s.Enabled, s.Stage, s.PendingAction = false, "uncertain", ""
+			switch mode {
+			case "refreshing", "publishing", "installed":
+				txn.Phase = mode
+			case "files":
+				txn.Files = []nativeFile{{Path: ".codex/auth.json"}}
+			case "pending":
+				s.PendingAction = "switch"
+			case "enabled":
+				s.Enabled = true
+			case "authorization":
+				s.AuthorizationID = "different-authorization"
+			case "source":
+				s.SourceAccount = s.TargetAccount
+			case "unknown-account":
+				writeFixture(t, filepath.Join(r.Home, ".codex/auth.json"), "{}")
+			}
+			if err = n.save(txn); err != nil {
+				t.Fatal(err)
+			}
+			if err = writeState(r.handoffPath(), s); err != nil {
+				t.Fatal(err)
+			}
+			before, _ := os.ReadFile(r.nativeTransactionPath())
+			if _, err = r.reviewNativePreparationMode(context.Background(), n, true); err == nil {
+				t.Fatal("unsafe manual review accepted")
+			}
+			after, err := os.ReadFile(r.nativeTransactionPath())
+			if err != nil || string(before) != string(after) || r.HandoffStatus() != s {
+				t.Fatal("rejected review changed journal or authorization")
+			}
+		})
+	}
+}
+
 func TestNativeIdleDuplicateRepairDoesNotStartTask(t *testing.T) {
 	r, n, _ := nativeFixture(t)
 	raw, _ := os.ReadFile(filepath.Join(r.Home, ".codex/auth.json"))
