@@ -2,6 +2,12 @@
 
 2026-10-28，Asia/Singapore。版本0.3.9/build20（含手动替代准备核查）。源码基线为main的1daa246，新增原生双端后端。此文件记录当前结论；旧实验日志留在仓库外，不含真实凭证。
 
+## 当前结论（优先于下方历史时间线）
+
+当前安装为0.3.9/build20，源码e090e7a。手动切号已由用户确认，原prepared事务已完整归档；state=off/enabled=false，10%阈值，无活动原生事务/执行器。两端磁盘仍同号，本轮不修复或重试。安装版Desktop只读环境检查ready=true（含后续准备时修复同号的能力，不代表当前账号已分开），CLI检查因待用Desktop仍在工作而ready=false。
+
+两个GUI入口及对应Prepare/Run均接入原生后端；完整实机验收仍未通过。逐项交付审计存私有部署目录build20-manual-review/acceptance-audit.json，goal_achieved=false。需要人工处理的完整退出与双账号实机步骤继续搁置，不重跑已结束实验；没有新的长期运行命令。
+
 ## 功能范围
 
 - Desktop使用`~/.codex`，CLI使用`~/.codex-cli`，各自配置及历史隔离。
