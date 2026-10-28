@@ -33,7 +33,7 @@ func (d *diagnosticNativeOps) Execute(ctx context.Context, a HandoffAction, s Ha
 }
 
 func syntheticHandoffToken(user, workspace string, expiry int64) string {
-	data, _ := json.Marshal(map[string]any{"iss": "https://auth.openai.com", "sub": "synthetic-" + user, "exp": expiry, "email": user + "@example.test", "https://api.openai.com/auth": map[string]any{"chatgpt_user_id": user, "chatgpt_account_id": workspace, "chatgpt_plan_type": "plus"}})
+	data, _ := json.Marshal(map[string]any{"iss": "https://auth.openai.com", "exp": expiry, "email": user + "@example.test", "https://api.openai.com/auth": map[string]any{"chatgpt_user_id": user, "chatgpt_account_id": workspace, "chatgpt_plan_type": "plus"}})
 	return "e30." + base64.RawURLEncoding.EncodeToString(data) + ".synthetic-signature"
 }
 
@@ -145,13 +145,6 @@ func TestNativeCLISupervisorWithLocalModel(t *testing.T) {
 	}
 	setup.stop()
 	r := Reader{Home: home, SQLite: "/usr/bin/sqlite3"}
-	dual := os.Getenv("CODEX_HELPER_NATIVE_DUAL_TEST") == "1"
-	if dual {
-		writeFixture(t, filepath.Join(home, ".codex/config.toml"), "model='gpt-6-luna'\n")
-		settings, _ := json.Marshal(map[string]any{"codexConfigDir": filepath.Join(home, ".codex-cli"), "currentProviderCodex": "provider-a"})
-		writeFixture(t, filepath.Join(home, ".cc-switch/settings.json"), string(settings))
-		fixtureDB(t, filepath.Join(home, ".cc-switch/cc-switch.db"), `CREATE TABLE providers(id TEXT,name TEXT,app_type TEXT,meta TEXT,is_current INTEGER,settings_config TEXT); INSERT INTO providers VALUES('provider-a','A','codex','{"authBinding":{"authProvider":"codex_oauth","accountId":"managed-a"}}',1,'{"config":""}'); INSERT INTO providers VALUES('provider-b','B','codex','{"authBinding":{"authProvider":"codex_oauth","accountId":"managed-b"}}',0,'{"config":""}');`)
-	}
 	socketRoot, err := os.MkdirTemp("/tmp", "codex-helper-cli-")
 	if err != nil {
 		t.Fatal(err)
@@ -178,35 +171,15 @@ func TestNativeCLISupervisorWithLocalModel(t *testing.T) {
 	env = append(env, "TERM=xterm-256color")
 	output := &liveTerminalCapture{}
 	s := &cliHandoffSupervisor{r: r, ctx: ctx, id: id, cwd: filepath.Join(home, "work"), exe: exe, socket: filepath.Join(socketRoot, "control.sock"), env: env, provider: "routing", input: &cliHandoffInput{}, sourceID: "managed-a", targetID: "managed-b", client: fakeQuota, output: output}
-	if dual {
-		s.native = newNativeDualSwitcher(r)
-		s.native.env = &fakeNativeEnvironment{cc: true}
-		s.native.client = fakeQuota
-		s.native.query = func(ctx context.Context, c quotaCredential) AccountQuota { return queryAccountQuota(ctx, fakeQuota, c) }
-		defer s.native.close()
+	if err = s.start(); err != nil {
+		t.Fatalf("native supervisor start: %v", err)
 	}
 	defer func() {
 		stop, done := context.WithTimeout(context.Background(), 8*time.Second)
 		defer done()
-		if err := s.stop(stop); err != nil {
-			t.Errorf("native supervisor cleanup failed: %v", err)
-		}
-		if s.server.exited() && s.tui.exited() {
-			_ = os.Remove(r.cliRunnerPath())
-		} else {
-			t.Error("native integration left an owned process running")
-			// Only this test's isolated synthetic processes, never user CLI.
-			for _, process := range []*ownedCLIProcess{s.tui, s.server} {
-				if process != nil && !process.exited() {
-					_ = process.cmd.Process.Kill()
-					<-process.done
-				}
-			}
-		}
+		_ = s.stop(stop)
+		_ = os.Remove(r.cliRunnerPath())
 	}()
-	if err = s.start(); err != nil {
-		t.Fatalf("native supervisor start: %v", err)
-	}
 	loaded := false
 	var lastErr error
 	var lastThread cliHandoffThread
@@ -223,12 +196,7 @@ func TestNativeCLISupervisorWithLocalModel(t *testing.T) {
 	if !loaded {
 		t.Fatalf("native TUI did not resume test thread (server-exited=%t tui-exited=%t read-error=%v runtime=%s output-bytes=%d flags=%v errors=%v)", s.server.exited(), s.tui.exited(), lastErr, lastThread.Status.Type, output.size(), output.flags(), output.syntheticErrors(home))
 	}
-	if dual {
-		_, err = r.configureNativeHandoff("cli", id, 10)
-	} else {
-		_, err = r.ConfigureHandoff("cli", id, 10, true)
-	}
-	if err != nil {
+	if _, err = r.ConfigureHandoff("cli", id, 10, true); err != nil {
 		t.Fatal(err)
 	}
 	var turnID string
@@ -280,16 +248,8 @@ func TestNativeCLISupervisorWithLocalModel(t *testing.T) {
 			if e != nil || !r.handoffCurrentMatchesAccount(live, "managed-b") {
 				t.Fatal("synthetic target auth not installed")
 			}
-			if dual {
-				e = s.native.finish(ctx, state, s.verifyAccountID)
-			} else {
-				e = r.finishHandoffAuth(ctx, s.verifyAccountID)
-			}
-			if e != nil {
+			if e = r.finishHandoffAuth(ctx, s.verifyAccountID); e != nil {
 				t.Fatalf("native verification cleanup failed: %v", e)
-			}
-			if dual && !r.AccountAllocation().Distinct {
-				t.Fatal("native CLI handoff did not preserve different client accounts")
 			}
 			t.Logf("native process handoff completed; fake model requests: %d", requests.Load())
 			return

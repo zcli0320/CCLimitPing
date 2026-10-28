@@ -69,19 +69,3 @@ func TestDesktopPersistedSettingsRejectUnknownOrPartialEvidence(t *testing.T) {
 		})
 	}
 }
-
-func TestDesktopPersistedExplicitDefaultEffort(t *testing.T) {
-	home := t.TempDir()
-	path := filepath.Join(home, ".codex/sessions/test.jsonl")
-	data := strings.ReplaceAll(desktopSettingsFixture("thread", "turn"), `"effort":"high",`, "")
-	data = strings.ReplaceAll(data, `"collaboration_mode":null`, `"collaboration_mode":{"mode":"default","settings":{"model":"fixture-model","reasoning_effort":null,"developer_instructions":null}}`)
-	writeFixture(t, path, data)
-	view := desktopConversation{ID: "thread", RolloutPath: path}
-	x, err := desktopPersistedTurn(home, view, resumeTurn{ID: "turn", Params: map[string]json.RawMessage{"effort": json.RawMessage(`null`)}})
-	if err != nil || string(x.Params["effort"]) != `"default"` || string(x.Params["saved_default_effort"]) != "true" {
-		t.Fatalf("explicit default not preserved: %v", err)
-	}
-	if _, err = desktopPersistedTurn(home, view, resumeTurn{ID: "turn", Params: map[string]json.RawMessage{"effort": json.RawMessage(`"high"`)}}); err == nil {
-		t.Fatal("known high effort downgraded")
-	}
-}

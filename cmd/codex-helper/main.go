@@ -17,10 +17,6 @@ import (
 )
 
 func main() {
-	if len(os.Args) >= 2 && os.Args[1] == "accounts" {
-		accountsCommand()
-		return
-	}
 	if len(os.Args) >= 2 && os.Args[1] == "handoff" {
 		handoffCommand()
 		return
@@ -58,41 +54,6 @@ func main() {
 	if err := enc.Encode(snapshot); err != nil {
 		os.Exit(1)
 	}
-}
-
-func accountsCommand() {
-	r, err := assistant.NewReader()
-	if err != nil {
-		os.Exit(1)
-	}
-	if len(os.Args) == 3 && os.Args[2] == "status" {
-		_ = json.NewEncoder(os.Stdout).Encode(r.AccountAllocation())
-		return
-	}
-	if (len(os.Args) == 3 || (len(os.Args) == 4 && os.Args[3] == "--manual-switch")) && os.Args[2] == "recover-preparation" {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
-		var s assistant.HandoffState
-		var e error
-		if len(os.Args) == 4 {
-			s, e = r.ReviewManualNativePreparation(ctx)
-		} else {
-			s, e = r.ReviewNativePreparation(ctx)
-		}
-		if e != nil {
-			s.Message = e.Error()
-		}
-		_ = json.NewEncoder(os.Stdout).Encode(s)
-		return
-	}
-	if len(os.Args) == 4 && os.Args[2] == "check" {
-		ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
-		defer cancel()
-		_ = json.NewEncoder(os.Stdout).Encode(r.CheckNativeAccounts(ctx, os.Args[3]))
-		return
-	}
-	fmt.Fprintln(os.Stderr, "Usage: codex-helper accounts status | check desktop|cli | recover-preparation [--manual-switch]")
-	os.Exit(2)
 }
 
 func handoffCommand() {
@@ -257,8 +218,6 @@ func warmupCommand() {
 		report, err = r.ConfigureWarmup(ctx, false)
 	case "check":
 		report, err = r.CheckWarmup(ctx, "")
-	case "refresh":
-		report, err = r.RefreshWarmup(ctx)
 	case "schedule":
 		if len(os.Args) != 6 || (os.Args[3] != "on" && os.Args[3] != "off") {
 			fmt.Fprintln(os.Stderr, "Usage: codex-helper warmup schedule on|off HH:MM HH:MM")
@@ -272,7 +231,7 @@ func warmupCommand() {
 		}
 		report, err = r.CheckWarmup(ctx, os.Args[3])
 	default:
-		fmt.Fprintln(os.Stderr, "Usage: codex-helper warmup status|enable|disable|check|refresh|probe <account>")
+		fmt.Fprintln(os.Stderr, "Usage: codex-helper warmup status|enable|disable|check|probe <account>")
 		os.Exit(2)
 	}
 	if err != nil {

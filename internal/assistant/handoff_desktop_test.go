@@ -160,25 +160,6 @@ func TestDesktopContinueQuotaFailedTurnAfterRestart(t *testing.T) {
 	}
 }
 
-func TestDesktopDefaultEffortKeepsNativeAPIShape(t *testing.T) {
-	var request map[string]any
-	ipc, close := fakeIPC(t, func(m map[string]any) map[string]any {
-		request = m["params"].(map[string]any)["turnStart"].(map[string]any)["request"].(map[string]any)
-		return map[string]any{"type": "response", "requestId": m["requestId"], "resultType": "success", "result": map[string]any{"result": map[string]any{"turn": map[string]any{"id": "next", "status": "inProgress"}}}}
-	})
-	defer close()
-	_, err := ipc.startDesktopTurn("thread", "owner", resumeTurn{ID: "old", Params: map[string]json.RawMessage{"effort": json.RawMessage(`"default"`), "collaborationMode": json.RawMessage(`{"mode":"default","settings":{"model":"fixture","reasoning_effort":null,"developer_instructions":null}}`)}}, "继续")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, exists := request["effort"]; exists {
-		t.Fatal("internal default marker sent as unsupported API effort")
-	}
-	if request["collaborationMode"] == nil {
-		t.Fatal("explicit default collaboration settings lost")
-	}
-}
-
 func TestDesktopInterruptUsesExactOwnerAndExpectedTurn(t *testing.T) {
 	var sent map[string]any
 	ipc, close := fakeIPC(t, func(m map[string]any) map[string]any {

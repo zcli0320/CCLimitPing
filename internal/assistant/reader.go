@@ -18,8 +18,8 @@ import (
 	"time"
 )
 
-// Snapshot/history/quota readers never write their sources and open SQLite
-// read-only. Native switching uses separate, journaled write operations.
+// Reader never writes to the sources. SQLite is opened explicitly read-only;
+// subprocess stderr and JSON decoder errors cannot leak source content.
 type Reader struct {
 	Home   string
 	SQLite string
@@ -128,8 +128,6 @@ func (r Reader) Snapshot(ctx context.Context) Snapshot {
 		s.CodexHome = ""
 	}
 	s.Accounts, s.Warnings = r.accounts(ctx, ccRoot, settings.CurrentProvider, s.Warnings)
-	allocation := r.AccountAllocation()
-	s.Allocation = &allocation
 	// The user deliberately split Desktop and CLI. CC Switch's configured
 	// directory remains metadata, and must not redirect both session readers.
 	s.Sources = []SessionSource{
@@ -169,12 +167,10 @@ func (r Reader) Snapshot(ctx context.Context) Snapshot {
 	handoff := r.HandoffStatus()
 	_, recoveryErr := os.Lstat(r.handoffAuthTransactionPath())
 	_, ccRecoveryErr := os.Lstat(r.ccSwitchTransactionPath())
-	_, nativeRecoveryErr := os.Lstat(r.nativeTransactionPath())
 	var runner cliRunnerState
 	runnerReady := readJSON(r.cliRunnerPath(), &runner) == nil && runner.Ready && runner.ClientPID > 0 && syscall.Kill(runner.ClientPID, 0) == nil && r.cliManaged(handoff.SessionID)
 	ready := (handoff.Scope == "cli" && runnerReady) || (handoff.Scope == "desktop" && r.desktopRunnerReady(handoff))
 	s.Handoff = &HandoffSummary{Enabled: handoff.Enabled, Scope: handoff.Scope, SessionID: handoff.SessionID, Threshold: handoff.Threshold, Stage: handoff.Stage, Message: handoff.Message, RecoveryPending: recoveryErr == nil || !os.IsNotExist(recoveryErr) || !os.IsNotExist(ccRecoveryErr), RunnerReady: handoff.Enabled && ready}
-	s.Handoff.RecoveryPending = s.Handoff.RecoveryPending || !os.IsNotExist(nativeRecoveryErr)
 	if handoff.Enabled && handoff.Scope == "cli" && !r.cliManaged(handoff.SessionID) {
 		s.Handoff.Enabled = false
 		s.Handoff.Message = "托管终端未运行，自动切号已暂停；请检查原会话状态。"

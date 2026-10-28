@@ -18,7 +18,6 @@ import (
 // into this structure. A pending action means its external result is unknown.
 type HandoffState struct {
 	Version         int     `json:"version"`
-	Backend         string  `json:"backend,omitempty"`
 	Enabled         bool    `json:"enabled"`
 	AuthorizationID string  `json:"authorization_id,omitempty"`
 	Scope           string  `json:"scope"`
@@ -37,7 +36,6 @@ type HandoffState struct {
 	InterruptSent   bool    `json:"interrupt_sent,omitempty"`
 	ActionAt        int64   `json:"action_at,omitempty"`
 	LastStage       string  `json:"last_stage,omitempty"`
-	PrepareAfter    int64   `json:"prepare_after,omitempty"`
 }
 
 type HandoffAction string
@@ -49,19 +47,16 @@ type handoffSafeError string
 func (e handoffSafeError) Error() string { return string(e) }
 
 const (
-	HandoffPrepareTarget HandoffAction = "prepare_target"
-	HandoffRequestStop   HandoffAction = "request_stop"
-	HandoffInterrupt     HandoffAction = "interrupt"
-	HandoffExit          HandoffAction = "exit"
-	HandoffSwitch        HandoffAction = "switch"
-	HandoffRestart       HandoffAction = "restart"
-	HandoffContinue      HandoffAction = "continue"
+	HandoffRequestStop HandoffAction = "request_stop"
+	HandoffInterrupt   HandoffAction = "interrupt"
+	HandoffExit        HandoffAction = "exit"
+	HandoffSwitch      HandoffAction = "switch"
+	HandoffRestart     HandoffAction = "restart"
+	HandoffContinue    HandoffAction = "continue"
 )
 
 func handoffActionLabel(action HandoffAction) string {
 	switch action {
-	case HandoffPrepareTarget:
-		return "双端账号准备"
 	case HandoffRequestStop:
 		return "收尾请求"
 	case HandoffInterrupt:
@@ -83,8 +78,6 @@ func handoffActionLabel(action HandoffAction) string {
 // timestamp or from the display title. False includes unknown. Observation must
 // be read-only; the adapter owns the meaning and provenance of every flag.
 type HandoffObservation struct {
-	NeedsPreparation      bool
-	AllocationConflict    bool
 	Warning               string
 	TargetMatches         bool
 	Running               bool
@@ -163,7 +156,7 @@ func validHandoffThreshold(v float64) bool {
 
 func (r Reader) HandoffStatus() HandoffState {
 	s := HandoffState{Version: 1, Threshold: 10, Stage: "off", Message: "自动切号未开启"}
-	if readState(r.handoffPath(), &s) != nil || (s.Version != 1 && s.Version != 2) || !validHandoffThreshold(s.Threshold) {
+	if readState(r.handoffPath(), &s) != nil || s.Version != 1 || !validHandoffThreshold(s.Threshold) {
 		return HandoffState{Version: 1, Stage: "error", Message: "交接状态不可读取，已停止"}
 	}
 	return s
@@ -173,10 +166,6 @@ func (r Reader) HandoffStatus() HandoffState {
 // contact either account. An unresolved external action cannot be discarded by
 // merely enabling the feature again.
 func (r Reader) ConfigureHandoff(scope, sessionID string, threshold float64, enabled bool) (HandoffState, error) {
-	return r.configureHandoff(scope, sessionID, threshold, enabled, "")
-}
-
-func (r Reader) configureHandoff(scope, sessionID string, threshold float64, enabled bool, backend string) (HandoffState, error) {
 	// A cancellation marker is written before trying the coordinator lock, so
 	// a user changing targets does not wait for a network request to finish.
 	if !enabled {
@@ -205,8 +194,7 @@ func (r Reader) configureHandoff(scope, sessionID string, threshold float64, ena
 		// Preserve the journal and require inspection before a fresh handoff.
 		_, txnErr := os.Lstat(r.handoffAuthTransactionPath())
 		_, ccErr := os.Lstat(r.ccSwitchTransactionPath())
-		_, nativeErr := os.Lstat(r.nativeTransactionPath())
-		if os.IsNotExist(txnErr) && os.IsNotExist(ccErr) && os.IsNotExist(nativeErr) && s.PendingAction == "" && (s.Stage == "off" || s.Stage == "watching" || s.Stage == "ready_prepare" || s.Stage == "ready_stop" || s.Stage == "completed" || s.Stage == "cancelled") {
+		if os.IsNotExist(txnErr) && os.IsNotExist(ccErr) && s.PendingAction == "" && (s.Stage == "off" || s.Stage == "watching" || s.Stage == "ready_stop" || s.Stage == "completed" || s.Stage == "cancelled") {
 			s.Stage, s.Message = "off", "自动切号已关闭"
 		} else {
 			s.LastStage = s.Stage
@@ -225,9 +213,6 @@ func (r Reader) configureHandoff(scope, sessionID string, threshold float64, ena
 	if _, err := os.Lstat(r.ccSwitchTransactionPath()); !os.IsNotExist(err) {
 		return s, errors.New("仍有 CC Switch 切换恢复记录，请先核查")
 	}
-	if _, err := os.Lstat(r.nativeTransactionPath()); !os.IsNotExist(err) {
-		return s, errors.New("仍有双端账号交换记录，请先核查")
-	}
 	if (scope != "desktop" && scope != "cli") || !validHandoffText(sessionID) || !validHandoffThreshold(threshold) {
 		return s, errors.New("会话或阈值无效")
 	}
@@ -239,10 +224,7 @@ func (r Reader) configureHandoff(scope, sessionID string, threshold float64, ena
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return s, errors.New("无法创建交接授权")
 	}
-	s = HandoffState{Version: 1, Backend: backend, Enabled: true, AuthorizationID: hex.EncodeToString(nonce[:]), Scope: scope, SessionID: sessionID, Threshold: threshold, Stage: "watching", Message: "等待所选会话触发交接"}
-	if backend == nativeBackend {
-		s.Version = 2
-	}
+	s = HandoffState{Version: 1, Enabled: true, AuthorizationID: hex.EncodeToString(nonce[:]), Scope: scope, SessionID: sessionID, Threshold: threshold, Stage: "watching", Message: "等待所选会话触发交接"}
 	return s, writeState(r.handoffPath(), s)
 }
 
@@ -336,14 +318,6 @@ func (r Reader) AdvanceHandoff(ctx context.Context, ops HandoffOperations) (Hand
 			return cancel()
 		}
 		if e := ops.Execute(ctx, action, s); e != nil {
-			if action == HandoffPrepareTarget && (errors.Is(e, errNativeAllocationRepaired) || errors.Is(e, errNativeNotReady)) {
-				s.PendingAction = ""
-				if errors.Is(e, errNativeAllocationRepaired) {
-					return persist("watching", "两端账号已分开，继续监控工作端")
-				}
-				s.PrepareAfter = time.Now().Add(5 * time.Minute).Unix()
-				return persist("watching", "待用账号额度不足，五分钟后重新检查；工作端保持原任务")
-			}
 			s.Enabled, s.Stage, s.Message = false, "uncertain", handoffActionLabel(action)+"结果未确认，请核查原会话和运行状态"
 			var safe handoffSafeError
 			if errors.As(e, &safe) {
@@ -376,16 +350,7 @@ func (r Reader) AdvanceHandoff(ctx context.Context, ops HandoffOperations) (Hand
 			}
 			return s, nil
 		}
-		eligible := o.Running || (o.AlreadyLimited && o.StopConfirmed && o.StoppedForHandoff && o.OtherSessionsIdle)
-		if o.NeedsPreparation && o.TargetMatches && (eligible || o.AllocationConflict) && (o.AllocationConflict || (o.CurrentQuotaKnown && validHandoffPercent(o.CurrentRemaining) && o.CurrentRemaining < s.Threshold && time.Now().Unix() >= s.PrepareAfter)) {
-			if !validHandoffText(o.TurnID) || !validHandoffText(o.SourceAccount) || !validHandoffText(o.TargetAccount) || o.SourceAccount == o.TargetAccount || !validHandoffText(o.Directory) || !validHandoffText(o.Model) || !validHandoffText(o.Effort) || !validHandoffText(o.Permissions) {
-				return s, nil
-			}
-			s.TurnID, s.SourceAccount, s.TargetAccount = o.TurnID, o.SourceAccount, o.TargetAccount
-			s.Directory, s.Model, s.Effort, s.Permissions = o.Directory, o.Model, o.Effort, o.Permissions
-			return persist("ready_prepare", "准备待用端并核对账号分配")
-		}
-		if !o.TargetMatches || !eligible || !o.CurrentQuotaKnown || !validHandoffPercent(o.CurrentRemaining) || o.CurrentRemaining >= s.Threshold {
+		if !o.TargetMatches || (!o.Running && !(o.AlreadyLimited && o.StopConfirmed && o.StoppedForHandoff && o.OtherSessionsIdle)) || !o.CurrentQuotaKnown || !validHandoffPercent(o.CurrentRemaining) || o.CurrentRemaining >= s.Threshold {
 			return s, nil
 		}
 		if !handoffBackupReady(o, s.Threshold) {
@@ -400,11 +365,6 @@ func (r Reader) AdvanceHandoff(ctx context.Context, ops HandoffOperations) (Hand
 			return persist("ready_exit", "原任务已因额度停止，准备退出")
 		}
 		return persist("ready_stop", "已确认备用账号，准备安全收尾")
-	case "ready_prepare":
-		if !handoffFrozenEvidence(o, s) || (!o.Running && !o.AlreadyLimited && !o.AllocationConflict) || o.Directory != s.Directory || o.Model != s.Model || o.Effort != s.Effort || o.Permissions != s.Permissions {
-			return persist("watching", "任务状态变化，继续等待")
-		}
-		return execute(HandoffPrepareTarget, "ready_stop", "待用账号已准备，准备安全收尾")
 	case "ready_stop":
 		if handoffFrozenEvidence(o, s) && o.AlreadyLimited && o.StopConfirmed && o.StoppedForHandoff && o.OtherSessionsIdle && o.Directory == s.Directory && o.Model == s.Model && o.Effort == s.Effort && o.Permissions == s.Permissions && o.CurrentQuotaKnown && validHandoffPercent(o.CurrentRemaining) && o.CurrentRemaining < s.Threshold && handoffBackupReady(o, s.Threshold) {
 			return persist("ready_exit", "原任务已因额度停止，准备退出")
@@ -503,7 +463,7 @@ func (r Reader) rearmCompletedHandoff(expected HandoffState) (HandoffState, bool
 	if current != expected || current.Stage != "completed" || current.Enabled || current.AuthorizationID == "" || r.handoffCancelled(current) {
 		return current, false, nil
 	}
-	current = HandoffState{Version: current.Version, Backend: current.Backend, Enabled: true, AuthorizationID: current.AuthorizationID, Scope: current.Scope, SessionID: current.SessionID, Threshold: current.Threshold, Stage: "watching", Message: "交接完成，继续监控此会话"}
+	current = HandoffState{Version: 1, Enabled: true, AuthorizationID: current.AuthorizationID, Scope: current.Scope, SessionID: current.SessionID, Threshold: current.Threshold, Stage: "watching", Message: "交接完成，继续监控此会话"}
 	if err := writeState(r.handoffPath(), current); err != nil {
 		return current, false, err
 	}
@@ -536,9 +496,6 @@ func (r Reader) handoffCleanupUncertain(expected HandoffState) (HandoffState, er
 func (r Reader) AcknowledgeHandoff() (HandoffState, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
-	if _, err := os.Lstat(r.nativeTransactionPath()); !os.IsNotExist(err) {
-		return r.ReviewNativePreparation(ctx)
-	}
 	client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
 	return r.acknowledgeHandoff(ctx, func(ctx context.Context, c quotaCredential) AccountQuota { return queryAccountQuota(ctx, client, c) })
 }
@@ -550,9 +507,6 @@ func (r Reader) acknowledgeHandoff(ctx context.Context, verify func(context.Cont
 	}
 	defer unlock()
 	s := r.HandoffStatus()
-	if _, e := os.Lstat(r.nativeTransactionPath()); !os.IsNotExist(e) {
-		return s, errors.New("原生双端交换记录需要专门核查；已保留凭证恢复副本")
-	}
 	if _, err := os.Lstat(r.ccSwitchTransactionPath()); err == nil {
 		return r.reviewCCSwitchHandoff(ctx, s, verify)
 	} else if !os.IsNotExist(err) {

@@ -90,21 +90,6 @@ func desktopPersistedTurn(home string, v desktopConversation, turn resumeTurn) (
 			params[to] = raw
 		}
 	}
-	// New Desktop turns can explicitly request the model's default effort in
-	// collaboration settings while omitting the top-level persisted effort. This
-	// is affirmative default intent, not permission to discard a known effort.
-	if len(params["effort"]) == 0 {
-		var mode struct {
-			Settings map[string]json.RawMessage `json:"settings"`
-		}
-		var snapshotEffort string
-		_ = json.Unmarshal(turn.Params["effort"], &snapshotEffort)
-		if json.Unmarshal(context["collaboration_mode"], &mode) != nil || mode.Settings == nil || string(mode.Settings["reasoning_effort"]) != "null" || (snapshotEffort != "" && snapshotEffort != "default") {
-			return turn, invalid
-		}
-		params["effort"] = json.RawMessage(`"default"`)
-		params["saved_default_effort"] = json.RawMessage(`true`)
-	}
 	// Persisted sandbox enums use snake/kebab case; turn/start uses camelCase.
 	var sandbox map[string]json.RawMessage
 	if json.Unmarshal(params["sandboxPolicy"], &sandbox) != nil {

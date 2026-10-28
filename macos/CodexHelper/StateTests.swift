@@ -35,11 +35,9 @@ enum Tests {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: dir) }
         let store = StateStore(directory: dir)
-		state.handoffThreshold="8"
         try store.save(state)
         let loaded = store.load()
         precondition(loaded.selectedKey == "a" && !loaded.observing, "Restart requires fresh observation opt-in")
-		precondition(loaded.handoffThreshold == "8", "Restart must retain the user's threshold")
         precondition(loaded.expandedProjects == [projectKey("/project")] && loaded.projectLayoutInitialized)
         let attrs = try FileManager.default.attributesOfItem(atPath: store.file.path)
         precondition((attrs[.posixPermissions] as? NSNumber)?.intValue == 0o600)
@@ -94,10 +92,6 @@ enum Tests {
         {"enabled":false,"authorization_pending":true,"scope":"desktop","session_id":"fixture","threshold":8,"stage":"uncertain","message":"执行器已停止"}
         """.utf8))
         precondition(!deadRunner.enabled && deadRunner.hasAuthorization, "A stopped runner must retain the Stop control until stale authority is revoked")
-		let allocation = try JSONDecoder().decode(AccountAllocationReport.self, from: Data("""
-		{"clients":[{"scope":"desktop","home":"/isolated/.codex","name":"账号 A","status":"matched","message":"disk only"},{"scope":"cli","home":"/isolated/.codex-cli","name":"账号 B","status":"matched","message":"disk only"}],"distinct":true,"working_scope":"desktop","message":"两端账号不同"}
-		""".utf8))
-		precondition(allocation.distinct && allocation.working_scope == "desktop" && allocation.caption.contains("Desktop：账号 A") && allocation.caption.contains("CLI：账号 B"), "Dual-client allocation must decode and distinguish both scopes")
         let started = Date()
         let schedule = WarmupSchedule(enabled: true, start: "22:00", end: "08:00", time_zone: "Asia/Singapore")
         precondition(schedule.caption.contains("次日 08:00"))
@@ -106,14 +100,6 @@ enum Tests {
         """
         let waiting = try JSONDecoder().decode(WarmupReport.self, from: Data(scheduleJSON.utf8))
         precondition(waiting.summary.contains("22:00") && waiting.summary.contains("时段外等待"))
-        let refreshedWarmup = try JSONDecoder().decode(WarmupReport.self, from: Data("""
-        {"enabled":true,"message":"已检查","available":true,"accounts":[{"key":"fixture","name":"账号 A","status":"window_running","message":"窗口运行中","last_check":"2026-10-28T02:03:04.125Z","attempts":2}]}
-        """.utf8))
-        precondition(refreshedWarmup.summary.contains("最后核查 10/28 10:03"), "Warmup must show the persisted check time in UTC+8")
-        let legacyWarmup = try JSONDecoder().decode(WarmupReport.self, from: Data("""
-        {"enabled":true,"message":"旧状态","available":true,"accounts":[{"key":"fixture","name":"账号 A","status":"window_running","message":"窗口运行中","attempts":2}]}
-        """.utf8))
-        precondition(!legacyWarmup.summary.contains("最后核查"), "Legacy warmup state must not invent a check time")
         do {
             _ = try BridgeClient.read(executable: URL(fileURLWithPath: "/bin/sleep"), arguments: ["5"], timeout: 0.1)
             preconditionFailure("Hung bridge was not timed out")

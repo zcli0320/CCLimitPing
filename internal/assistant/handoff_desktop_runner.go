@@ -120,14 +120,17 @@ func (r Reader) PrepareDesktopHandoff(ctx context.Context, id string, threshold 
 	if err != nil {
 		return r.HandoffStatus(), err
 	}
-	_ = target
-	if err := newNativeDualSwitcher(r).inspect(ctx, "desktop"); err != nil {
+	bridge, err := newDesktopCCSwitch(r)
+	if err != nil {
+		return r.HandoffStatus(), err
+	}
+	if err := bridge.inspect(ctx, target); err != nil {
 		return r.HandoffStatus(), err
 	}
 	if _, err := newDesktopHandoffLifecycle(ctx, r.Home); err != nil {
 		return r.HandoffStatus(), err
 	}
-	return r.configureNativeHandoff("desktop", id, threshold)
+	return r.ConfigureHandoff("desktop", id, threshold, true)
 }
 
 func (r Reader) RunDesktopHandoff(ctx context.Context, id string, threshold float64, authorizationID string) error {
@@ -139,21 +142,12 @@ func (r Reader) RunDesktopHandoff(ctx context.Context, id string, threshold floa
 		return errors.New("该会话的切号授权已变化")
 	}
 	client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
-	var bridge *desktopCCSwitch
-	var native *nativeDualSwitcher
-	var err error
-	if state.Backend == nativeBackend {
-		native = newNativeDualSwitcher(r)
-		defer native.close()
-	} else {
-		bridge, err = newDesktopCCSwitch(r)
-		if err != nil {
-			return err
-		}
+	bridge, err := newDesktopCCSwitch(r)
+	if err != nil {
+		return err
 	}
 	deps := desktopRunnerDependencies{
 		ccswitch: bridge,
-		native:   native,
 		makeRuntime: func(ctx context.Context, provider string) (desktopHandoffRuntime, error) {
 			lifecycle, err := newDesktopHandoffLifecycle(ctx, r.Home)
 			if err != nil {
@@ -179,31 +173,17 @@ func (r Reader) RunDesktopHandoff(ctx context.Context, id string, threshold floa
 			runtime.baselineEffort = ""
 			runtime.baselinePermissions = ""
 			runtime.launchRequested = false
-			runtime.exitRequested = false
 			runtime.continuedTurn = ""
 			return nil
 		},
 		quota: func(ctx context.Context, c quotaCredential) AccountQuota { return queryAccountQuota(ctx, client, c) },
 		tick:  2 * time.Second, watchInterval: 30 * time.Second,
 	}
-	err = r.runDesktopHandoff(ctx, id, threshold, authorizationID, deps)
-	if native != nil {
-		native.close()
-		state := r.HandoffStatus()
-		if !state.Enabled && state.Stage == "uncertain" && state.PendingAction == "" {
-			if t, e := native.txn(); e == nil && t.Phase == "prepared" && len(t.Files) == 0 {
-				review, done := context.WithTimeout(context.Background(), 15*time.Second)
-				_, _ = r.ReviewNativePreparation(review)
-				done()
-			}
-		}
-	}
-	return err
+	return r.runDesktopHandoff(ctx, id, threshold, authorizationID, deps)
 }
 
 type desktopRunnerDependencies struct {
 	ccswitch            *desktopCCSwitch
-	native              *nativeDualSwitcher
 	makeRuntime         func(context.Context, string) (desktopHandoffRuntime, error)
 	resetRuntime        func(context.Context, desktopHandoffRuntime) error
 	quota               func(context.Context, quotaCredential) AccountQuota
@@ -247,7 +227,7 @@ func (r Reader) runDesktopHandoff(ctx context.Context, id string, threshold floa
 	if err != nil {
 		return err
 	}
-	d := &desktopHandoffCoordinator{r: r, id: id, provider: provider, source: source, target: target, runtime: runtime, quota: deps.quota, ccswitch: deps.ccswitch, native: deps.native}
+	d := &desktopHandoffCoordinator{r: r, id: id, provider: provider, source: source, target: target, runtime: runtime, quota: deps.quota, ccswitch: deps.ccswitch}
 	if r.HandoffStatus() != state || r.handoffCancelled(state) {
 		return errors.New("切号授权已取消")
 	}

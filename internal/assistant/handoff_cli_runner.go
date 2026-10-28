@@ -115,7 +115,6 @@ func (i *cliHandoffInput) forward(b []byte) {
 }
 
 type cliHandoffSupervisor struct {
-	native          *nativeDualSwitcher
 	r               Reader
 	ctx             context.Context
 	id              string
@@ -252,22 +251,16 @@ func (s *cliHandoffSupervisor) stopForHandoff(ctx context.Context) error {
 	return nil
 }
 func (s *cliHandoffSupervisor) stopDetached(ctx context.Context) error {
-	// Teardown owns both processes. A stuck terminal must not prevent the
-	// backend from receiving its one shutdown request and becoming orphaned.
-	tuiRequestErr := s.tui.requestStop()
-	serverRequestErr := s.server.requestStop()
-	tuiErr := s.tui.stop(ctx)
+	if err := s.tui.stop(ctx); err != nil {
+		return handoffSafeError("托管终端未能退出")
+	}
 	if s.terminal != nil {
 		_ = s.terminal.Close()
 		s.terminal = nil
 	}
 	// A real backend can take longer than the terminal to close network and
 	// session resources. The result is still checked before touching auth.
-	serverErr := s.server.stopWithTimeout(ctx, 10*time.Second)
-	if tuiRequestErr != nil || tuiErr != nil {
-		return handoffSafeError("托管终端未能退出")
-	}
-	if serverRequestErr != nil || serverErr != nil {
+	if err := s.server.stopWithTimeout(ctx, 10*time.Second); err != nil {
 		return handoffSafeError("托管后端未能退出")
 	}
 	return nil
@@ -330,9 +323,6 @@ func (s *cliHandoffSupervisor) identifyAccounts(ctx context.Context) error {
 	return nil
 }
 func (s *cliHandoffSupervisor) backupEvidence(ctx context.Context, threshold float64) (AccountQuota, bool) {
-	if s.native != nil {
-		return s.native.evidence(ctx, s.r.HandoffStatus())
-	}
 	prep, candidate, err := s.r.prepareHandoffAuth("cli", s.targetID, time.Now())
 	if err != nil {
 		return AccountQuota{}, false
@@ -360,10 +350,6 @@ func (s *cliHandoffSupervisor) currentIdentityOK(now time.Time) bool {
 }
 func (s *cliHandoffSupervisor) Observe(ctx context.Context, state HandoffState) (HandoffObservation, error) {
 	o := HandoffObservation{TargetMatches: state.Scope == "cli" && state.SessionID == s.id, SourceAccount: s.sourceID, TargetAccount: s.targetID}
-	if s.native != nil {
-		o.NeedsPreparation = !s.native.ready
-		o.AllocationConflict = !s.r.AccountAllocation().Distinct
-	}
 	if !o.TargetMatches {
 		return o, nil
 	}
@@ -428,12 +414,11 @@ func (s *cliHandoffSupervisor) Observe(ctx context.Context, state HandoffState) 
 		return o, nil
 	}
 	o.TurnID = turn.ID
-	if state.Stage == "watching" || state.Stage == "ready_prepare" || state.Stage == "ready_stop" {
+	if state.Stage == "watching" || state.Stage == "ready_stop" {
 		active := thread.Status.Type == "active" && turn.Status == "inProgress" && len(thread.Status.ActiveFlags) == 0
-		limited := (state.Stage == "watching" || state.Stage == "ready_prepare" || state.Stage == "ready_stop") && s.seenActiveTurn == turn.ID && (thread.Status.Type == "idle" || thread.Status.Type == "systemError") && turn.Status == "failed" && usageLimitError(turn.Error) && turn.toolsStopped()
-		repairIdle := s.native != nil && o.AllocationConflict && thread.Status.Type == "idle" && turn.Status != "inProgress" && turn.toolsStopped()
+		limited := state.Stage == "watching" && s.seenActiveTurn == turn.ID && (thread.Status.Type == "idle" || thread.Status.Type == "systemError") && turn.Status == "failed" && usageLimitError(turn.Error) && turn.toolsStopped()
 		o.Running = active
-		if !active && !limited && !repairIdle {
+		if !active && !limited {
 			if state.Stage == "ready_stop" {
 				o.FinishedNormally = true
 			}
@@ -466,9 +451,6 @@ func (s *cliHandoffSupervisor) Observe(ctx context.Context, state HandoffState) 
 		o.Model = settings.Model
 		o.Effort = settings.Effort
 		o.Permissions = string(encoded)
-		if repairIdle {
-			return o, nil
-		}
 		if state.Stage == "watching" {
 			s.preparedOK = false
 		}
@@ -505,7 +487,7 @@ func (s *cliHandoffSupervisor) Observe(ctx context.Context, state HandoffState) 
 		o.TargetQuotaKnown = ready
 		o.TargetWeeklyUsable = ready
 		o.TargetRemaining, _ = handoffWindow(&q, 18000)
-		if limited && (ready || s.native != nil) {
+		if limited && ready {
 			o.OtherSessionsIdle, err = otherHandoffCLIThreadsIdle(ctx, s.socket, s.id, s.provider)
 			if err != nil {
 				return o, err
@@ -560,9 +542,6 @@ func (s *cliHandoffSupervisor) Observe(ctx context.Context, state HandoffState) 
 	return o, nil
 }
 func (s *cliHandoffSupervisor) authTargetInstalled() bool {
-	if s.native != nil {
-		return s.native.installed(s.r.HandoffStatus())
-	}
 	path, err := s.r.handoffAuthPath("cli")
 	if err != nil {
 		return false
@@ -626,15 +605,10 @@ func (s *cliHandoffSupervisor) verifyTarget(ctx context.Context) error {
 	})
 }
 func (s *cliHandoffSupervisor) Execute(ctx context.Context, action HandoffAction, state HandoffState) error {
-	if action != HandoffRequestStop && action != HandoffPrepareTarget && !s.armedInputUnchanged() {
+	if action != HandoffRequestStop && !s.armedInputUnchanged() {
 		return handoffSafeError("检测到手动输入")
 	}
 	switch action {
-	case HandoffPrepareTarget:
-		if s.native == nil {
-			return errors.New("原生后端不可用")
-		}
-		return s.native.prepare(ctx, state)
 	case HandoffRequestStop:
 		s.input.Lock()
 		defer s.input.Unlock()
@@ -657,9 +631,6 @@ func (s *cliHandoffSupervisor) Execute(ctx context.Context, action HandoffAction
 	case HandoffExit:
 		return s.stopForHandoff(ctx)
 	case HandoffSwitch:
-		if s.native != nil {
-			return s.native.switchAccount(ctx, state, s.stoppedForHandoff)
-		}
 		if !s.preparedOK {
 			return errors.New("备用认证未准备")
 		}
@@ -771,10 +742,6 @@ func (s *cliHandoffSupervisor) Execute(ctx context.Context, action HandoffAction
 // PrepareCLIHandoff binds authorization before a terminal is launched. This
 // lets changing the GUI selection cancel even while Terminal is starting.
 func (r Reader) PrepareCLIHandoff(ctx context.Context, id string, threshold float64) (HandoffState, error) {
-	return r.prepareCLIHandoff(ctx, id, threshold, newNativeDualSwitcher(r))
-}
-
-func (r Reader) prepareCLIHandoff(ctx context.Context, id string, threshold float64, backend *nativeDualSwitcher) (HandoffState, error) {
 	if !validHandoffThreshold(threshold) {
 		return r.HandoffStatus(), errors.New("阈值无效")
 	}
@@ -803,10 +770,7 @@ func (r Reader) prepareCLIHandoff(ctx context.Context, id string, threshold floa
 	if _, err := r.scopeCredential("cli", time.Now()); err != nil {
 		return r.HandoffStatus(), err
 	}
-	if err := backend.inspect(ctx, "cli"); err != nil {
-		return r.HandoffStatus(), err
-	}
-	return r.configureNativeHandoff("cli", id, threshold)
+	return r.ConfigureHandoff("cli", id, threshold, true)
 }
 
 func (r Reader) RunCLIHandoff(ctx context.Context, id string, threshold float64, authorizationID string) error {
@@ -858,10 +822,6 @@ func (r Reader) RunCLIHandoff(ctx context.Context, id string, threshold float64,
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	s := &cliHandoffSupervisor{r: r, ctx: ctx, id: id, cwd: selected.Project, exe: exe, socket: filepath.Join(root, "control.sock"), env: cliEnvironment(r.Home), provider: provider, input: &cliHandoffInput{}, client: &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}}
-	if authorized.Backend == nativeBackend {
-		s.native = newNativeDualSwitcher(r)
-		defer s.native.close()
-	}
 	if err = s.identifyAccounts(ctx); err != nil {
 		return err
 	}
@@ -952,13 +912,7 @@ func (r Reader) RunCLIHandoff(ctx context.Context, id string, threshold float64,
 					fmt.Fprintln(os.Stderr, updated.Message)
 				}
 				if updated.Stage == "completed" {
-					var cleanupErr error
-					if s.native != nil {
-						cleanupErr = s.native.finish(ctx, updated, s.verifyAccountID)
-					} else {
-						cleanupErr = r.finishHandoffAuth(ctx, s.verifyAccountID)
-					}
-					if err := cleanupErr; err != nil {
+					if err := r.finishHandoffAuth(ctx, s.verifyAccountID); err != nil {
 						fmt.Fprintln(os.Stderr, "认证恢复副本等待核验清理：", err)
 						_, _ = r.handoffCleanupUncertain(updated)
 					} else if _, rearmed, err := r.rearmCompletedHandoff(updated); err != nil {

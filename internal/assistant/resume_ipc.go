@@ -253,9 +253,6 @@ func (c *desktopIPC) startDesktopTurn(id, owner string, turn resumeTurn, message
 	// attachments must not be resubmitted. The owner inherits current settings.
 	for _, key := range []string{"cwd", "model", "effort", "serviceTier", "collaborationMode", "multiAgentMode", "summary", "personality", "outputSchema", "approvalPolicy", "approvalsReviewer", "sandboxPolicy", "permissions", "disabledPluginIds"} {
 		if value, ok := turn.Params[key]; ok && string(value) != "null" {
-			if key == "effort" && string(value) == `"default"` {
-				continue
-			}
 			request[key] = value
 		}
 	}

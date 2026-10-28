@@ -259,17 +259,6 @@ func decideWarmup(q AccountQuota, record *WarmupAccount, now time.Time, probe bo
 		}
 		return true
 	}
-	resetKnown := five.ResetAt != nil && *five.ResetAt > 0
-	if five.ResetAfter != nil {
-		resetKnown = *five.ResetAfter >= 0 && *five.ResetAfter <= five.Seconds
-	}
-	if !resetKnown {
-		record.Status = "window_unknown"
-		record.Message = "五小时窗口重置时间未知，等待完整数据；不发送预热请求"
-		record.IdleObserved = time.Time{}
-		record.NextCheck = now.Add(5 * time.Minute)
-		return false
-	}
 	if windowRunning(*five, now) {
 		record.Status = "window_running"
 		record.Message = "五小时窗口已运行，无需额外预热"
@@ -305,46 +294,17 @@ func decideWarmup(q AccountQuota, record *WarmupAccount, now time.Time, probe bo
 }
 
 type warmupDependencies struct {
-	now      func() time.Time
-	quota    func(context.Context, quotaCredential) AccountQuota
-	run      func(context.Context, string, quotaCredential, func() error) (WarmupExecution, error)
-	busy     func([]string) bool
-	activity func([]string) (bool, error)
-}
-
-func (d warmupDependencies) accountActivity(sources []string) (bool, error) {
-	if d.activity != nil {
-		return d.activity(sources)
-	}
-	if d.busy != nil {
-		return d.busy(sources), nil
-	}
-	return false, errors.New("账号活动状态无法确认，暂缓预热")
+	now   func() time.Time
+	quota func(context.Context, quotaCredential) AccountQuota
+	run   func(context.Context, string, quotaCredential, func() error) (WarmupExecution, error)
+	busy  func([]string) bool
 }
 
 func (r Reader) CheckWarmup(ctx context.Context, probeID string) (WarmupReport, error) {
-	return r.checkWarmupMode(ctx, probeID, false, r.warmupDependencies())
-}
-
-// RefreshWarmup bypasses cached check times but never starts a model request.
-// Existing request claims, cooldowns, and automatic policy remain unchanged.
-func (r Reader) RefreshWarmup(ctx context.Context) (WarmupReport, error) {
-	return r.checkWarmupMode(ctx, "", true, r.warmupDependencies())
-}
-
-func (r Reader) warmupDependencies() warmupDependencies {
 	client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
-	return warmupDependencies{now: time.Now, quota: func(ctx context.Context, c quotaCredential) AccountQuota { return queryAccountQuota(ctx, client, c) }, run: runIsolatedWarmup, activity: func(s []string) (bool, error) { return r.activityStatus(s, time.Now()) }}
+	return r.checkWarmup(ctx, probeID, warmupDependencies{now: time.Now, quota: func(ctx context.Context, c quotaCredential) AccountQuota { return queryAccountQuota(ctx, client, c) }, run: runIsolatedWarmup, busy: func(s []string) bool { return r.recentActivity(s, time.Now()) }})
 }
 func (r Reader) checkWarmup(ctx context.Context, probeID string, d warmupDependencies) (WarmupReport, error) {
-	return r.checkWarmupMode(ctx, probeID, false, d)
-}
-func (r Reader) checkWarmupMode(ctx context.Context, probeID string, refreshOnly bool, d warmupDependencies) (WarmupReport, error) {
-	if _, err := os.Lstat(r.nativeTransactionPath()); !os.IsNotExist(err) {
-		report := r.WarmupStatus()
-		report.Message = "双端账号交换或恢复核查期间暂停预热"
-		return report, nil
-	}
 	unlock, err := lockWarmup(filepath.Join(r.warmupRoot(), "execution.lock"))
 	if err != nil {
 		return r.WarmupStatus(), err
@@ -354,11 +314,11 @@ func (r Reader) checkWarmupMode(ctx context.Context, probeID string, refreshOnly
 	if err != nil {
 		return WarmupReport{}, err
 	}
-	if !p.Enabled && probeID == "" && !refreshOnly {
+	if !p.Enabled && probeID == "" {
 		return r.warmupReport(p, j), nil
 	}
 	schedule := scheduleOf(p)
-	if probeID == "" && !refreshOnly && !schedule.permits(d.now()) {
+	if probeID == "" && !schedule.permits(d.now()) {
 		report := r.warmupReport(p, j)
 		report.ScheduleAllowed = false
 		next := schedule.nextOpening(d.now())
@@ -383,7 +343,7 @@ func (r Reader) checkWarmupMode(ctx context.Context, probeID string, refreshOnly
 		if probeID == "" && !p.Allowed[privateKey(account.ID)] {
 			continue
 		}
-		if probeID == "" && !refreshOnly {
+		if probeID == "" {
 			fresh, _, e := r.readWarmupState()
 			if e != nil {
 				return r.warmupReport(p, j), e
@@ -420,11 +380,10 @@ func (r Reader) checkWarmupMode(ctx context.Context, probeID string, refreshOnly
 		record.Name = account.Name
 		// A newly available credential should clear an old missing-credential
 		// status on the next scheduler tick, without waiting out its backoff.
-		if probeID == "" && !refreshOnly && record.NextCheck.After(d.now()) && !(ok && record.Status == "credential_unavailable") {
+		if probeID == "" && record.NextCheck.After(d.now()) && !(ok && record.Status == "credential_unavailable") {
 			continue
 		}
 		if !ok {
-			record.LastCheck = d.now()
 			record.Status = "credential_unavailable"
 			record.Message = "等待 CC Switch 提供该账号的有效访问凭证"
 			record.NextCheck = d.now().Add(5 * time.Minute)
@@ -434,20 +393,9 @@ func (r Reader) checkWarmupMode(ctx context.Context, probeID string, refreshOnly
 		if !decideWarmup(q, record, d.now(), probeID != "") {
 			continue
 		}
-		if probeID == "" {
-			busy, activityErr := d.accountActivity(credential.sources)
-			if activityErr != nil || busy {
-				record.Status, record.Message = "account_busy", "对应账号目录近期有任务活动，稍后再检查"
-				if activityErr != nil {
-					record.Status, record.Message = "activity_unknown", activityErr.Error()
-				}
-				record.NextCheck = d.now().Add(time.Minute)
-				continue
-			}
-		}
-		if refreshOnly {
-			record.Status = "ready_to_warmup"
-			record.Message = "已重新查询：窗口未启动；本次仅检查，后续按自动策略调度"
+		if probeID == "" && d.busy(credential.sources) {
+			record.Status = "account_busy"
+			record.Message = "对应账号目录近期有任务活动，稍后再检查"
 			record.NextCheck = d.now().Add(time.Minute)
 			continue
 		}
@@ -473,12 +421,7 @@ func (r Reader) checkWarmupMode(ctx context.Context, probeID string, refreshOnly
 				if !decideWarmup(d.quota(ctx, fresh), record, d.now(), false) {
 					return errors.New("窗口状态已变化，取消本次请求")
 				}
-				busy, activityErr := d.accountActivity(fresh.sources)
-				if activityErr != nil {
-					record.Status = "activity_unknown"
-					return activityErr
-				}
-				if busy {
+				if d.busy(fresh.sources) {
 					record.Status = "account_busy"
 					return errors.New("账号任务活动发生变化，取消本次请求")
 				}
@@ -508,7 +451,7 @@ func (r Reader) checkWarmupMode(ctx context.Context, probeID string, refreshOnly
 		})
 		record.Execution = &execution
 		if !execution.Submitted && runErr != nil {
-			if record.Status != "window_running" && record.Status != "account_busy" && record.Status != "activity_unknown" && record.Status != "window_unknown" {
+			if record.Status != "window_running" && record.Status != "account_busy" {
 				record.Status = "setup_failed"
 			}
 			record.Message = runErr.Error()
@@ -573,9 +516,5 @@ func (r Reader) checkWarmupMode(ctx context.Context, probeID string, refreshOnly
 	if e == nil {
 		p = latest
 	}
-	report := r.warmupReport(p, j)
-	if refreshOnly {
-		report.Message = "已重新查询额度；本次仅检查，不发送预热请求"
-	}
-	return report, nil
+	return r.warmupReport(p, j), nil
 }
