@@ -68,3 +68,45 @@ func TestStaleSupervisorCannotHideALiveBackend(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestSupervisorTeardownStopsBackendWhenTerminalRefusesExit(t *testing.T) {
+	dir := t.TempDir()
+	ready := filepath.Join(dir, "ready")
+	script := filepath.Join(dir, "stuck-terminal.py")
+	if err := os.WriteFile(script, []byte("import signal,time,sys\nsignal.signal(signal.SIGTERM, lambda *args: None)\nopen(sys.argv[1], 'w').close()\nwhile True: time.sleep(0.05)\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	tui, _, err := startOwnedCLIProcess(exec.Command("/usr/bin/python3", script, ready), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tui.cmd.Process.Kill(); <-tui.done }()
+	for deadline := time.Now().Add(3 * time.Second); ; {
+		if _, err := os.Stat(ready); err == nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("terminal fixture did not start")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	server, _, err := startOwnedCLIProcess(exec.Command("/bin/sleep", "30"), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = server.cmd.Process.Kill(); <-server.done }()
+	s := &cliHandoffSupervisor{input: &cliHandoffInput{}, tui: tui, server: server}
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	if s.stop(ctx) == nil {
+		t.Fatal("stuck terminal was accepted as stopped")
+	}
+	select {
+	case <-server.done:
+	case <-time.After(time.Second):
+		t.Fatal("backend leaked because terminal refused exit")
+	}
+	if !server.shutdownRequested() || tui.exited() {
+		t.Fatal("teardown did not independently track both process outcomes")
+	}
+}

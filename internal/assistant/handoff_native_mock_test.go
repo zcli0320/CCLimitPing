@@ -185,15 +185,28 @@ func TestNativeCLISupervisorWithLocalModel(t *testing.T) {
 		s.native.query = func(ctx context.Context, c quotaCredential) AccountQuota { return queryAccountQuota(ctx, fakeQuota, c) }
 		defer s.native.close()
 	}
-	if err = s.start(); err != nil {
-		t.Fatalf("native supervisor start: %v", err)
-	}
 	defer func() {
 		stop, done := context.WithTimeout(context.Background(), 8*time.Second)
 		defer done()
-		_ = s.stop(stop)
-		_ = os.Remove(r.cliRunnerPath())
+		if err := s.stop(stop); err != nil {
+			t.Errorf("native supervisor cleanup failed: %v", err)
+		}
+		if s.server.exited() && s.tui.exited() {
+			_ = os.Remove(r.cliRunnerPath())
+		} else {
+			t.Error("native integration left an owned process running")
+			// Only this test's isolated synthetic processes, never user CLI.
+			for _, process := range []*ownedCLIProcess{s.tui, s.server} {
+				if process != nil && !process.exited() {
+					_ = process.cmd.Process.Kill()
+					<-process.done
+				}
+			}
+		}
 	}()
+	if err = s.start(); err != nil {
+		t.Fatalf("native supervisor start: %v", err)
+	}
 	loaded := false
 	var lastErr error
 	var lastThread cliHandoffThread

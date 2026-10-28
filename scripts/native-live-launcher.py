@@ -13,7 +13,9 @@ p.add_argument('--thread', required=True)
 p.add_argument('--evidence', required=True)
 p.add_argument('--test-binary', required=True)
 p.add_argument('--helper', required=True)
+p.add_argument('--runtime-account', required=True, help='Independently read from the running Desktop account API, not auth.json')
 p.add_argument('--delay', type=int, default=15)
+p.add_argument('--trigger', choices=['real-quota', 'inject-current-quota'], default='real-quota')
 a = p.parse_args()
 root = Path(a.evidence)
 if not root.is_absolute() or not re.fullmatch(r'[0-9a-fA-F-]{36}', a.thread):
@@ -25,6 +27,9 @@ env = {k: v for k, v in os.environ.items() if not k.startswith('CODEX_HELPER_LIV
 env['CODEX_HELPER_LIVE_NATIVE_FULL'] = 'run-native-dual-once'
 env['CODEX_HELPER_LIVE_FULL_DESKTOP_THREAD'] = a.thread
 env['CODEX_HELPER_LIVE_NATIVE_EVIDENCE'] = str(root)
+env['CODEX_HELPER_LIVE_RUNTIME_ACCOUNT'] = a.runtime_account
+if a.trigger == 'inject-current-quota':
+    env['CODEX_HELPER_LIVE_NATIVE_TRIGGER'] = a.trigger
 time.sleep(max(0, min(a.delay, 60)))
 code = -1
 with (root / 'experiment.log').open('w') as f:
@@ -35,7 +40,12 @@ with (root / 'experiment.log').open('w') as f:
 (root / 'result.json').write_text(json.dumps({'exit_code': code, 'finished_at': time.time()}, indent=2))
 clean = {k: v for k, v in env.items() if not k.startswith('CODEX_HELPER_LIVE_')}
 subprocess.run(['/usr/bin/open', '-a', '/Applications/ChatGPT.app', 'codex://threads/' + a.thread], env=clean, check=False)
-if code != 0:
+try:
+    native_result = json.loads((root / 'native-result.json').read_text())
+except (OSError, ValueError):
+    native_result = {}
+# A preflight refusal has not paused a turn; do not send a recovery prompt.
+if code != 0 and native_result.get('stage') != 'preflight':
     recovery = dict(clean)
     recovery['CODEX_HELPER_LIVE_RECOVERY_THREAD'] = a.thread
     recovery['CODEX_HELPER_LIVE_RECOVERY_EVIDENCE'] = str(root)

@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"regexp"
 	"strings"
+	"time"
 )
 
 var desktopHandoffUUID = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
@@ -68,7 +69,11 @@ func (d *desktopHandoffLifecycle) requestExit(ctx context.Context) error {
 	}
 	d.oldTree = desktopProcessTree(procs, d.old.App)
 	// One graceful quit request; a refusal, timeout or prompt is not a success.
-	if d.command(ctx, "/usr/bin/osascript", "-e", `tell application id "com.openai.codex" to quit`) != nil {
+	// A native confirmation can hold the Apple event itself open, before the
+	// coordinator reaches waiting_exit. Bound that request independently.
+	requestCtx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	if d.command(requestCtx, "/usr/bin/osascript", "-e", `tell application id "com.openai.codex" to quit`) != nil {
 		return errors.New("Desktop 正常退出请求未确认")
 	}
 	return nil

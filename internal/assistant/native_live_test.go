@@ -141,7 +141,7 @@ func TestLiveNativeDualDesktopHandoff(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, p := range life.oldTree {
-		if p.PID == os.Getpid() {
+		if p.PID == os.Getpid() && os.Getenv("CODEX_HELPER_LIVE_PREFLIGHT_ONLY") != "1" {
 			t.Fatal("verifier must be outside Desktop process tree")
 		}
 	}
@@ -155,14 +155,47 @@ func TestLiveNativeDualDesktopHandoff(t *testing.T) {
 	if !okA || !okB {
 		t.Fatal("real quota credentials unavailable")
 	}
+	// The operator reads this from the running Desktop account API, not auth.json.
+	// A file-only switch can leave the old account loaded in a living process.
+	reportedRuntimeAccount := os.Getenv("CODEX_HELPER_LIVE_RUNTIME_ACCOUNT")
+	if reportedRuntimeAccount == "" || reportedRuntimeAccount != a.workspace {
+		_ = writeState(filepath.Join(evidence, "native-result.json"), map[string]any{"success": false, "stage": "preflight", "runtime_source_matches": false, "error": "运行账号未独立确认或与来源磁盘认证不同；尚未准备、退出或切号"})
+		t.Fatal("running Desktop account does not match disk source; no handoff action performed")
+	}
 	qa, qb := n.query(ctx, a), n.query(ctx, b)
 	ar, ak := handoffWindow(&qa, 18000)
 	br, bk := handoffWindow(&qb, 18000)
+	actualSourceRemaining := ar
+	triggerKind := "adjusted-real-threshold"
 	threshold := (ar + br) / 2
+	if os.Getenv("CODEX_HELPER_LIVE_NATIVE_TRIGGER") == "inject-current-quota" {
+		// Exercise real lifecycle and credential publication without burning a
+		// healthy source account down to its limit. Only the trigger is fake;
+		// candidate quota, identities and all write/exit gates remain real.
+		triggerKind, threshold, ar = "injected-source-quota-real-lifecycle", 10, 5
+		query := n.query
+		n.query = func(ctx context.Context, c quotaCredential) AccountQuota {
+			if credentialIdentity(c) != credentialIdentity(a) {
+				return query(ctx, c)
+			}
+			q := qa
+			q.Windows = append([]QuotaWindow(nil), qa.Windows...)
+			for i := range q.Windows {
+				if q.Windows[i].Seconds == 18000 {
+					q.Windows[i].UsedPercent = 95
+				}
+			}
+			return q
+		}
+	}
 	if !ak || !bk || !validHandoffThreshold(threshold) || ar >= threshold || !handoffTargetQuotaOK(qb, threshold) {
 		t.Fatal("real source/standby quota ordering unsuitable")
 	}
 	t.Logf("real native trigger: source=%.1f target=%.1f adjusted-threshold=%.1f", ar, br, threshold)
+	if os.Getenv("CODEX_HELPER_LIVE_PREFLIGHT_ONLY") == "1" {
+		_ = writeState(filepath.Join(evidence, "native-result.json"), map[string]any{"success": true, "stage": "preflight", "read_only": true, "runtime_source_matches": true, "trigger": triggerKind})
+		return
+	}
 	state, err := r.configureNativeHandoff("desktop", id, threshold)
 	if err != nil {
 		t.Fatal(err)
@@ -181,7 +214,7 @@ func TestLiveNativeDualDesktopHandoff(t *testing.T) {
 	deps := desktopRunnerDependencies{native: n, makeRuntime: func(context.Context, string) (desktopHandoffRuntime, error) { return runtime, nil }, resetRuntime: func(context.Context, desktopHandoffRuntime) error { cancel(); return nil }, quota: n.query, tick: time.Second, watchInterval: time.Second}
 	err = r.runDesktopHandoff(ctx, id, threshold, state.AuthorizationID, deps)
 	allocation := r.AccountAllocation()
-	result := map[string]any{"success": errors.Is(err, context.Canceled) && allocation.Distinct, "working_scope": "desktop", "distinct": allocation.Distinct, "trigger": "adjusted-real-threshold", "source_remaining": ar, "target_remaining": br, "threshold": threshold, "finished_at": time.Now().UTC()}
+	result := map[string]any{"success": errors.Is(err, context.Canceled) && allocation.Distinct, "working_scope": "desktop", "distinct": allocation.Distinct, "trigger": triggerKind, "source_remaining": ar, "actual_source_remaining": actualSourceRemaining, "target_remaining": br, "threshold": threshold, "finished_at": time.Now().UTC()}
 	if err != nil {
 		result["runner_result"] = errString(err)
 	}
@@ -225,4 +258,7 @@ func TestLiveDesktopReadOnlyDiagnostic(t *testing.T) {
 	var effort any
 	_ = json.Unmarshal(turn.Params["effort"], &effort)
 	t.Logf("read-only observation: error=%v has-turn=%t runtime=%s turn-status=%s owner-known=%t params-count=%d snapshot-effort=%v latest-effort=%s", err, has, e.View.Runtime.Type, turn.Status, e.Owner != "", len(turn.Params), effort, e.View.LatestEffort)
+	if err != nil || !has || e.Owner == "" {
+		t.Fatal("real Desktop read-only observation not verified")
+	}
 }

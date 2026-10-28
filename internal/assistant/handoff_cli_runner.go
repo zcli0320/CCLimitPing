@@ -252,16 +252,22 @@ func (s *cliHandoffSupervisor) stopForHandoff(ctx context.Context) error {
 	return nil
 }
 func (s *cliHandoffSupervisor) stopDetached(ctx context.Context) error {
-	if err := s.tui.stop(ctx); err != nil {
-		return handoffSafeError("托管终端未能退出")
-	}
+	// Teardown owns both processes. A stuck terminal must not prevent the
+	// backend from receiving its one shutdown request and becoming orphaned.
+	tuiRequestErr := s.tui.requestStop()
+	serverRequestErr := s.server.requestStop()
+	tuiErr := s.tui.stop(ctx)
 	if s.terminal != nil {
 		_ = s.terminal.Close()
 		s.terminal = nil
 	}
 	// A real backend can take longer than the terminal to close network and
 	// session resources. The result is still checked before touching auth.
-	if err := s.server.stopWithTimeout(ctx, 10*time.Second); err != nil {
+	serverErr := s.server.stopWithTimeout(ctx, 10*time.Second)
+	if tuiRequestErr != nil || tuiErr != nil {
+		return handoffSafeError("托管终端未能退出")
+	}
+	if serverRequestErr != nil || serverErr != nil {
 		return handoffSafeError("托管后端未能退出")
 	}
 	return nil

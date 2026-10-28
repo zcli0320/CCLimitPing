@@ -5,6 +5,7 @@ import (
 	"errors"
 	"reflect"
 	"testing"
+	"time"
 )
 
 func TestDesktopLifecycleRequiresActualOldExitAndNewHome(t *testing.T) {
@@ -16,7 +17,13 @@ func TestDesktopLifecycleRequiresActualOldExitAndNewHome(t *testing.T) {
 	d := &desktopHandoffLifecycle{home: "/Users/test", appPath: app, uid: 501, old: old,
 		read:     func(context.Context) ([]desktopProcessIdentity, error) { return procs, nil },
 		usesHome: func(context.Context, desktopProcessIdentity, string) bool { return homeOK },
-		command: func(_ context.Context, name string, args ...string) error {
+		command: func(requestCtx context.Context, name string, args ...string) error {
+			if name == "/usr/bin/osascript" {
+				deadline, bounded := requestCtx.Deadline()
+				if !bounded || time.Until(deadline) > 10*time.Second {
+					t.Fatal("quit request can wait indefinitely before process-exit observation")
+				}
+			}
 			calls = append(calls, append([]string{name}, args...))
 			return nil
 		},
