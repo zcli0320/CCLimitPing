@@ -5,6 +5,7 @@
 *.out
 coverage.out
 *.test
+/native-accounts/target/
 __pycache__/
 *.py[cod]
 

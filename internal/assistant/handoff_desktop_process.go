@@ -17,7 +17,7 @@ type desktopProcessIdentity struct {
 	PID, PPID, UID int
 	Start, Command string
 }
-type desktopProcessPair struct{ App, Server desktopProcessIdentity }
+type desktopProcessPair struct{ App, Server, Bridge desktopProcessIdentity }
 
 func desktopProcessTree(procs []desktopProcessIdentity, root desktopProcessIdentity) []desktopProcessIdentity {
 	known := map[int]bool{root.PID: true}
@@ -74,6 +74,22 @@ func parseDesktopProcessList(text string) ([]desktopProcessIdentity, error) {
 }
 
 func findDesktopProcessPair(procs []desktopProcessIdentity, uid int, appPath string) (desktopProcessPair, error) {
+	return findDesktopProcessPairWithBridge(procs, uid, appPath, "")
+}
+
+func desktopProcessRuns(p desktopProcessIdentity, executable, arg string) bool {
+	if executable == "" || !strings.HasPrefix(p.Command, executable+" ") {
+		return false
+	}
+	for _, word := range strings.Fields(strings.TrimPrefix(p.Command, executable+" ")) {
+		if word == arg {
+			return true
+		}
+	}
+	return false
+}
+
+func findDesktopProcessPairWithBridge(procs []desktopProcessIdentity, uid int, appPath, bridgePath string) (desktopProcessPair, error) {
 	var pair desktopProcessPair
 	main := filepath.Join(appPath, "Contents/MacOS/ChatGPT")
 	server := filepath.Join(appPath, "Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex")
@@ -86,21 +102,21 @@ func findDesktopProcessPair(procs []desktopProcessIdentity, uid int, appPath str
 		}
 	}
 	if pair.App.PID == 0 {
-		return desktopProcessPair{}, errors.New("Desktop 未运行")
+		return pair, errors.New("Desktop 未运行")
 	}
 	for _, p := range procs {
-		if p.UID != uid || p.PPID != pair.App.PID || !strings.HasPrefix(p.Command, server+" ") {
+		if p.UID == uid && p.PPID == pair.App.PID && desktopProcessRuns(p, bridgePath, "app-server") {
+			if pair.Bridge.PID != 0 {
+				return desktopProcessPair{}, errors.New("发现多个 Desktop 运行核验进程")
+			}
+			pair.Bridge = p
+		}
+	}
+	for _, p := range procs {
+		if p.UID != uid || !desktopProcessRuns(p, server, "app-server") {
 			continue
 		}
-		words := strings.Fields(p.Command)
-		found := false
-		for _, word := range words[1:] {
-			if word == "app-server" {
-				found = true
-				break
-			}
-		}
-		if !found {
+		if p.PPID != pair.App.PID && (pair.Bridge.PID == 0 || p.PPID != pair.Bridge.PID) {
 			continue
 		}
 		if pair.Server.PID != 0 {
@@ -108,7 +124,7 @@ func findDesktopProcessPair(procs []desktopProcessIdentity, uid int, appPath str
 		}
 		pair.Server = p
 	}
-	if pair.Server.PID == 0 {
+	if pair.Server.PID == 0 || (pair.Bridge.PID != 0 && pair.Server.PPID != pair.Bridge.PID) {
 		return desktopProcessPair{}, errors.New("Desktop 后端不可确认")
 	}
 	return pair, nil
@@ -122,7 +138,7 @@ func desktopOldProcessesExited(old desktopProcessPair, procs []desktopProcessIde
 		if p.UID != uid {
 			continue
 		}
-		if (p.PID == old.App.PID && p.Start == old.App.Start) || (p.PID == old.Server.PID && p.Start == old.Server.Start) {
+		if (p.PID == old.App.PID && p.Start == old.App.Start) || (p.PID == old.Server.PID && p.Start == old.Server.Start) || (old.Bridge.PID > 0 && p.PID == old.Bridge.PID && p.Start == old.Bridge.Start) {
 			return false
 		}
 		if p.Command == filepath.Join(appPath, "Contents/MacOS/ChatGPT") {
@@ -158,11 +174,26 @@ func desktopEnvironmentMatches(text, home string) bool {
 
 func readDesktopProcesses(ctx context.Context) ([]desktopProcessIdentity, error) {
 	cmd := exec.CommandContext(ctx, "/bin/ps", "-axo", "pid=,ppid=,uid=,lstart=,command=")
+	cmd.Env = desktopProcessListEnvironment(os.Environ())
 	out, err := cmd.Output()
 	if err != nil || len(out) > 8<<20 {
 		return nil, errors.New("无法检查 Desktop 进程")
 	}
 	return parseDesktopProcessList(string(out))
+}
+
+// lstart follows the caller's locale (zh_CN prints four fields, not five), so
+// time is pinned to C. LC_ALL=C would also make ps escape non-ASCII bytes in
+// commands (M-e...), which hides a bridge installed under a Chinese app name.
+func desktopProcessListEnvironment(env []string) []string {
+	var out []string
+	for _, value := range env {
+		key, _, _ := strings.Cut(value, "=")
+		if key != "LC_ALL" && key != "LANG" && key != "LC_TIME" && key != "LC_CTYPE" {
+			out = append(out, value)
+		}
+	}
+	return append(out, "LC_TIME=C", "LC_CTYPE=UTF-8")
 }
 
 func desktopServerUsesHome(ctx context.Context, p desktopProcessIdentity, home string) bool {

@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"strings"
+	"time"
 )
 
 // desktopSingleSessionRuntime is only used for a user's explicitly selected
@@ -114,7 +115,7 @@ func (d *desktopSingleSessionRuntime) observe(ctx context.Context, id string) (d
 		if err != nil {
 			return e, err
 		}
-		pair, err := findDesktopProcessPair(procs, d.lifecycle.uid, d.lifecycle.appPath)
+		pair, err := findDesktopProcessPairWithBridge(procs, d.lifecycle.uid, d.lifecycle.appPath, d.lifecycle.bridgePath)
 		if err != nil || pair != d.lifecycle.old || !d.lifecycle.usesHome(ctx, pair.Server, d.r.Home) {
 			return e, errors.New("Desktop 进程或目录已变化")
 		}
@@ -127,6 +128,9 @@ func (d *desktopSingleSessionRuntime) observe(ctx context.Context, id string) (d
 	e.View, e.Owner, err = client.snapshot(id)
 	if err != nil {
 		return e, err
+	}
+	if d.r.nativeAccountPreview() {
+		e.RuntimeIdentityVerified = d.verifyRuntimeIdentity(ctx)
 	}
 	turn, ok := e.View.latest()
 	if !ok {
@@ -233,4 +237,42 @@ func (d *desktopSingleSessionRuntime) requestContinue(ctx context.Context, id, o
 		d.continuedTurn = idNew
 	}
 	return idNew, err
+}
+
+// A matching file is not sufficient to arm a real Desktop handoff. The same
+// proof is also rechecked during observation and before any disruptive action.
+func (d *desktopSingleSessionRuntime) requireRuntimeIdentity(ctx context.Context) error {
+	if d == nil || d.lifecycle == nil || d.lifecycle.read == nil || d.lifecycle.usesHome == nil || !d.verifyRuntimeIdentity(ctx) {
+		return errors.New("Desktop 运行账号未独立确认；请正常退出后以核验方式打开，再重新检查")
+	}
+	return nil
+}
+
+func (d *desktopSingleSessionRuntime) verifyRuntimeIdentity(ctx context.Context) bool {
+	procs, err := d.lifecycle.read(ctx)
+	if err != nil {
+		return false
+	}
+	pair, err := findDesktopProcessPairWithBridge(procs, d.lifecycle.uid, d.lifecycle.appPath, d.lifecycle.bridgePath)
+	if err != nil || pair.Bridge.PID <= 0 || (!d.launchRequested && pair != d.lifecycle.old) || (d.launchRequested && pair != d.lifecycle.restarted) || !d.lifecycle.usesHome(ctx, pair.Server, d.r.Home) {
+		return false
+	}
+	root, err := d.r.runtimeIdentityDirectory(false)
+	if err != nil {
+		return false
+	}
+	identity, err := queryRuntimeIdentityEndpoint(ctx, runtimeIdentitySocket(root, pair.Bridge.PID), pair.Bridge.PID, pair.Server.PID)
+	if err != nil {
+		return false
+	}
+	credential, err := d.r.scopeCredential("desktop", time.Now())
+	if err != nil || identity.Fingerprint != credentialIdentity(credential) {
+		return false
+	}
+	after, err := d.lifecycle.read(ctx)
+	if err != nil {
+		return false
+	}
+	actual, err := findDesktopProcessPairWithBridge(after, d.lifecycle.uid, d.lifecycle.appPath, d.lifecycle.bridgePath)
+	return err == nil && actual == pair && d.lifecycle.usesHome(ctx, actual.Server, d.r.Home)
 }

@@ -1,5 +1,6 @@
 import Cocoa
 import ServiceManagement
+import Darwin
 
 final class FlippedDocument: NSView { override var isFlipped: Bool { true } }
 final class ProjectItem: NSObject {
@@ -22,8 +23,19 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
     var state: SelectionState
     let store: StateStore
     let fixture: URL?
-    let status = NSTextField(wrappingLabelWithString: "正在读取 CC Switch 与会话记录…")
+    let status = NSTextField(wrappingLabelWithString: "正在读取小助手账号与会话记录…")
+    var accountCenter: AccountCenterController?
+    var accountClient: AccountCenterClient?
     let accountStack = NSStackView()
+    let accountActionNotice = NSTextField(wrappingLabelWithString: "")
+    var accountMetadata: [String: [String: Any]] = [:]
+    var accountMetadataReadable = false
+    var accountMetadataPending = false
+    var desktopAccountOwner: DesktopAccountOwner = .unknown
+    var accountMetadataInFlight = false
+    var accountMetadataFingerprint: Data?
+    var accountMetadataTimer: Timer?
+    var accountActionBusy = false
     let search = NSSearchField()
     let archived = NSButton(checkboxWithTitle: "包括归档", target: nil, action: nil)
     let sourceTabs = NSSegmentedControl(labels: ["Desktop", "CLI"], trackingMode: .selectOne, target: nil, action: nil)
@@ -75,6 +87,8 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
     let cliResume = NSButton(title: "在终端托管续跑", target: nil, action: nil)
     let resumeStatus = NSTextField(wrappingLabelWithString: "未开启指定会话续跑")
     let handoffThreshold = NSTextField(string: "10")
+    let runtimeLaunch = NSButton(title: "核验方式打开 Desktop", target: nil, action: nil)
+    var runtimeLaunching = false
     let handoffPreflight = NSButton(title: "检查所选会话", target: nil, action: nil)
     let handoffStatus = NSTextField(wrappingLabelWithString: "选择会话后可以检查当前交接条件。")
     let handoffStart = NSButton(title: "托管并开启切号", target: nil, action: nil)
@@ -90,6 +104,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
     var handoffPendingKey: String?
     var handoffLaunchDeadline: Date?
     var handoffCancelPending = false
+    var handoffStartFailure: (key: String, message: String)?
     var desktopHandoffProcess: Process?
     var resumeReport: ResumeReport?
     var resumeBusy = false
@@ -151,6 +166,10 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
     }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
+        if fixture == nil {
+            let executable = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/codex-accounts")
+            accountClient = AccountCenterClient(executable: executable)
+        }
         let mainMenu = NSMenu(), appMenu = NSMenu(), item = NSMenuItem()
         appMenu.addItem(withTitle: "退出 Codex 小助手", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
         item.submenu = appMenu; mainMenu.addItem(item)
@@ -160,13 +179,15 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editItem.submenu = editMenu; mainMenu.addItem(editItem); NSApp.mainMenu = mainMenu
 
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 660, height: 700),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 760),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "Codex 小助手"
-        window.minSize = NSSize(width: 560, height: 500)
+        window.titleVisibility = .hidden
+        window.minSize = NSSize(width: 580, height: 520)
         window.delegate = self
         window.isReleasedWhenClosed = false
         window.titlebarAppearsTransparent = true
+        window.backgroundColor = .windowBackgroundColor
         let content = NSView(); window.contentView = content
         outerScroll.hasVerticalScroller = true; outerScroll.autohidesScrollers = true
         outerScroll.drawsBackground = false
@@ -179,108 +200,162 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         document.autoresizingMask = [.width]
         let stack = contentStack; stack.orientation = .vertical; stack.alignment = .leading; stack.spacing = 10; stack.detachesHiddenViews = true
         document.addSubview(stack); stack.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([stack.topAnchor.constraint(equalTo: document.topAnchor, constant: 18),
-                                     stack.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: 22),
-                                     stack.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -22)])
+        NSLayoutConstraint.activate([stack.topAnchor.constraint(equalTo: document.topAnchor, constant: 14),
+                                     stack.leadingAnchor.constraint(equalTo: document.leadingAnchor, constant: Theme.pagePadding),
+                                     stack.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -Theme.pagePadding)])
+        func gap(after view: NSView) { stack.setCustomSpacing(Theme.sectionSpacing, after: view) }
+
+        // Header: identity, data freshness and the two global actions.
         let appIcon = Bundle.main.url(forResource: "CodexHelper", withExtension: "icns").flatMap { NSImage(contentsOf: $0) }
             ?? NSImage(systemSymbolName: "person.2.badge.gearshape", accessibilityDescription: nil)!
         let icon = NSImageView(image: appIcon)
         icon.imageScaling = .scaleProportionallyUpOrDown
         icon.setAccessibilityLabel("Codex 小助手")
-        icon.widthAnchor.constraint(equalToConstant: 32).isActive = true
-        icon.heightAnchor.constraint(equalToConstant: 32).isActive = true
+        icon.widthAnchor.constraint(equalToConstant: 40).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 40).isActive = true
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "开发版"
         let versionLabel = cliHandoffAvailable ? version : version + " · 验收中"
-        add(row([icon, label("账号与会话", size: 20, weight: .semibold, color: .labelColor), spacer(), label(versionLabel)]), to: stack)
-        status.font = .systemFont(ofSize: 12); status.textColor = .secondaryLabelColor
+        let title = Theme.text("账号与会话", size: 20, weight: .bold, wraps: false)
+        let titleRow = Theme.hstack([title, StatusChip("v" + versionLabel, tint: .secondaryLabelColor)], spacing: 8)
+        status.font = .systemFont(ofSize: 11); status.textColor = .secondaryLabelColor
         status.maximumNumberOfLines = 2
-        add(status, to: stack)
-        let openSwitch = NSButton(title: "打开 CC Switch", target: self, action: #selector(openCCSwitch))
-        openSwitch.bezelStyle = .rounded
+        let heading = Theme.vstack([titleRow, status], spacing: 2)
+        status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        heading.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let openSwitch = Theme.button(NSButton(title: "授权管理", target: self, action: #selector(openNativeAccountCenter)), primary: true)
+        openSwitch.image = NSImage(systemSymbolName: "person.crop.circle.badge.plus", accessibilityDescription: nil)
+        openSwitch.imagePosition = .imageLeading
         refresh.target = self; refresh.action = #selector(refreshNow); refresh.bezelStyle = .rounded
-        add(row([label("CC Switch 账号", size: 13, weight: .semibold, color: .labelColor), spacer(), openSwitch, refresh]), to: stack)
+        let header = Theme.hstack([icon, heading, Theme.flexible(), openSwitch, refresh], spacing: 12)
+        add(header, to: stack); gap(after: header)
+
+        // Accounts, per-client state, and explicit manual switching.
+        let accountsTitle = Theme.sectionTitle("账号管理")
+        add(accountsTitle, to: stack)
+        let accountHint = Theme.caption("Desktop 由 CC Switch 管理时请在 CC Switch 中切换；其他切换前请退出目标客户端及其后端。")
+        accountHint.maximumNumberOfLines = 3
+        add(accountHint, to: stack)
+        accountActionNotice.font = .systemFont(ofSize: 11)
+        accountActionNotice.textColor = .systemOrange
+        accountActionNotice.maximumNumberOfLines = 4
+        accountActionNotice.isHidden = true
+        add(accountActionNotice, to: stack)
         accountStack.orientation = .vertical; accountStack.alignment = .leading; accountStack.spacing = 8
-        add(accountStack, to: stack)
+        add(accountStack, to: stack); gap(after: accountStack)
+
+        // Warmup.
+        add(Theme.sectionTitle("自动预热"), to: stack)
+        let warmupBox = SectionBox()
         warmup = NSButton(checkboxWithTitle: "自动预热五小时窗口", target: self, action: #selector(toggleWarmup))
         warmup.isEnabled = false
-        warmupCheck.target = self; warmupCheck.action = #selector(checkWarmupNow); warmupCheck.bezelStyle = .rounded
+        warmupCheck.target = self; warmupCheck.action = #selector(checkWarmupNow)
+        Theme.button(warmupCheck, small: true)
         warmupCheck.isEnabled = false
-        add(row([warmup, spacer(), warmupCheck]), to: stack)
-        scheduleLabel.font = .systemFont(ofSize: 11); scheduleLabel.textColor = .secondaryLabelColor
-        scheduleLabel.lineBreakMode = .byTruncatingTail
-        scheduleButton.target = self; scheduleButton.action = #selector(editWarmupSchedule); scheduleButton.bezelStyle = .rounded
-        add(row([scheduleLabel, spacer(), scheduleButton]), to: stack)
+        warmupBox.add(Theme.hstack([warmup, Theme.flexible(), warmupCheck]))
         warmupStatus.font = .systemFont(ofSize: 11); warmupStatus.textColor = .secondaryLabelColor
         warmupStatus.maximumNumberOfLines = 3
-        add(warmupStatus, to: stack)
-        add(separator(), to: stack)
-        add(row([label("会话 · 按项目收纳", size: 13, weight: .semibold, color: .labelColor), spacer(), countLabel]), to: stack)
+        warmupBox.add(warmupStatus)
+        warmupBox.addDivider()
+        scheduleLabel.font = .systemFont(ofSize: 12); scheduleLabel.textColor = .labelColor
+        scheduleLabel.lineBreakMode = .byTruncatingTail
+        scheduleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        scheduleButton.target = self; scheduleButton.action = #selector(editWarmupSchedule)
+        Theme.button(scheduleButton, small: true)
+        let clock = NSImageView(image: NSImage(systemSymbolName: "clock", accessibilityDescription: nil)!)
+        clock.contentTintColor = .secondaryLabelColor
+        warmupBox.add(Theme.hstack([clock, scheduleLabel, Theme.flexible(), scheduleButton], spacing: 6))
+        add(warmupBox, to: stack); gap(after: warmupBox)
+
+        // Session browser.
+        add(Theme.sectionTitle("会话", accessories: [countLabel]), to: stack)
+        countLabel.font = .systemFont(ofSize: 11); countLabel.textColor = .secondaryLabelColor
+        let sessionBox = SectionBox(spacing: 8)
         sourceTabs.target = self; sourceTabs.action = #selector(changeSource)
         sourceTabs.segmentDistribution = .fillEqually
         sourceTabs.selectedSegment = state.activeScope == "cli" ? 1 : 0
-        add(sourceTabs, to: stack)
+        sessionBox.add(sourceTabs)
         sourceHint.font = .systemFont(ofSize: 11); sourceHint.textColor = .secondaryLabelColor
         sourceHint.maximumNumberOfLines = 2
-        add(sourceHint, to: stack)
         search.placeholderString = "搜索标题、项目或会话 ID"
         search.delegate = self; search.sendsSearchStringImmediately = true
         archived.target = self; archived.action = #selector(filterChanged)
-        add(row([search, archived]), to: stack)
+        archived.controlSize = .small; archived.font = .systemFont(ofSize: 11)
         search.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        sessionBox.add(Theme.hstack([search, archived], spacing: 10))
+        sessionBox.add(sourceHint)
         let titleColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("title")); titleColumn.title = "项目 / 会话"; titleColumn.width = 460; titleColumn.minWidth = 240
-        let timeColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("time")); timeColumn.title = "最近活动"; timeColumn.width = 100; timeColumn.minWidth = 90
+        let timeColumn = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("time")); timeColumn.title = "最近活动"; timeColumn.width = 96; timeColumn.minWidth = 84
         table.addTableColumn(titleColumn); table.addTableColumn(timeColumn)
-        table.outlineTableColumn = titleColumn; table.indentationPerLevel = 16
+        table.outlineTableColumn = titleColumn; table.indentationPerLevel = 14
         table.autoresizesOutlineColumn = false
-        table.delegate = self; table.dataSource = self; table.rowHeight = 38
-        table.usesAlternatingRowBackgroundColors = true; table.allowsEmptySelection = true
+        table.delegate = self; table.dataSource = self; table.rowHeight = 28
+        table.style = .plain; table.intercellSpacing = NSSize(width: 6, height: 2)
+        table.usesAlternatingRowBackgroundColors = false; table.allowsEmptySelection = true
+        table.backgroundColor = .controlBackgroundColor
+        table.headerView = nil; table.floatsGroupRows = false
         table.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
         table.setAccessibilityLabel("按项目分组的 Codex 会话")
-        let scroll = NSScrollView(); scroll.documentView = table; scroll.hasVerticalScroller = true; scroll.borderType = .bezelBorder
-        scroll.autohidesScrollers = true
+        let scroll = NSScrollView(); scroll.documentView = table; scroll.hasVerticalScroller = true; scroll.borderType = .noBorder
+        scroll.autohidesScrollers = true; scroll.drawsBackground = true; scroll.backgroundColor = .controlBackgroundColor
         tableHeight = scroll.heightAnchor.constraint(equalToConstant: 220); tableHeight.isActive = true
         scroll.setContentHuggingPriority(.defaultLow, for: .vertical)
-        add(scroll, to: stack)
+        sessionBox.addDivider()
+        sessionBox.add(scroll)
         emptyLabel.font = .systemFont(ofSize: 12); emptyLabel.textColor = .secondaryLabelColor
-        add(emptyLabel, to: stack); emptyLabel.isHidden = true
-        selection.font = .systemFont(ofSize: 13, weight: .medium); selection.maximumNumberOfLines = 2
+        emptyLabel.alignment = .center
+        sessionBox.add(emptyLabel); emptyLabel.isHidden = true
+        add(sessionBox, to: stack); gap(after: sessionBox)
+
+        // The selected session: observation and same-account resume.
+        add(Theme.sectionTitle("所选会话"), to: stack)
+        let selectedBox = SectionBox()
+        selection.font = .systemFont(ofSize: 13, weight: .semibold); selection.maximumNumberOfLines = 2
         detail.font = .systemFont(ofSize: 11); detail.textColor = .secondaryLabelColor; detail.maximumNumberOfLines = 3
-        add(selection, to: stack); add(detail, to: stack)
         selection.isSelectable = true; detail.isSelectable = true
+        selectedBox.add(Theme.vstack([selection, detail], spacing: 3))
         selectionHint.font = .systemFont(ofSize: 11); selectionHint.textColor = .systemOrange
-        add(selectionHint, to: stack); selectionHint.isHidden = true
-        observe.target = self; observe.action = #selector(toggleObservation); observe.bezelStyle = .rounded
+        selectedBox.add(selectionHint); selectionHint.isHidden = true
+        observe.target = self; observe.action = #selector(toggleObservation); Theme.button(observe, small: true)
         observe.isEnabled = false
-        clearSelection.target = self; clearSelection.action = #selector(clearTarget); clearSelection.bezelStyle = .rounded
+        clearSelection.target = self; clearSelection.action = #selector(clearTarget); Theme.button(clearSelection, small: true)
         clearSelection.isEnabled = false
-        add(row([label("仅观察本机记录"), spacer(), clearSelection, observe]), to: stack)
+        selectedBox.add(Theme.hstack([label("仅观察本机记录，不会切号或发送消息", size: 11), Theme.flexible(), clearSelection, observe]))
+        selectedBox.addDivider()
         resumeToggle.target = self; resumeToggle.action = #selector(toggleResume)
-        cliResume.target = self; cliResume.action = #selector(openManagedCLI); cliResume.bezelStyle = .rounded
-        add(row([resumeToggle, spacer(), cliResume]), to: stack)
+        cliResume.target = self; cliResume.action = #selector(openManagedCLI); Theme.button(cliResume, small: true)
+        selectedBox.add(Theme.hstack([resumeToggle, Theme.flexible(), cliResume]))
         resumeStatus.font = .systemFont(ofSize: 11); resumeStatus.textColor = .secondaryLabelColor
-        add(resumeStatus, to: stack)
-        add(separator(), to: stack)
+        selectedBox.add(resumeStatus)
+        add(selectedBox, to: stack); gap(after: selectedBox)
+
+        // Automatic account handoff for the selected session.
+        add(Theme.sectionTitle("自动切号"), to: stack)
+        let handoffBox = SectionBox()
         handoffThreshold.alignment = .right
         handoffThreshold.widthAnchor.constraint(equalToConstant: 44).isActive = true
-        handoffPreflight.target = self; handoffPreflight.action = #selector(checkHandoffPreflight)
-        handoffPreflight.bezelStyle = .rounded
-        handoffStart.target = self; handoffStart.action = #selector(startCLIHandoff); handoffStart.bezelStyle = .rounded
-        handoffStop.target = self; handoffStop.action = #selector(stopHandoff); handoffStop.bezelStyle = .rounded
-        handoffAcknowledge.target = self; handoffAcknowledge.action = #selector(acknowledgeHandoff); handoffAcknowledge.bezelStyle = .rounded
-        add(row([label("自动切号", weight: .medium), spacer(), label("剩余低于"), handoffThreshold, label("%"), handoffPreflight]), to: stack)
-        add(row([handoffStart, handoffStop, handoffAcknowledge, spacer()]), to: stack)
-        handoffRunStatus.font = .systemFont(ofSize: 11); handoffRunStatus.textColor = .secondaryLabelColor
-        add(handoffRunStatus, to: stack)
+        handoffPreflight.target = self; handoffPreflight.action = #selector(checkHandoffPreflight); Theme.button(handoffPreflight, small: true)
+        handoffStart.target = self; handoffStart.action = #selector(startCLIHandoff); Theme.button(handoffStart, primary: true)
+        handoffStop.target = self; handoffStop.action = #selector(stopHandoff); Theme.button(handoffStop)
+        handoffAcknowledge.target = self; handoffAcknowledge.action = #selector(acknowledgeHandoff); Theme.button(handoffAcknowledge)
+        handoffBox.add(Theme.hstack([label("五小时剩余额度低于", size: 12, color: .labelColor), handoffThreshold, label("% 时切换", size: 12, color: .labelColor), Theme.flexible(), handoffPreflight], spacing: 6))
         handoffStatus.font = .systemFont(ofSize: 11); handoffStatus.textColor = .secondaryLabelColor
-        add(handoffStatus, to: stack)
-        add(separator(), to: stack)
-        let help = NSButton(title: "接入说明", target: self, action: #selector(showDetails)); help.bezelStyle = .rounded
+        handoffBox.add(handoffStatus)
+        handoffBox.addDivider()
+        runtimeLaunch.target = self; runtimeLaunch.action = #selector(openDesktopWithRuntimeBridge); Theme.button(runtimeLaunch)
+        runtimeLaunch.toolTip = "请先正常退出 Desktop；打开后可独立核对运行账号。"
+        handoffBox.add(Theme.hstack([handoffStart, handoffStop, handoffAcknowledge, Theme.flexible(), runtimeLaunch]))
+        handoffRunStatus.font = .systemFont(ofSize: 11); handoffRunStatus.textColor = .secondaryLabelColor
+        handoffBox.add(handoffRunStatus)
+        add(handoffBox, to: stack); gap(after: handoffBox)
+
+        // Footer.
+        let help = NSButton(title: "接入说明", target: self, action: #selector(showDetails)); Theme.button(help, small: true)
+        help.image = NSImage(systemSymbolName: "questionmark.circle", accessibilityDescription: nil); help.imagePosition = .imageLeading
         automationToggle.target = self; automationToggle.action = #selector(toggleAutomationDetails)
         automationToggle.bezelStyle = .inline; automationToggle.isBordered = false
         automationToggle.font = .systemFont(ofSize: 12, weight: .medium)
         automationToggle.image = NSImage(systemSymbolName: "chevron.right", accessibilityDescription: nil)
         automationToggle.imagePosition = .imageLeading
-        add(row([spacer(), help]), to: stack)
         automationStack.orientation = .vertical; automationStack.alignment = .leading; automationStack.spacing = 8
         automationStack.isHidden = true
         handoff = NSButton(checkboxWithTitle: "为选中会话自动切号续跑", target: nil, action: nil)
@@ -288,16 +363,28 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         add(row([handoff, spacer(), label("待验证", color: .systemOrange)]), to: automationStack)
         feedback.font = .systemFont(ofSize: 11); feedback.textColor = .secondaryLabelColor
         feedback.maximumNumberOfLines = 2
-        add(feedback, to: stack)
         if let visible = NSScreen.main?.visibleFrame {
-            window.setContentSize(NSSize(width: min(660, visible.width - 40), height: min(700, visible.height - 60)))
+            window.setContentSize(NSSize(width: min(680, visible.width - 40), height: min(800, visible.height - 60)))
         }
         loginItem.target = self; loginItem.action = #selector(toggleLoginItem)
         loginStatus.font = .systemFont(ofSize: 11); loginStatus.textColor = .secondaryLabelColor
-        add(row([loginItem, spacer(), loginStatus]), to: stack)
+        let footer = SectionBox(spacing: 6)
+        footer.add(Theme.hstack([loginItem, loginStatus, Theme.flexible(), help]))
+        footer.add(feedback)
+        add(footer, to: stack)
         updateLoginItem()
+        // Preview automations must already be disabled while the first
+        // asynchronous snapshot is still loading.
+        if ProcessInfo.processInfo.environment["CODEX_HELPER_NATIVE_PREVIEW"] == "1" {
+            updateWarmupUI()
+            updateHandoffUI()
+        }
         window.center(); window.makeKeyAndOrderFront(nil); layoutDocument(); NSApp.activate(ignoringOtherApps: true)
         refreshNow()
+        accountMetadataTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+            guard self?.window.isVisible == true else { return }
+            self?.refreshAccountMetadata()
+        }
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             self?.refreshData(forceQuota: false)
             self?.runWarmupCheckIfDue()
@@ -308,7 +395,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { !backgroundEnabled }
     func applicationWillTerminate(_ notification: Notification) {
-        shuttingDown = true; timer?.invalidate()
+        shuttingDown = true; timer?.invalidate(); accountMetadataTimer?.invalidate()
         if let process = warmupProcess, process.isRunning { process.terminate() }
         if let process = resumeProcess, process.isRunning { process.terminate() }
         if fixture == nil && resumeReport?.enabled == true {
@@ -319,6 +406,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
             let bridge = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/codex-helper")
             _ = try? BridgeClient.read(executable: bridge, arguments: ["handoff","disable"], timeout: 3)
         }
+        accountClient?.close()
     }
     func windowShouldClose(_ sender: NSWindow) -> Bool {
         if backgroundEnabled { sender.orderOut(nil); return false }
@@ -327,7 +415,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool {
         showHelperWindow(); return true
     }
-    @objc func showHelperWindow() { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true) }
+    @objc func showHelperWindow() { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); refreshAccountMetadata() }
     func windowDidResize(_ notification: Notification) { layoutDocument() }
 
     func layoutDocument() {
@@ -348,15 +436,15 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
 
     @objc func showDetails() {
         let alert = NSAlert(); alert.messageText = "接入说明"
-        alert.informativeText = "账号与额度沿用 CC Switch。预热在独立临时进程执行；CLI 可为所选会话启动托管切号，Desktop 切号仍在开发。"
+        alert.informativeText = "小助手使用自己的账号库；CLI 可托管切号，Desktop 切号前会核验运行账号，由 CC Switch 管理时使用 CC Switch 切换。"
         var lines = ["观察记录不能判断任务是否运行、实际使用账号或是否触及额度。"]
         if let snapshot = snapshot {
             for source in snapshot.sources ?? [] {
                 lines += ["", "\(source.label) 会话目录：\(source.home)"]
                 lines += source.warnings.map { "• \($0)" }
             }
-            lines += ["", "CC Switch 配置目录：\(snapshot.codex_home)", "两端仅按目录分隔历史；账号卡片来自 CC Switch，不证明运行实例身份。"]
-            lines += ["", "额度每 2 分钟自动查询，点刷新可立即查询。只读使用已签发的有效访问凭证；凭证过期需在 CC Switch 刷新，不复制或轮换刷新凭证。"]
+            lines += ["", "两端按目录分隔历史；本地绑定不证明运行实例身份。"]
+            lines += ["", "额度使用端内或账号管理器中现有的有效凭证查询；过期时显示未知，不会为查询独立刷新凭证。"]
             if let report = warmupReport {
                 lines += ["", "预热：" + report.summary, "开启时每分钟检查；关闭窗口后仍在菜单栏运行。退出应用停止后续检查。"]
                 for account in report.accounts {
@@ -392,8 +480,146 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         }
     }
 
+    func ensureAccountClient() -> AccountCenterClient? {
+        guard fixture == nil else { return nil }
+        let executable = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/codex-accounts")
+        if accountClient?.isAvailable != true {
+            accountCenter?.close()
+            accountCenter = nil
+            accountClient?.close()
+            accountClient = AccountCenterClient(executable: executable)
+        }
+        return accountClient
+    }
+
+    // Read only: the main window follows external switches even when the
+    // authorization window is closed. Quota has its own slower schedule.
+    func refreshAccountMetadata() {
+        guard !accountMetadataInFlight, !shuttingDown, let client = ensureAccountClient() else { return }
+        accountMetadataInFlight = true
+        client.send("list") { [weak self, weak client] result in
+            guard let self = self else { return }
+            self.accountMetadataInFlight = false
+            guard client === self.accountClient else { return }
+            switch result {
+            case .failure:
+                self.desktopAccountOwner = .unknown
+                self.accountMetadataReadable = false
+                self.accountMetadata = [:]
+                self.accountMetadataFingerprint = nil
+                self.accountActionNotice.stringValue = "账号状态暂不可读取，切换已暂停；请点刷新重试。"
+                self.accountActionNotice.isHidden = false
+                self.renderAccountCards()
+            case .success(let data):
+                guard let rows = data["accounts"] as? [[String: Any]],
+                      rows.allSatisfy({ ($0["id"] as? String)?.isEmpty == false && $0["managed"] is Bool }) else {
+                    self.accountMetadataReadable = false
+                    self.accountMetadata = [:]
+                    self.accountMetadataFingerprint = nil
+                    self.accountActionNotice.stringValue = "账号状态暂不可确认，切换已暂停；请点刷新重试。"
+                    self.accountActionNotice.isHidden = false
+                    self.renderAccountCards(); return
+                }
+                let ids = rows.compactMap { $0["id"] as? String }
+                guard Set(ids).count == ids.count else {
+                    self.accountMetadataReadable = false
+                    self.accountMetadata = [:]
+                    self.accountMetadataFingerprint = nil
+                    self.accountActionNotice.stringValue = "账号状态存在重复，切换已暂停；请先检查授权管理。"
+                    self.accountActionNotice.isHidden = false
+                    self.renderAccountCards(); return
+                }
+                let previousIDs = Set(self.accountMetadata.keys)
+                let fingerprint = try? JSONSerialization.data(withJSONObject: data, options: [.sortedKeys])
+                let changed = !self.accountMetadataReadable || fingerprint != self.accountMetadataFingerprint
+                self.accountMetadata = Dictionary(uniqueKeysWithValues: zip(ids, rows))
+                self.desktopAccountOwner = DesktopAccountOwner(data["desktop_owner"])
+                self.accountMetadataPending = data["pending"] as? Bool == true
+                self.accountMetadataReadable = true
+                self.accountMetadataFingerprint = fingerprint
+                if self.accountActionNotice.stringValue.hasPrefix("账号状态暂不可") || self.accountActionNotice.stringValue.hasPrefix("账号状态存在重复") {
+                    self.accountActionNotice.stringValue = ""; self.accountActionNotice.isHidden = true
+                }
+                if self.accountMetadataPending && !self.accountActionBusy {
+                    self.accountActionNotice.stringValue = "上次账号操作待核查，请在授权管理中选择“核查上次操作”。"
+                    self.accountActionNotice.isHidden = false
+                } else if !self.accountMetadataPending && self.accountActionNotice.stringValue.hasPrefix("上次账号操作待核查") {
+                    self.accountActionNotice.stringValue = ""; self.accountActionNotice.isHidden = true
+                }
+                if changed { self.renderAccountCards() }
+                if previousIDs != Set(ids), self.snapshot != nil { self.refreshData(forceQuota: false) }
+            }
+        }
+    }
+
+    @objc func openNativeAccountCenter() {
+        guard fixture == nil else { return }
+        let executable = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/codex-accounts")
+        _ = ensureAccountClient()
+        if let current = accountCenter { current.show(); return }
+        let controller = AccountCenterController(executable: executable, sharedClient: accountClient) { [weak self] in
+            self?.refreshAccountMetadata()
+            self?.refreshData(forceQuota: true)
+        }
+        accountCenter = controller
+        controller.show()
+    }
+
     @objc func refreshNow() {
+        refreshAccountMetadata()
         refreshData(forceQuota: true)
+    }
+
+    @objc func applyAccountFromMain(_ sender: AccountScopeButton) {
+        let id = sender.accountID, scope = sender.scope
+        if scope == "desktop" && desktopAccountOwner != .native {
+            accountActionNotice.stringValue = desktopAccountOwner.blockedMessage; accountActionNotice.isHidden = false
+            return
+        }
+        guard !accountActionBusy, accountMetadataReadable, !accountMetadataPending,
+              accountMetadata[id]?["managed"] as? Bool == true,
+              ["desktop", "cli"].contains(scope), let client = ensureAccountClient() else { return }
+        let end = scope == "desktop" ? "Desktop（~/.codex）" : "CLI（~/.codex-cli）"
+        let alert = NSAlert(); alert.messageText = "应用账号到 \(end)"
+        alert.informativeText = scope == "desktop"
+            ? "请先完全退出 Desktop 及使用该目录的 Codex 后端。Desktop 由 CC Switch 管理时请在 CC Switch 中切换。\n\n操作会更新此端登录文件，不会改写另一端。完成后请确认实际账号。"
+            : "请先完全退出使用 CLI 目录的客户端及后端。若 CC Switch 正管理 CLI 目录，请从菜单栏退出 CC Switch。\n\n操作会更新 CLI 登录文件，不会改写 Desktop。完成后请确认实际账号。"
+        alert.addButton(withTitle: "应用账号"); alert.addButton(withTitle: "取消")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        guard accountMetadataReadable, !accountMetadataPending,
+              accountMetadata[id]?["managed"] as? Bool == true, client === accountClient else {
+            accountActionNotice.stringValue = "账号状态已变化，请刷新后重试。"; accountActionNotice.isHidden = false
+            renderAccountCards(); return
+        }
+        if scope == "desktop" && desktopAccountOwner != .native {
+            accountActionNotice.stringValue = desktopAccountOwner.blockedMessage; accountActionNotice.isHidden = false
+            renderAccountCards(); return
+        }
+        accountActionBusy = true
+        accountActionNotice.stringValue = "正在检查并应用到 \(end)…"; accountActionNotice.isHidden = false
+        renderAccountCards()
+        client.send("apply", fields: ["account_id": id, "scope": scope]) { [weak self] result in
+            guard let self = self else { return }
+            self.accountActionBusy = false
+            switch result {
+            case .failure(let error):
+                if error.message == "CC Switch 也管理该端，请先退出它以避免同时写入" {
+                    self.accountActionNotice.stringValue = scope == "desktop"
+                        ? DesktopAccountOwner.ccSwitch.blockedMessage
+                        : "上次切换未完成：请从菜单栏完全退出管理 CLI 目录的 CC Switch，再重新点击应用。"
+                } else {
+                    self.accountActionNotice.stringValue = "上次切换未完成：\(error.message)"
+                }
+            case .success(let value):
+                self.accountActionNotice.stringValue = value["state"] as? String == "already_bound"
+                    ? "\(end) 已绑定所选账号；运行身份请在客户端确认。"
+                    : "\(end) 的登录文件已更新；请启动客户端并确认实际账号。"
+                self.refreshData(forceQuota: true)
+            }
+            self.accountActionNotice.isHidden = false
+            self.refreshAccountMetadata()
+            self.renderAccountCards()
+        }
     }
 
     func refreshData(forceQuota: Bool) {
@@ -454,7 +680,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
     }
 
     func render(preserveScroll: Bool = true) {
-        for view in accountStack.arrangedSubviews { accountStack.removeArrangedSubview(view); view.removeFromSuperview() }
+        renderAccountCards()
         guard let snapshot = snapshot else {
             sourceHint.stringValue = "\(state.activeScope == "cli" ? "CLI · ~/.codex-cli" : "Desktop · ~/.codex") · 数据暂不可用"
             status.textColor = .systemOrange
@@ -475,14 +701,25 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         let iso = ISO8601DateFormatter(); iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
         let captured = iso.date(from: snapshot.captured_at) ?? ISO8601DateFormatter().date(from: snapshot.captured_at)
         status.stringValue = "\(prefix) · \(captured.map { DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .short) } ?? "刚刚") 更新\(warnings.first.map { "\n" + $0 } ?? " · 额度每 2 分钟自动更新")"
-        for (index, account) in snapshot.accounts.enumerated() {
-            add(QuotaCard(account: account, index: index, target: self, action: #selector(showAccountQuotaDetails(_:))), to: accountStack)
-        }
-        if snapshot.accounts.isEmpty { add(label("未读取到 CC Switch Codex 账号。"), to: accountStack) }
         warmup.toolTip = snapshot.capabilities["account_warmup"]?.reason
         handoff.toolTip = snapshot.capabilities["desktop_handoff"]?.reason
         applyFilter(preserveScroll: preserveScroll)
         feedback.stringValue = warnings.isEmpty ? (backgroundEnabled ? "自动任务开启 · 关闭窗口后继续运行" : "自动任务关闭 · 关闭窗口即退出") : "\(warnings.count) 条读取提示，可在「接入说明」中查看。"
+        layoutDocument()
+    }
+
+    func renderAccountCards() {
+        for view in accountStack.arrangedSubviews { accountStack.removeArrangedSubview(view); view.removeFromSuperview() }
+        guard let snapshot = snapshot else { layoutDocument(); return }
+        for (index, account) in snapshot.accounts.enumerated() {
+            let metadata = accountMetadataReadable ? accountMetadata[account.id] : nil
+            add(QuotaCard(account: account, index: index, metadata: metadata,
+                          actionsEnabled: accountMetadataReadable && !accountMetadataPending && !accountActionBusy && fixture == nil,
+                          desktopOwner: desktopAccountOwner,
+                          target: self, detailAction: #selector(showAccountQuotaDetails(_:)),
+                          applyAction: #selector(applyAccountFromMain(_:)), authorizeAction: #selector(openNativeAccountCenter)), to: accountStack)
+        }
+        if snapshot.accounts.isEmpty { add(label("尚未添加账号，请前往“授权管理”登录。"), to: accountStack) }
         layoutDocument()
     }
 
@@ -606,15 +843,16 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         }
     }
 
-    @objc func checkWarmupNow() { lastWarmupCheck = .distantPast; runWarmupCheckIfDue() }
-    func runWarmupCheckIfDue() {
+    @objc func checkWarmupNow() { lastWarmupCheck = .distantPast; runWarmupCheckIfDue(refreshOnly: true) }
+    func runWarmupCheckIfDue(refreshOnly: Bool = false) {
         guard fixture == nil, warmupReport?.enabled == true, !warmupChecking, !shuttingDown,
               Date().timeIntervalSince(lastWarmupCheck) >= 60 else { return }
         warmupChecking = true; lastWarmupCheck = Date(); updateWarmupUI()
         let revision = warmupControlRevision
         let bridge = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/codex-helper")
+        let arguments = ["warmup", refreshOnly ? "refresh" : "check"]
         DispatchQueue.global(qos: .utility).async { [weak self] in
-            let report = try? JSONDecoder().decode(WarmupReport.self, from: BridgeClient.read(executable: bridge, arguments: ["warmup","check"], timeout: 220, maximumBytes: 1 << 20, onStart: { process in
+            let report = try? JSONDecoder().decode(WarmupReport.self, from: BridgeClient.read(executable: bridge, arguments: arguments, timeout: 220, maximumBytes: 1 << 20, onStart: { process in
                 DispatchQueue.main.sync {
                     if self?.shuttingDown == true { process.terminate() }
                     else { self?.warmupProcess = process }
@@ -648,7 +886,8 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
             lines += ["", quota.summary, "", "查询时间：" + quotaTime(quota.queried_at)]
             if !quota.credential_sources.isEmpty { lines += ["凭证来源：" + quota.credential_sources.joined(separator: " / ")] }
         } else { lines += ["", "尚未查询额度，点刷新读取。"] }
-        lines += ["", "账号选择来自 CC Switch 配置。磁盘凭证归属不代表运行实例身份。"]
+        let managed = accountMetadata[account.id]?["managed"] as? Bool
+        lines += ["", managed == false ? "账号仅来自 CC Switch；小助手尚未获得此账号授权。" : "磁盘凭证归属不代表运行实例身份。"]
         alert.informativeText = lines.joined(separator: "\n")
         alert.addButton(withTitle: "知道了"); alert.beginSheetModal(for: window)
     }
@@ -742,25 +981,54 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
     func outlineView(_ outlineView: NSOutlineView, isGroupItem item: Any) -> Bool { item is ProjectItem }
 
     func outlineView(_ outlineView: NSOutlineView, viewFor tableColumn: NSTableColumn?, item: Any) -> NSView? {
-        let text: String
-        let tooltip: String
-        let isProject = item is ProjectItem
+        let isTime = tableColumn?.identifier.rawValue == "time"
+        let cell = NSTableCellView()
+        let field = NSTextField(labelWithString: "")
+        field.lineBreakMode = .byTruncatingTail; field.maximumNumberOfLines = 1
+        var views: [NSView] = []
         if let project = item as? ProjectItem {
-            text = tableColumn?.identifier.rawValue == "time" ? activityTime(project.group.latestActivity) : "\(project.group.title)（\(project.children.count)）"
-            tooltip = project.group.path.isEmpty ? "没有项目目录的会话" : project.group.path
+            cell.toolTip = project.group.path.isEmpty ? "没有项目目录的会话" : project.group.path
+            if isTime {
+                field.stringValue = activityTime(project.group.latestActivity)
+            } else {
+                let folder = NSImageView(image: NSImage(systemSymbolName: project.group.path.isEmpty ? "tray" : "folder", accessibilityDescription: nil)!)
+                folder.contentTintColor = .secondaryLabelColor
+                field.stringValue = project.group.title
+                field.font = .systemFont(ofSize: 12, weight: .semibold)
+                let count = Theme.text("\(project.children.count)", size: 10.5, weight: .medium, color: .secondaryLabelColor, wraps: false)
+                views = [folder, field, count]
+            }
         } else if let child = item as? SessionItem {
             let session = child.session
-            text = tableColumn?.identifier.rawValue == "time" ? activityTime(session.updated_at) : (session.archived ? "[归档] " : "") + session.title
-            tooltip = "\(session.title)\n\(session.project)\n\(session.id)"
+            cell.toolTip = "\(session.title)\n\(session.project)\n\(session.id)"
+            if isTime {
+                field.stringValue = activityTime(session.updated_at)
+            } else {
+                field.stringValue = session.title
+                field.font = .systemFont(ofSize: 12.5)
+                field.textColor = session.archived ? .secondaryLabelColor : .labelColor
+                views = [field]
+                if session.archived {
+                    let box = NSImageView(image: NSImage(systemSymbolName: "archivebox", accessibilityDescription: "已归档")!)
+                    box.contentTintColor = .tertiaryLabelColor
+                    views.insert(box, at: 0)
+                }
+            }
         } else { return nil }
-        let field = NSTextField(labelWithString: text)
-        field.font = .systemFont(ofSize: 12, weight: isProject ? .semibold : .regular)
-        field.lineBreakMode = .byTruncatingTail; field.maximumNumberOfLines = 1
-        let cell = NSTableCellView(); cell.addSubview(field); field.translatesAutoresizingMaskIntoConstraints = false
-        NSLayoutConstraint.activate([field.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 5),
-                                     field.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -5),
-                                     field.centerYAnchor.constraint(equalTo: cell.centerYAnchor)])
-        cell.textField = field; cell.toolTip = tooltip
+        if isTime {
+            field.font = .monospacedDigitSystemFont(ofSize: 11, weight: .regular)
+            field.textColor = .secondaryLabelColor
+            field.alignment = .right
+            views = [field]
+        }
+        field.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        let row = Theme.hstack(views, spacing: 6)
+        cell.addSubview(row); row.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([row.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
+                                     row.trailingAnchor.constraint(lessThanOrEqualTo: cell.trailingAnchor, constant: -4),
+                                     row.centerYAnchor.constraint(equalTo: cell.centerYAnchor)])
+        if isTime { row.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -4).isActive = true }
+        cell.textField = field
         return cell
     }
 
@@ -888,12 +1156,34 @@ extension Assistant {
         resumeToggle.isEnabled = !handoffActive && !resumeBusy && fixture == nil && selected?.archived == false && snapshot?.complete(in: state.activeScope) == true
         cliResume.isHidden = state.activeScope != "cli"
         cliResume.isEnabled = !handoffActive && fixture == nil && !resumeBusy && selected?.archived == false && snapshot?.complete(in: "cli") == true
-        resumeStatus.stringValue = state.activeScope == "cli" && !matching ? "首次请点“在终端托管续跑”；若该会话已在别处运行，请先退出原终端中的会话。" : (resumeReport?.message ?? "手动开启后，只在明确触限且额度恢复时继续原会话。")
+        if resumeReport?.status == "error" {
+            resumeStatus.stringValue = resumeReport?.message ?? "续跑设置未确认，请重试。"
+        } else {
+            resumeStatus.stringValue = state.activeScope == "cli" && !matching ? "首次请点“在终端托管续跑”；若该会话已在别处运行，请先退出原终端中的会话。" : (resumeReport?.message ?? "手动开启后，只在明确触限且额度恢复时继续原会话。")
+        }
         resumeStatus.toolTip = resumeStatus.stringValue
-        handoffPreflight.isEnabled = !handoffChecking && fixture == nil && selected?.archived == false && snapshot?.complete(in: state.activeScope) == true
+        runtimeLaunch.isHidden = state.activeScope != "desktop"
+        runtimeLaunch.isEnabled = !runtimeLaunching && !handoffActive && !resumeBusy && resumeReport?.enabled != true && fixture == nil && selected?.archived == false && snapshot?.complete(in: "desktop") == true
+        handoffPreflight.isEnabled = !runtimeLaunching && !handoffChecking && fixture == nil && selected?.archived == false && snapshot?.complete(in: state.activeScope) == true
         if handoffCheckedKey != nil && handoffCheckedKey != state.selectedKey {
             handoffCheckedKey = nil
             handoffStatus.stringValue = "选择会话后可以检查当前交接条件。"
+        }
+    }
+    @objc func openDesktopWithRuntimeBridge() {
+        guard !runtimeLaunching, let target = selected, target.sessionScope == "desktop", !target.archived, fixture == nil else { return }
+        guard ProcessInfo.processInfo.environment["CODEX_HELPER_TEST_HOME"] == nil else { handoffStatus.stringValue = "隔离测试不启动真实 Desktop。"; return }
+        runtimeLaunching = true; handoffCheckedKey = target.key; updateResumeUI()
+        let bridge = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/codex-helper")
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            struct LaunchResult: Decodable { let ok: Bool; let message: String }
+            let result = try? JSONDecoder().decode(LaunchResult.self, from: BridgeClient.read(executable: bridge, arguments: ["desktop-runtime", "launch", target.id], timeout: 20))
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.runtimeLaunching = false
+                if self.state.selectedKey == target.key { self.handoffStatus.stringValue = result?.message ?? "Desktop 启动请求结果未确认；请检查应用后再操作。" }
+                self.updateResumeUI(); self.layoutDocument()
+            }
         }
     }
     @objc func checkHandoffPreflight() {
@@ -927,7 +1217,7 @@ extension Assistant {
         handoffAcknowledge.isHidden = !needsReview || active
         handoffAcknowledge.title = handoffReport?.recovery_pending == true ? "保留当前账号并解除暂停" : "已检查，解除暂停"
         handoffAcknowledge.toolTip = handoffReport?.recovery_pending == true ? (handoffReport?.scope == "desktop" ? "先停止交接并核查 Desktop 会话及当前账号；通过认证检查后保留当前认证并清理旧恢复副本。" : "先关闭托管终端并核查会话。通过认证检查后保留当前认证并清理旧恢复副本。") : "请先核查原会话状态。"
-        let available = state.activeScope == "desktop" ? snapshot?.capabilities["desktop_handoff"]?.available == true : cliHandoffAvailable
+        let available = state.activeScope == "desktop" ? snapshot?.capabilities["desktop_handoff"]?.available == true : (cliHandoffAvailable && snapshot?.capabilities["cli_handoff"]?.available == true)
         handoffStart.isEnabled = available && fixture == nil && !needsReview && !active && !handoffBusy && !resumeBusy && resumeReport?.enabled != true && selected?.archived == false && snapshot?.complete(in: state.activeScope) == true
         handoffStop.isEnabled = !handoffBusy
         handoffAcknowledge.isEnabled = !handoffBusy && fixture == nil
@@ -935,7 +1225,8 @@ extension Assistant {
         if handoffPendingKey != nil { handoffRunStatus.stringValue = state.activeScope == "desktop" ? "正在启动 Desktop 会话监控。" : "正在打开托管终端；请在该终端使用所选会话。" }
         else if matches { handoffRunStatus.stringValue = handoffReport?.message ?? "正在监控所选会话。" }
         else if needsReview || handoffReport?.stage == "error" { handoffRunStatus.stringValue = handoffReport?.recovery_pending == true ? (handoffReport?.scope == "desktop" ? "请停止交接并核查 Desktop 会话与账号，再确认保留当前认证。" : "请关闭托管终端并核查账号。确认后可保留当前认证并解除暂停。") : (handoffReport?.message ?? "请检查原会话状态。") }
-        else if state.activeScope == "desktop" { handoffRunStatus.stringValue = available ? "仅监控选中会话；触发时会退出整个 Desktop，其他会话和未提交输入可能受影响。" : "Desktop 切号代码已接入，完整实机交接尚待验收。" }
+        else if let failure = handoffStartFailure, failure.key == state.selectedKey { handoffRunStatus.stringValue = "上次开启失败：" + failure.message }
+        else if state.activeScope == "desktop" { handoffRunStatus.stringValue = available ? "仅监控选中会话；触发时会退出整个 Desktop，其他会话和未提交输入可能受影响。" : (snapshot?.capabilities["desktop_handoff"]?.reason ?? "Desktop 切号状态读取中。") }
         else if resumeReport?.enabled == true { handoffRunStatus.stringValue = "请先关闭“不切号续跑”，再开启托管切号。" }
         else if !cliHandoffAvailable { handoffRunStatus.stringValue = "CLI 切号的真实服务验收尚未通过，暂不可开启。可先检查账号和额度。" }
         else { handoffRunStatus.stringValue = "先退出其他终端中的同一会话，再托管并开启切号。" }
@@ -944,10 +1235,12 @@ extension Assistant {
     }
     @objc func startCLIHandoff() {
         if state.activeScope == "desktop" { startDesktopHandoff(); return }
+        guard ProcessInfo.processInfo.environment["CODEX_HELPER_TEST_HOME"] == nil else { handoffRunStatus.stringValue = "隔离测试不打开真实终端。"; return }
         guard cliHandoffAvailable, !handoffBusy, !resumeBusy, resumeReport?.enabled != true, handoffPendingKey == nil, handoffReport?.hasAuthorization != true, let target = selected, target.sessionScope == "cli", !target.archived, fixture == nil else { return }
         guard let threshold = Double(handoffThreshold.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)), threshold.isFinite, threshold > 0, threshold < 100 else {
             handoffRunStatus.stringValue = "请输入大于 0、小于 100 的剩余额度阈值。"; return
         }
+        handoffStartFailure = nil
         handoffBusy = true; handoffRevision += 1; handoffPendingKey = target.key; handoffCancelPending = false; updateHandoffUI(); updateWarmupUI()
         let bridge = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/codex-helper")
         DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -956,8 +1249,9 @@ extension Assistant {
                 guard let self = self else { return }
                 self.handoffBusy = false; self.handoffRevision += 1
                 guard let report = report, report.enabled, let authorization = report.authorization_id, !authorization.isEmpty else {
-                    self.handoffPendingKey = nil; self.handoffLaunchDeadline = nil; self.updateHandoffUI(); self.updateWarmupUI()
-                    self.handoffRunStatus.stringValue = report?.message ?? "未能准备自动切号，请重试。"; return
+                    self.handoffPendingKey = nil; self.handoffLaunchDeadline = nil
+                    self.handoffStartFailure = (target.key, report?.message ?? "自动切号准备未完成，请先检查账号与会话状态。")
+                    self.updateHandoffUI(); self.updateWarmupUI(); return
                 }
                 self.handoffReport = report
                 if self.handoffCancelPending || self.state.selectedKey != target.key || self.state.activeScope != "cli" {
@@ -968,7 +1262,7 @@ extension Assistant {
                     let directory = FileManager.default.temporaryDirectory.appendingPathComponent("codex-helper-launch-" + UUID().uuidString)
                     try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
                     let file = directory.appendingPathComponent("Codex 自动切号.command")
-                    let script = "#!/bin/zsh\n" + quote(bridge.path) + " handoff cli " + quote(target.id) + " " + quote(String(threshold)) + " " + quote(authorization) + "\n"
+                    let script = "#!/bin/zsh\nexport CODEX_HELPER_NATIVE_PREVIEW=1\n" + quote(bridge.path) + " handoff cli " + quote(target.id) + " " + quote(String(threshold)) + " " + quote(authorization) + "\n"
                     try script.write(to: file, atomically: true, encoding: .utf8)
                     try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: file.path)
                     if !NSWorkspace.shared.open(file) { self.stopHandoff(); self.handoffRunStatus.stringValue = "终端未打开，请重试。" }
@@ -983,10 +1277,12 @@ extension Assistant {
         }
     }
     func startDesktopHandoff() {
+        guard ProcessInfo.processInfo.environment["CODEX_HELPER_TEST_HOME"] == nil else { handoffRunStatus.stringValue = "隔离测试不退出真实 Desktop。"; return }
         guard !handoffBusy, !resumeBusy, resumeReport?.enabled != true, handoffPendingKey == nil, handoffReport?.hasAuthorization != true, let target = selected, target.sessionScope == "desktop", !target.archived, fixture == nil else { return }
         guard let threshold = Double(handoffThreshold.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)), threshold.isFinite, threshold > 0, threshold < 100 else {
             handoffRunStatus.stringValue = "请输入大于 0、小于 100 的剩余额度阈值。"; return
         }
+        handoffStartFailure = nil
         handoffBusy = true; handoffRevision += 1; handoffPendingKey = target.key; handoffCancelPending = false; updateHandoffUI(); updateWarmupUI()
         let bridge = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/codex-helper")
         DispatchQueue.global(qos: .utility).async { [weak self] in
@@ -995,8 +1291,9 @@ extension Assistant {
                 guard let self = self else { return }
                 self.handoffBusy = false; self.handoffRevision += 1
                 guard let report = report, report.enabled, let authorization = report.authorization_id, !authorization.isEmpty else {
-                    self.handoffPendingKey = nil; self.handoffLaunchDeadline = nil; self.updateHandoffUI(); self.updateWarmupUI()
-                    self.handoffRunStatus.stringValue = report?.message ?? "未能准备 Desktop 自动切号。"; return
+                    self.handoffPendingKey = nil; self.handoffLaunchDeadline = nil
+                    self.handoffStartFailure = (target.key, report?.message ?? "Desktop 切号服务未能完成准备，请先检查账号与会话状态。")
+                    self.updateHandoffUI(); self.updateWarmupUI(); return
                 }
                 self.handoffReport = report
                 if self.handoffCancelPending || self.state.selectedKey != target.key || self.state.activeScope != "desktop" { self.stopHandoff(); return }
@@ -1054,6 +1351,7 @@ extension Assistant {
         }
     }
     @objc func openManagedCLI() {
+        guard ProcessInfo.processInfo.environment["CODEX_HELPER_TEST_HOME"] == nil else { resumeStatus.stringValue = "隔离测试不打开真实终端。"; return }
         guard handoffReport?.hasAuthorization != true, handoffPendingKey == nil, !handoffBusy, let target = selected, target.sessionScope == "cli", !target.archived, fixture == nil else { return }
         func quote(_ value: String) -> String { "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'" }
         do {
@@ -1061,7 +1359,7 @@ extension Assistant {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             let file = directory.appendingPathComponent("Codex 会话续跑.command")
             let bridge = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/codex-helper").path
-            let script = "#!/bin/zsh\n" + quote(bridge) + " resume cli " + quote(target.id) + "\n"
+            let script = "#!/bin/zsh\nexport CODEX_HELPER_NATIVE_PREVIEW=1\n" + quote(bridge) + " resume cli " + quote(target.id) + "\n"
             try script.write(to: file, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: file.path)
             if NSWorkspace.shared.open(file) { resumeStatus.stringValue = "正在打开原 CLI 会话的托管终端…" }
@@ -1124,6 +1422,7 @@ extension Assistant {
 }
 
 let args = CommandLine.arguments
+setenv("CODEX_HELPER_NATIVE_PREVIEW", "1", 1)
 if CCSwitchControl.handle(arguments: args) { exit(0) }
 func argument(_ name: String) -> String? {
     guard let index = args.firstIndex(of: name), index + 1 < args.count else { return nil }
@@ -1131,7 +1430,7 @@ func argument(_ name: String) -> String? {
 }
 let fixture = (argument("--fixture") ?? ProcessInfo.processInfo.environment["CODEX_HELPER_FIXTURE"]).map { URL(fileURLWithPath: $0) }
 let directory = (argument("--state-dir") ?? ProcessInfo.processInfo.environment["CODEX_HELPER_STATE_DIR"]).map { URL(fileURLWithPath: $0) }
-    ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/CodexHelper")
+    ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/CodexHelper-AccountPreview")
 let app = NSApplication.shared
 if fixture != nil, ProcessInfo.processInfo.environment["CODEX_HELPER_TEST_APPEARANCE"] == "dark" { app.appearance = NSAppearance(named: .darkAqua) }
 app.setActivationPolicy(.regular)

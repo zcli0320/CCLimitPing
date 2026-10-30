@@ -138,12 +138,13 @@ func (c *desktopIPC) interruptHandoffTurn(id, owner, expectedTurn string) error 
 // identity used by the running backend, or the state of background processes.
 // A successful observation does not authorize an automatic handoff.
 type DesktopHandoffPreflight struct {
-	SessionID string   `json:"session_id"`
-	TurnID    string   `json:"turn_id,omitempty"`
-	TurnState string   `json:"turn_state,omitempty"`
-	Runtime   string   `json:"runtime,omitempty"`
-	Ready     bool     `json:"ready"`
-	Blockers  []string `json:"blockers"`
+	SessionID               string   `json:"session_id"`
+	TurnID                  string   `json:"turn_id,omitempty"`
+	TurnState               string   `json:"turn_state,omitempty"`
+	Runtime                 string   `json:"runtime,omitempty"`
+	Ready                   bool     `json:"ready"`
+	RuntimeIdentityVerified bool     `json:"runtime_identity_verified"`
+	Blockers                []string `json:"blockers"`
 }
 
 type desktopHandoffSnapshot interface {
@@ -191,6 +192,9 @@ func inspectDesktopHandoff(ipc desktopHandoffSnapshot, id, provider string) (Des
 // account switch, or application restart. The protocol subscription requests a
 // snapshot from the already running owner, just like existing resume inspection.
 func (r Reader) CheckDesktopHandoffPreflight(ctx context.Context, id string) (DesktopHandoffPreflight, error) {
+	if _, err := r.desktopCCSwitchOwner(); err != nil {
+		return DesktopHandoffPreflight{SessionID: id, Ready: false}, err
+	}
 	provider, ok := r.managedResumeProvider("desktop")
 	if !ok {
 		return DesktopHandoffPreflight{SessionID: id, Ready: false}, errors.New("Desktop 账号配置不可确认，自动切号已暂停")
@@ -204,9 +208,32 @@ func (r Reader) CheckDesktopHandoffPreflight(ctx context.Context, id string) (De
 	if err != nil {
 		return out, err
 	}
-	if _, err := newDesktopHandoffLifecycle(ctx, r.Home); err != nil {
+	lifecycle, err := newDesktopHandoffLifecycle(ctx, r.Home)
+	if err != nil {
 		out.Ready = false
 		out.Blockers = append(out.Blockers, err.Error())
+	}
+	if r.nativeAccountPreview() {
+		filtered := out.Blockers[:0]
+		for _, blocker := range out.Blockers {
+			if !strings.HasPrefix(blocker, "重启账号根据冷启动、配置目录及 CC Switch 写出的完整凭证核验；") {
+				filtered = append(filtered, blocker)
+			}
+		}
+		out.Blockers = filtered
+		if lifecycle != nil {
+			runtime := desktopSingleSessionRuntime{r: r, lifecycle: lifecycle}
+			out.RuntimeIdentityVerified = runtime.requireRuntimeIdentity(ctx) == nil
+		}
+		if !out.RuntimeIdentityVerified {
+			out.Ready = false
+			out.Blockers = append(out.Blockers, "Desktop 运行账号未独立确认；需正常退出后以核验方式打开。")
+		}
+		if r.desktopWriterIsCCSwitch() {
+			out.Blockers = append(out.Blockers, "通过独立运行身份核验，交接时由 CC Switch 切换账号；触发时退出并重启整个 Desktop。")
+		} else {
+			out.Blockers = append(out.Blockers, "通过独立运行身份核验与原生账号管理器执行交接；触发时退出并重启整个 Desktop。")
+		}
 	}
 	return out, nil
 }

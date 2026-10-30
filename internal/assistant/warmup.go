@@ -15,20 +15,44 @@ import (
 )
 
 type WarmupAccount struct {
-	Key           string           `json:"key"`
-	Name          string           `json:"name"`
-	Status        string           `json:"status"`
-	Message       string           `json:"message"`
-	LastCheck     time.Time        `json:"last_check,omitempty"`
-	LastAttempt   time.Time        `json:"last_attempt,omitempty"`
-	NextCheck     time.Time        `json:"next_check,omitempty"`
-	WindowReset   int64            `json:"window_reset,omitempty"`
-	Attempts      int              `json:"attempts"`
-	Execution     *WarmupExecution `json:"execution,omitempty"`
-	NoRetryBefore time.Time        `json:"no_retry_before,omitempty"`
-	IdleObserved  time.Time        `json:"idle_observed,omitempty"`
-	LastProbe     time.Time        `json:"last_probe,omitempty"`
+	Key              string           `json:"key"`
+	Name             string           `json:"name"`
+	Status           string           `json:"status"`
+	Message          string           `json:"message"`
+	LastCheck        time.Time        `json:"last_check,omitempty"`
+	LastAttempt      time.Time        `json:"last_attempt,omitempty"`
+	NextCheck        time.Time        `json:"next_check,omitempty"`
+	WindowReset      int64            `json:"window_reset,omitempty"`
+	Attempts         int              `json:"attempts"`
+	ConfirmedAttempt int              `json:"confirmed_attempt,omitempty"`
+	Execution        *WarmupExecution `json:"execution,omitempty"`
+	NoRetryBefore    time.Time        `json:"no_retry_before,omitempty"`
+	IdleObserved     time.Time        `json:"idle_observed,omitempty"`
+	ZeroSampleAt     time.Time        `json:"zero_sample_at,omitempty"`
+	ZeroDeadline     int64            `json:"zero_deadline,omitempty"`
+	LastProbe        time.Time        `json:"last_probe,omitempty"`
 }
+
+const warmupWindowRecheck = 2 * time.Minute
+
+func isCachedWindowStatus(status string) bool {
+	switch status {
+	case "window_running", "confirmed", "window_running_uncertain_request", "probe_verified":
+		return true
+	default:
+		return false
+	}
+}
+
+func warmupWindowStatusStale(record *WarmupAccount, now time.Time) bool {
+	return record.LastCheck.IsZero() || record.LastCheck.After(now) || now.Sub(record.LastCheck) >= warmupWindowRecheck
+}
+
+func warmupHasConfirmedRequest(record *WarmupAccount, now time.Time) bool {
+	return record.Attempts > 0 && record.ConfirmedAttempt == record.Attempts && record.NoRetryBefore.After(now) &&
+		record.Execution != nil && record.Execution.Submitted && record.Execution.Completed && record.Execution.IdentityVerified
+}
+
 type WarmupReport struct {
 	Enabled         bool            `json:"enabled"`
 	Message         string          `json:"message"`
@@ -60,7 +84,7 @@ func credentialIdentity(c quotaCredential) string {
 	return privateKey(claims.Auth.User + "\x00" + claims.Auth.Workspace)
 }
 func (r Reader) warmupRoot() string {
-	return filepath.Join(r.Home, "Library/Application Support/CodexHelper/warmup")
+	return filepath.Join(r.helperStateRoot(), "warmup")
 }
 
 func readState[T any](path string, out *T) error {
@@ -148,9 +172,9 @@ func (r Reader) ConfigureWarmup(ctx context.Context, enabled bool) (WarmupReport
 	}
 	p.Enabled = enabled
 	if enabled {
-		accounts, _ := r.accounts(ctx, filepath.Join(r.Home, ".cc-switch"), "", nil)
+		accounts := r.automationAccounts(ctx)
 		if len(accounts) == 0 {
-			return WarmupReport{}, errors.New("没有可启用预热的 CC Switch 账号")
+			return WarmupReport{}, errors.New("没有可启用预热的账号")
 		}
 		p.Allowed = map[string]bool{}
 		for _, a := range accounts {
@@ -170,11 +194,14 @@ func (r Reader) WarmupStatus() WarmupReport {
 	return r.warmupReport(p, j)
 }
 func (r Reader) warmupReport(p warmupPolicy, j warmupJournal) WarmupReport {
+	return r.warmupReportAt(p, j, time.Now())
+}
+func (r Reader) warmupReportAt(p warmupPolicy, j warmupJournal, now time.Time) WarmupReport {
 	report := WarmupReport{Enabled: p.Enabled, Available: codexExecutable(r.Home) != "", Message: "自动预热已关闭", Accounts: []WarmupAccount{}}
 	report.Schedule = scheduleOf(p)
-	report.ScheduleAllowed = report.Schedule.permits(time.Now())
+	report.ScheduleAllowed = report.Schedule.permits(now)
 	if !report.ScheduleAllowed {
-		next := report.Schedule.nextOpening(time.Now())
+		next := report.Schedule.nextOpening(now)
 		report.NextOpening = &next
 	}
 	if p.Enabled {
@@ -184,7 +211,15 @@ func (r Reader) warmupReport(p warmupPolicy, j warmupJournal) WarmupReport {
 		}
 	}
 	for _, a := range j.Accounts {
-		report.Accounts = append(report.Accounts, *a)
+		account := *a
+		if isCachedWindowStatus(account.Status) && warmupWindowStatusStale(&account, now) {
+			account.Status = "window_check_pending"
+			account.Message = "上次窗口状态已过期，等待重新查询"
+			if warmupHasConfirmedRequest(&account, now) {
+				account.Message = "本次预热请求已完成，当前窗口状态待重新查询"
+			}
+		}
+		report.Accounts = append(report.Accounts, account)
 	}
 	sort.Slice(report.Accounts, func(i, j int) bool { return report.Accounts[i].Name < report.Accounts[j].Name })
 	return report
@@ -214,7 +249,32 @@ func windowDeadline(w QuotaWindow, now time.Time) time.Time {
 	return now.Add(time.Minute)
 }
 
+func validRunningWindow(w QuotaWindow, now time.Time) bool {
+	if w.ResetAfter != nil {
+		return *w.ResetAfter > 0 && *w.ResetAfter <= w.Seconds && windowRunning(w, now)
+	}
+	return w.ResetAt != nil && *w.ResetAt > now.Unix() && windowRunning(w, now)
+}
+
+// A zero-percent response may be rounded, and an unused window may report a
+// reset that moves with the clock. Two samples can establish a fixed deadline;
+// a single short countdown cannot prove the request opened a window.
+func zeroUsageWindowStable(first QuotaWindow, firstAt time.Time, next QuotaWindow, nextAt time.Time) bool {
+	elapsed := nextAt.Sub(firstAt)
+	if first.Seconds != 18000 || next.Seconds != 18000 || first.UsedPercent != 0 || next.UsedPercent != 0 || elapsed < 2*time.Second || elapsed > time.Minute || !validRunningWindow(next, nextAt) {
+		return false
+	}
+	firstKnown := (first.ResetAfter != nil && *first.ResetAfter > 0 && *first.ResetAfter <= first.Seconds) || (first.ResetAfter == nil && first.ResetAt != nil && *first.ResetAt > firstAt.Unix())
+	nextKnown := (next.ResetAfter != nil && *next.ResetAfter > 0 && *next.ResetAfter <= next.Seconds) || (next.ResetAfter == nil && next.ResetAt != nil && *next.ResetAt > nextAt.Unix())
+	if !firstKnown || !nextKnown {
+		return false
+	}
+	delta := windowDeadline(next, nextAt).Sub(windowDeadline(first, firstAt))
+	return delta >= -2*time.Second && delta <= 2*time.Second
+}
+
 func decideWarmup(q AccountQuota, record *WarmupAccount, now time.Time, probe bool) bool {
+	previousCheck, previousStatus := record.LastCheck, record.Status
 	record.LastCheck = now
 	record.NextCheck = now.Add(time.Minute)
 	if q.Status != "ready" {
@@ -259,20 +319,83 @@ func decideWarmup(q AccountQuota, record *WarmupAccount, now time.Time, probe bo
 		}
 		return true
 	}
-	if windowRunning(*five, now) {
-		record.Status = "window_running"
-		record.Message = "五小时窗口已运行，无需额外预热"
+	resetKnown := five.ResetAt != nil && *five.ResetAt > 0
+	if five.ResetAfter != nil {
+		resetKnown = *five.ResetAfter >= 0 && *five.ResetAfter <= five.Seconds
+	}
+	if !resetKnown {
+		record.Status = "window_unknown"
+		record.Message = "五小时窗口重置时间未知，等待完整数据；不发送预热请求"
 		record.IdleObserved = time.Time{}
-		deadline := windowDeadline(*five, now)
-		record.WindowReset = deadline.Unix()
-		record.NextCheck = deadline.Add(10 * time.Second)
+		record.NextCheck = now.Add(5 * time.Minute)
 		return false
 	}
+	if windowRunning(*five, now) {
+		deadline := windowDeadline(*five, now)
+		if five.UsedPercent == 0 {
+			// Zero may be rounded usage, or an idle window with a synthetic
+			// sliding reset. A single short countdown cannot distinguish them.
+			if record.ZeroSampleAt.IsZero() && previousStatus == "confirmed" && warmupHasConfirmedRequest(record, now) &&
+				record.WindowReset > 0 && !previousCheck.IsZero() && now.Sub(previousCheck) >= 10*time.Second && now.Sub(previousCheck) <= 10*time.Minute {
+				record.ZeroSampleAt, record.ZeroDeadline = previousCheck, record.WindowReset
+			}
+			elapsed := now.Sub(record.ZeroSampleAt)
+			if record.ZeroSampleAt.IsZero() || elapsed < 0 || elapsed > 10*time.Minute {
+				record.ZeroSampleAt, record.ZeroDeadline = now, deadline.Unix()
+				record.IdleObserved = time.Time{}
+				record.Status = "window_uncertain"
+				record.Message = "额度为零，正在复核窗口倒计时"
+				record.NextCheck = now.Add(10 * time.Second)
+				return false
+			}
+			if elapsed < 10*time.Second {
+				record.Status = "window_uncertain"
+				record.Message = "额度为零，等待再次核对窗口倒计时"
+				record.NextCheck = record.ZeroSampleAt.Add(10 * time.Second)
+				return false
+			}
+			shift := deadline.Unix() - record.ZeroDeadline
+			if shift >= -2 && shift <= 2 {
+				record.ZeroSampleAt, record.ZeroDeadline = now, deadline.Unix()
+			} else if shift >= int64(elapsed.Seconds())-2 && shift <= int64(elapsed.Seconds())+2 {
+				// The endpoint is advancing with the clock, so the earlier
+				// observation also serves as the first idle confirmation.
+				if record.IdleObserved.IsZero() {
+					record.IdleObserved = record.ZeroSampleAt
+				}
+				goto idle
+			} else {
+				record.ZeroSampleAt, record.ZeroDeadline = now, deadline.Unix()
+				record.IdleObserved = time.Time{}
+				record.Status = "window_uncertain"
+				record.Message = "窗口重置时间不稳定，稍后重新核查"
+				record.NextCheck = now.Add(time.Minute)
+				return false
+			}
+		} else {
+			record.ZeroSampleAt, record.ZeroDeadline = time.Time{}, 0
+		}
+		record.Status = "window_running"
+		record.Message = "额度显示五小时窗口正在运行；这不代表本次预热已完成"
+		if delta := deadline.Unix() - record.WindowReset; warmupHasConfirmedRequest(record, now) && record.WindowReset > 0 && delta >= -2 && delta <= 2 {
+			record.Status = "confirmed"
+			record.Message = "本次独立预热已完成，额度窗口仍在运行"
+		}
+		record.IdleObserved = time.Time{}
+		record.WindowReset = deadline.Unix()
+		record.NextCheck = now.Add(warmupWindowRecheck)
+		if end := deadline.Add(10 * time.Second); end.Before(record.NextCheck) {
+			record.NextCheck = end
+		}
+		return false
+	}
+	record.ZeroSampleAt, record.ZeroDeadline = time.Time{}, 0
 	if five.UsedPercent > 0 {
 		record.Status = "awaiting_reset"
 		record.Message = "窗口数据尚未归零，等待服务更新"
 		return false
 	}
+idle:
 	if record.NoRetryBefore.After(now) {
 		record.Status = "verification_pending"
 		record.Message = "已登记可能发送的请求；等待窗口回查，不重复发送"
@@ -294,17 +417,48 @@ func decideWarmup(q AccountQuota, record *WarmupAccount, now time.Time, probe bo
 }
 
 type warmupDependencies struct {
-	now   func() time.Time
-	quota func(context.Context, quotaCredential) AccountQuota
-	run   func(context.Context, string, quotaCredential, func() error) (WarmupExecution, error)
-	busy  func([]string) bool
+	now      func() time.Time
+	quota    func(context.Context, quotaCredential) AccountQuota
+	run      func(context.Context, string, quotaCredential, func() error) (WarmupExecution, error)
+	busy     func([]string) bool
+	activity func([]string) (bool, error)
+}
+
+func (d warmupDependencies) accountActivity(sources []string) (bool, error) {
+	if d.activity != nil {
+		return d.activity(sources)
+	}
+	if d.busy != nil {
+		return d.busy(sources), nil
+	}
+	return false, errors.New("账号活动状态无法确认，暂缓预热")
 }
 
 func (r Reader) CheckWarmup(ctx context.Context, probeID string) (WarmupReport, error) {
+	return r.checkWarmupMode(ctx, probeID, false, r.warmupDependencies())
+}
+
+// RefreshWarmup bypasses cached check times but never starts a model request.
+// Existing request claims, cooldowns, and automatic policy remain unchanged.
+func (r Reader) RefreshWarmup(ctx context.Context) (WarmupReport, error) {
+	return r.checkWarmupMode(ctx, "", true, r.warmupDependencies())
+}
+
+func (r Reader) warmupDependencies() warmupDependencies {
 	client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
-	return r.checkWarmup(ctx, probeID, warmupDependencies{now: time.Now, quota: func(ctx context.Context, c quotaCredential) AccountQuota { return queryAccountQuota(ctx, client, c) }, run: runIsolatedWarmup, busy: func(s []string) bool { return r.recentActivity(s, time.Now()) }})
+	return warmupDependencies{now: time.Now, quota: func(ctx context.Context, c quotaCredential) AccountQuota { return queryAccountQuota(ctx, client, c) }, run: runIsolatedWarmup, activity: func(s []string) (bool, error) { return r.activityStatus(s, time.Now()) }}
 }
 func (r Reader) checkWarmup(ctx context.Context, probeID string, d warmupDependencies) (WarmupReport, error) {
+	return r.checkWarmupMode(ctx, probeID, false, d)
+}
+func (r Reader) checkWarmupMode(ctx context.Context, probeID string, refreshOnly bool, d warmupDependencies) (WarmupReport, error) {
+	if r.nativeAccountPreview() {
+		if _, err := os.Lstat(filepath.Join(r.helperStateRoot(), "accounts", "pending.json")); !os.IsNotExist(err) {
+			report := r.WarmupStatus()
+			report.Message = "账号切换或恢复核查期间暂停预热"
+			return report, nil
+		}
+	}
 	unlock, err := lockWarmup(filepath.Join(r.warmupRoot(), "execution.lock"))
 	if err != nil {
 		return r.WarmupStatus(), err
@@ -314,20 +468,20 @@ func (r Reader) checkWarmup(ctx context.Context, probeID string, d warmupDepende
 	if err != nil {
 		return WarmupReport{}, err
 	}
-	if !p.Enabled && probeID == "" {
-		return r.warmupReport(p, j), nil
+	if !p.Enabled && probeID == "" && !refreshOnly {
+		return r.warmupReportAt(p, j, d.now()), nil
 	}
 	schedule := scheduleOf(p)
-	if probeID == "" && !schedule.permits(d.now()) {
-		report := r.warmupReport(p, j)
+	if probeID == "" && !refreshOnly && !schedule.permits(d.now()) {
+		report := r.warmupReportAt(p, j, d.now())
 		report.ScheduleAllowed = false
 		next := schedule.nextOpening(d.now())
 		report.NextOpening = &next
 		report.Message = "当前不在允许预热时段，等待下次开始时间"
 		return report, nil
 	}
-	accounts, _ := r.accounts(ctx, filepath.Join(r.Home, ".cc-switch"), "", nil)
-	credentials := r.quotaCredentials(d.now())
+	accounts := r.automationAccounts(ctx)
+	credentials := r.warmupCredentials(ctx, d.now())
 	seen := map[string]bool{}
 	probeFound := false
 	for _, account := range accounts {
@@ -343,10 +497,10 @@ func (r Reader) checkWarmup(ctx context.Context, probeID string, d warmupDepende
 		if probeID == "" && !p.Allowed[privateKey(account.ID)] {
 			continue
 		}
-		if probeID == "" {
+		if probeID == "" && !refreshOnly {
 			fresh, _, e := r.readWarmupState()
 			if e != nil {
-				return r.warmupReport(p, j), e
+				return r.warmupReportAt(p, j, d.now()), e
 			}
 			if !fresh.Enabled || !scheduleOf(fresh).permits(d.now()) {
 				break
@@ -380,12 +534,22 @@ func (r Reader) checkWarmup(ctx context.Context, probeID string, d warmupDepende
 		record.Name = account.Name
 		// A newly available credential should clear an old missing-credential
 		// status on the next scheduler tick, without waiting out its backoff.
-		if probeID == "" && record.NextCheck.After(d.now()) && !(ok && record.Status == "credential_unavailable") {
+		staleWindow := isCachedWindowStatus(record.Status) && warmupWindowStatusStale(record, d.now())
+		if probeID == "" && !refreshOnly && record.NextCheck.After(d.now()) && !(ok && record.Status == "credential_unavailable") && !staleWindow {
 			continue
 		}
 		if !ok {
+			record.LastCheck = d.now()
 			record.Status = "credential_unavailable"
-			record.Message = "等待 CC Switch 提供该账号的有效访问凭证"
+			record.Message = "等待该账号的有效访问凭证"
+			if r.nativeAccountPreview() {
+				bindings, err := r.readNativeBindings()
+				if err != nil {
+					record.Message = errNativeBindings.Error()
+				} else if bindings.reapplyBlocked()[account.ID] {
+					record.Message = errNativeReapply.Error()
+				}
+			}
 			record.NextCheck = d.now().Add(5 * time.Minute)
 			continue
 		}
@@ -393,16 +557,36 @@ func (r Reader) checkWarmup(ctx context.Context, probeID string, d warmupDepende
 		if !decideWarmup(q, record, d.now(), probeID != "") {
 			continue
 		}
-		if probeID == "" && d.busy(credential.sources) {
-			record.Status = "account_busy"
-			record.Message = "对应账号目录近期有任务活动，稍后再检查"
+		if probeID == "" {
+			sources, activityErr := r.warmupActivitySources(account.ID, credential.sources)
+			busy := false
+			if activityErr == nil {
+				busy, activityErr = d.accountActivity(sources)
+			}
+			if activityErr != nil || busy {
+				record.Status, record.Message = "account_busy", "对应账号目录近期有任务活动，稍后再检查"
+				if activityErr != nil {
+					record.Status, record.Message = "activity_unknown", activityErr.Error()
+				}
+				record.NextCheck = d.now().Add(time.Minute)
+				continue
+			}
+		}
+		if refreshOnly {
+			record.Status = "ready_to_warmup"
+			record.Message = "已重新查询：窗口未启动；本次仅检查，后续按自动策略调度"
 			record.NextCheck = d.now().Add(time.Minute)
 			continue
 		}
 		if err := writeState(filepath.Join(r.warmupRoot(), "journal.json"), j); err != nil {
-			return r.warmupReport(p, j), err
+			return r.warmupReportAt(p, j, d.now()), err
 		}
 		execution, runErr := d.run(ctx, codexExecutable(r.Home), credential, func() error {
+			if r.nativeAccountPreview() {
+				if _, err := os.Lstat(filepath.Join(r.helperStateRoot(), "accounts", "pending.json")); !os.IsNotExist(err) {
+					return errors.New("账号操作待核查，本次预热取消")
+				}
+			}
 			freshPolicy, _, e := r.readWarmupState()
 			if e != nil {
 				return e
@@ -413,7 +597,7 @@ func (r Reader) checkWarmup(ctx context.Context, probeID string, d warmupDepende
 			if probeID == "" && !scheduleOf(freshPolicy).permits(d.now()) {
 				return errors.New("已超出允许预热时段，本次请求取消")
 			}
-			fresh, exists := r.quotaCredentials(d.now())[account.ID]
+			fresh, exists := r.warmupCredentials(ctx, d.now())[account.ID]
 			if !exists || fresh.access != credential.access {
 				return errors.New("凭证已变化，本次预热取消")
 			}
@@ -421,7 +605,16 @@ func (r Reader) checkWarmup(ctx context.Context, probeID string, d warmupDepende
 				if !decideWarmup(d.quota(ctx, fresh), record, d.now(), false) {
 					return errors.New("窗口状态已变化，取消本次请求")
 				}
-				if d.busy(fresh.sources) {
+				sources, activityErr := r.warmupActivitySources(account.ID, fresh.sources)
+				busy := false
+				if activityErr == nil {
+					busy, activityErr = d.accountActivity(sources)
+				}
+				if activityErr != nil {
+					record.Status = "activity_unknown"
+					return activityErr
+				}
+				if busy {
 					record.Status = "account_busy"
 					return errors.New("账号任务活动发生变化，取消本次请求")
 				}
@@ -451,7 +644,7 @@ func (r Reader) checkWarmup(ctx context.Context, probeID string, d warmupDepende
 		})
 		record.Execution = &execution
 		if !execution.Submitted && runErr != nil {
-			if record.Status != "window_running" && record.Status != "account_busy" {
+			if record.Status != "window_running" && record.Status != "account_busy" && record.Status != "activity_unknown" && record.Status != "window_unknown" {
 				record.Status = "setup_failed"
 			}
 			record.Message = runErr.Error()
@@ -462,9 +655,11 @@ func (r Reader) checkWarmup(ctx context.Context, probeID string, d warmupDepende
 		record.Message = "请求是否成功不能仅凭进程判断，正在回查窗口"
 		record.NextCheck = d.now().Add(time.Minute)
 		if err := writeState(filepath.Join(r.warmupRoot(), "journal.json"), j); err != nil {
-			return r.warmupReport(p, j), err
+			return r.warmupReportAt(p, j, d.now()), err
 		}
 		verified := false
+		var zeroSample *QuotaWindow
+		var zeroSampleAt time.Time
 		for tries := 0; tries < 3; tries++ {
 			if tries > 0 {
 				select {
@@ -474,47 +669,70 @@ func (r Reader) checkWarmup(ctx context.Context, probeID string, d warmupDepende
 				}
 			}
 			after := d.quota(ctx, credential)
+			observedAt := d.now()
 			for _, w := range after.Windows {
-				if after.Status == "ready" && w.Seconds == 18000 && windowRunning(w, d.now()) {
+				if after.Status != "ready" || w.Seconds != 18000 {
+					continue
+				}
+				if w.UsedPercent > 0 && validRunningWindow(w, observedAt) {
 					verified = true
-					deadline := windowDeadline(w, d.now())
+				} else if w.UsedPercent == 0 {
+					if zeroSample != nil && zeroUsageWindowStable(*zeroSample, zeroSampleAt, w, observedAt) {
+						verified = true
+					} else if zeroSample == nil {
+						sample := w
+						zeroSample, zeroSampleAt = &sample, observedAt
+					}
+				}
+				if verified {
+					deadline := windowDeadline(w, observedAt)
 					record.WindowReset = deadline.Unix()
-					record.NextCheck = deadline.Add(10 * time.Second)
+					record.LastCheck = observedAt
+					record.NextCheck = observedAt.Add(warmupWindowRecheck)
+					if end := deadline.Add(10 * time.Second); end.Before(record.NextCheck) {
+						record.NextCheck = end
+					}
 				}
 			}
 			if verified || ctx.Err() != nil {
 				break
 			}
 		}
-		if verified && execution.Completed {
+		completed := execution.Submitted && execution.Completed && execution.IdentityVerified && runErr == nil
+		if verified && completed {
 			record.Status = "confirmed"
-			record.Message = "独立请求完成，已回查确认五小时窗口运行"
+			record.ConfirmedAttempt = record.Attempts
+			record.Message = "独立请求正常完成，额度回查显示五小时窗口运行"
 		}
-		if verified && !execution.Completed {
+		if verified && !completed {
 			record.Status = "window_running_uncertain_request"
-			record.Message = "窗口已运行，但本次请求完成状态不明确；不会重复发送"
+			record.Message = "额度窗口已运行，但本次预热请求完成状态未确认；不会重复发送"
 		}
 		if !verified {
 			record.Message = "已登记一次请求，窗口尚未确认；后续仅回查，不重复请求"
 		}
-		if probeID != "" && verified {
+		if probeID != "" && verified && completed {
 			record.Status = "probe_verified"
 			record.Message = "独立真实请求测试完成并回查；不代表经历了窗口重置"
 			record.NextCheck = d.now().Add(time.Minute)
 		}
 		if err := writeState(filepath.Join(r.warmupRoot(), "journal.json"), j); err != nil {
-			return r.warmupReport(p, j), err
+			return r.warmupReportAt(p, j, d.now()), err
 		}
 	}
 	if probeID != "" && !probeFound {
-		return r.warmupReport(p, j), errors.New("指定账号不在当前 CC Switch 账号列表中")
+		return r.warmupReportAt(p, j, d.now()), errors.New("指定账号不在当前账号列表中")
 	}
 	if err := writeState(filepath.Join(r.warmupRoot(), "journal.json"), j); err != nil {
-		return r.warmupReport(p, j), err
+		return r.warmupReportAt(p, j, d.now()), err
 	}
 	latest, _, e := r.readWarmupState()
 	if e == nil {
 		p = latest
 	}
-	return r.warmupReport(p, j), nil
+	report := r.warmupReportAt(p, j, d.now())
+	if refreshOnly {
+		report.Message = "已重新查询额度；本次仅检查，不发送预热请求"
+	}
+	return report, nil
 }

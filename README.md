@@ -6,7 +6,7 @@
 
 **English** | [中文](README.zh-CN.md)
 
-> This fork also includes **Codex Helper 0.3.8 / build 17**, a native macOS assistant for CC Switch account quotas, scheduled warmup, separate Desktop/CLI session lists, and opt-in handoff for one selected Desktop conversation. See the [Chinese setup and build guide](docs/macos-helper.zh-CN.md) and [handoff validation record](docs/auto-handoff-plan.zh-CN.md). The full real-account handoff passed with a simulated low-quota trigger; real Desktop exhaustion remains unverified. The proposed native switching backend is not implemented yet.
+> This fork also includes **Codex Helper 0.4.4 / build 23**, a native macOS assistant with account management, quotas, scheduled warmup, separate Desktop/CLI sessions, and opt-in handoff for one selected conversation. Desktop handoff checks the running identity and uses CC Switch when it owns the Desktop directory. See the [Chinese setup and build guide](docs/macos-helper.zh-CN.md). Natural quota-exhaustion handoff remains unverified.
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![CI](https://github.com/wavever/CCLimitPing/actions/workflows/ci.yml/badge.svg)](https://github.com/wavever/CCLimitPing/actions/workflows/ci.yml)

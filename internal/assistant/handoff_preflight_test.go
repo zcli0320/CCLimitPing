@@ -44,3 +44,18 @@ func TestHandoffQuotaEvidenceDoesNotTreatUnknownAsZero(t *testing.T) {
 		t.Fatal("unknown source or missing weekly quota was treated as usable")
 	}
 }
+
+func TestNativeDesktopPreflightRequiresIdentityAndUsableBackup(t *testing.T) {
+	ready := DesktopHandoffPreflight{Ready: true, RuntimeIdentityVerified: true}
+	if !desktopExecutionReady(ready, true, true, true) {
+		t.Fatal("a verified Desktop with a usable backup cannot enable monitoring")
+	}
+	ready.RuntimeIdentityVerified = false
+	if desktopExecutionReady(ready, true, true, true) {
+		t.Fatal("disk identity alone enabled native Desktop monitoring")
+	}
+	ready.RuntimeIdentityVerified = true
+	if desktopExecutionReady(ready, false, true, true) || desktopExecutionReady(ready, true, false, true) {
+		t.Fatal("unready login or quota enabled monitoring")
+	}
+}

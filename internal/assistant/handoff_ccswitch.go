@@ -7,11 +7,13 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 type ccSwitchBinding struct {
@@ -33,12 +35,181 @@ type desktopCCSwitch struct {
 func (r Reader) ccSwitchTransactionPath() string {
 	return filepath.Join(filepath.Dir(r.handoffPath()), "ccswitch-transaction.json")
 }
-func (r Reader) ccSwitchBinding(ctx context.Context, account string) (ccSwitchBinding, error) {
-	var settings struct {
-		Dir string `json:"codexConfigDir"`
+
+// An absent settings file means no CC Switch owner. An existing file defaults
+// to .codex when the directory is omitted or empty. Invalid/unreadable settings
+// are unknown, not permission to let another writer change Desktop.
+func (r Reader) desktopCCSwitchOwner() (bool, error) {
+	path := filepath.Join(r.Home, ".cc-switch/settings.json")
+	if _, err := os.Lstat(path); os.IsNotExist(err) {
+		return false, nil
+	} else if err != nil {
+		return false, errDesktopOwnerUnknown
 	}
-	if readJSON(filepath.Join(r.Home, ".cc-switch/settings.json"), &settings) != nil || !sameExistingPath(settings.Dir, filepath.Join(r.Home, ".codex")) {
+	info, err := os.Stat(path)
+	if err != nil || !info.Mode().IsRegular() || info.Size() > 8<<20 {
+		return false, errDesktopOwnerUnknown
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return false, errDesktopOwnerUnknown
+	}
+	defer f.Close()
+	info, err = f.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() > 8<<20 {
+		return false, errDesktopOwnerUnknown
+	}
+	rawSettings, err := io.ReadAll(io.LimitReader(f, (8<<20)+1))
+	if err != nil || len(rawSettings) > 8<<20 || !utf8.Valid(rawSettings) || !validJSONSurrogates(rawSettings) {
+		return false, errDesktopOwnerUnknown
+	}
+	var settings map[string]json.RawMessage
+	if json.Unmarshal(rawSettings, &settings) != nil || settings == nil {
+		return false, errDesktopOwnerUnknown
+	}
+	dir := ""
+	if raw, ok := settings["codexConfigDir"]; ok {
+		if string(raw) == "null" || json.Unmarshal(raw, &dir) != nil {
+			return false, errDesktopOwnerUnknown
+		}
+	}
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		dir = filepath.Join(r.Home, ".codex")
+	}
+	if dir == "~" {
+		dir = r.Home
+	} else if strings.HasPrefix(dir, "~/") {
+		dir = filepath.Join(r.Home, dir[2:])
+	}
+	if !filepath.IsAbs(dir) {
+		return false, errDesktopOwnerUnknown
+	}
+	dir = filepath.Clean(dir)
+	desktop := filepath.Clean(filepath.Join(r.Home, ".codex"))
+	return dir == desktop || sameExistingPath(dir, desktop), nil
+}
+
+// Go's JSON decoder otherwise replaces unpaired UTF-16 surrogate escapes,
+// while the Rust service rejects them. Treat either form of invalid Unicode as
+// an unknown owner so both writers make the same fail-closed decision.
+func validJSONSurrogates(data []byte) bool {
+	hex4 := func(raw []byte) (uint16, bool) {
+		if len(raw) != 4 {
+			return 0, false
+		}
+		var value uint16
+		for _, c := range raw {
+			value <<= 4
+			switch {
+			case c >= '0' && c <= '9':
+				value |= uint16(c - '0')
+			case c >= 'a' && c <= 'f':
+				value |= uint16(c-'a') + 10
+			case c >= 'A' && c <= 'F':
+				value |= uint16(c-'A') + 10
+			default:
+				return 0, false
+			}
+		}
+		return value, true
+	}
+	inString := false
+	for i := 0; i < len(data); {
+		switch {
+		case data[i] == '"':
+			inString = !inString
+			i++
+		case inString && data[i] == '\\':
+			if i+1 >= len(data) {
+				return false
+			}
+			if data[i+1] != 'u' {
+				i += 2
+				continue
+			}
+			if i+6 > len(data) {
+				return false
+			}
+			value, ok := hex4(data[i+2 : i+6])
+			if !ok {
+				return false
+			}
+			if value >= 0xd800 && value <= 0xdbff {
+				if i+12 > len(data) || data[i+6] != '\\' || data[i+7] != 'u' {
+					return false
+				}
+				low, ok := hex4(data[i+8 : i+12])
+				if !ok || low < 0xdc00 || low > 0xdfff {
+					return false
+				}
+				i += 12
+			} else {
+				if value >= 0xdc00 && value <= 0xdfff {
+					return false
+				}
+				i += 6
+			}
+		default:
+			i++
+		}
+	}
+	return true
+}
+
+func (r Reader) desktopWriterIsCCSwitch() bool {
+	owned, err := r.desktopCCSwitchOwner()
+	return err == nil && owned
+}
+
+// Resolve independent local key spaces by workspace and, where present,
+// user/email. Ambiguity fails closed even if one key happens to be equal.
+func (r Reader) ccSwitchAccountKey(account string) (string, error) {
+	var native, cc handoffManagedStore
+	if readJSON(r.managedAccountsStorePath(), &native) != nil || native.Version != 2 || readJSON(filepath.Join(r.Home, ".cc-switch/codex_oauth_auth.json"), &cc) != nil || cc.Version != 2 {
+		return "", errors.New("无法读取小助手或 CC Switch 账号信息")
+	}
+	a, ok := native.Accounts[account]
+	if !ok || a.ID != account || a.Workspace == "" {
+		return "", errors.New("小助手备用账号身份不可确认")
+	}
+	aClaims, aValid := decodeTokenClaims(a.Identity)
+	if aValid && aClaims.Auth.Workspace != a.Workspace {
+		return "", errors.New("小助手备用账号身份不一致")
+	}
+	key := ""
+	for id, candidate := range cc.Accounts {
+		if id == "" || candidate.ID != id || candidate.Workspace != a.Workspace {
+			continue
+		}
+		bClaims, bValid := decodeTokenClaims(candidate.Identity)
+		if bValid && bClaims.Auth.Workspace != candidate.Workspace {
+			continue
+		}
+		if aValid && bValid && aClaims.Auth.User != bClaims.Auth.User {
+			continue
+		}
+		if a.Email != "" && candidate.Email != "" && !strings.EqualFold(strings.TrimSpace(a.Email), strings.TrimSpace(candidate.Email)) {
+			continue
+		}
+		if key != "" {
+			return "", errors.New("备用账号匹配到多个 CC Switch 账号，无法确定切换目标")
+		}
+		key = id
+	}
+	if key == "" {
+		return "", errors.New("未找到与备用账号匹配的 CC Switch 账号")
+	}
+	return key, nil
+}
+
+func (r Reader) ccSwitchBinding(ctx context.Context, account string) (ccSwitchBinding, error) {
+	if !r.desktopWriterIsCCSwitch() {
 		return ccSwitchBinding{}, errors.New("CC Switch 的配置目录必须为 Desktop 的 .codex")
+	}
+	key, err := r.ccSwitchAccountKey(account)
+	if err != nil {
+		return ccSwitchBinding{}, err
 	}
 	var rows []struct {
 		ID      string `json:"id"`
@@ -50,7 +221,7 @@ func (r Reader) ccSwitchBinding(ctx context.Context, account string) (ccSwitchBi
 	}
 	var out ccSwitchBinding
 	for _, row := range rows {
-		if row.Account == account {
+		if row.Account == key {
 			if out.ID != "" {
 				return out, errors.New("备用账号绑定了多张卡片，请保留唯一切换目标")
 			}
@@ -124,7 +295,11 @@ func (r Reader) ccSwitchLiveMatches(account string) ([]byte, error) {
 	if json.Unmarshal(raw, &native) != nil || !r.handoffCurrentMatchesAccount(raw, account) || readJSON(filepath.Join(r.Home, ".cc-switch/codex_oauth_auth.json"), &store) != nil {
 		return nil, errors.New("CC Switch 写出的登录身份不匹配")
 	}
-	a, ok := store.Accounts[account]
+	key, err := r.ccSwitchAccountKey(account)
+	if err != nil {
+		return nil, err
+	}
+	a, ok := store.Accounts[key]
 	claims, valid := decodeTokenClaims(native.Tokens.Access)
 	if !ok || !valid || claims.Expires <= time.Now().Add(30*time.Second).Unix() || native.Tokens.Refresh == "" || a.Refresh == "" || subtle.ConstantTimeCompare([]byte(native.Tokens.Refresh), []byte(a.Refresh)) != 1 {
 		return nil, errors.New("CC Switch 写出的完整登录记录尚未同步")

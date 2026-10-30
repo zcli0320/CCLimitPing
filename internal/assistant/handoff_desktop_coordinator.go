@@ -22,6 +22,7 @@ type desktopRuntimeEvidence struct {
 	ColdStartVerified                     bool
 	ConfigHomeVerified                    bool
 	SettingsVerified                      bool
+	RuntimeIdentityVerified               bool // independent evidence for the active Desktop instance
 	ContinueTurnID                        string
 }
 
@@ -51,11 +52,39 @@ type desktopHandoffCoordinator struct {
 	owner                        string
 	continuedTurn                string
 	ccswitch                     *desktopCCSwitch
+	manager                      handoffAccountManager
 	lastObservation              HandoffObservation
 	observationFailed            bool
 }
 
 func (d *desktopHandoffCoordinator) targetEvidence(ctx context.Context, threshold float64) (AccountQuota, bool) {
+	if d.manager != nil {
+		path, err := d.r.handoffAuthPath("desktop")
+		if err != nil {
+			return AccountQuota{}, false
+		}
+		raw, err := readProtectedHandoffFile(path)
+		if err != nil || !d.r.handoffCurrentMatchesAccount(raw, d.source) {
+			return AccountQuota{}, false
+		}
+		if d.preparedOK && sha256.Sum256(raw) != d.prepared.currentHash {
+			return AccountQuota{}, false
+		}
+		if d.ccswitch != nil {
+			if _, err := d.r.ccSwitchBinding(ctx, d.target); err != nil {
+				return AccountQuota{}, false
+			}
+		} else if d.r.requireNativeWriteOwner("desktop") != nil || d.manager.ready(ctx, d.target, "desktop") != nil {
+			return AccountQuota{}, false
+		}
+		q, err := d.manager.quota(ctx, d.target)
+		if err != nil || !resumeQuotaReady(q) || !handoffTargetQuotaOK(q, threshold) {
+			return q, false
+		}
+		d.prepared = handoffAuthPreparation{scope: "desktop", accountID: d.target, currentHash: sha256.Sum256(raw)}
+		d.preparedOK = true
+		return q, true
+	}
 	if d.ccswitch != nil {
 		credential, found := d.r.quotaCredentials(time.Now())[d.target]
 		if !found || d.quota == nil {
@@ -102,6 +131,9 @@ func (d *desktopHandoffCoordinator) targetInstalled() bool {
 	if d.ccswitch != nil {
 		return d.ccswitch.installed(d.r.HandoffStatus())
 	}
+	if d.manager != nil {
+		return d.r.requireNativeWriteOwner("desktop") == nil && d.r.nativeHandoffInstalled("desktop", d.target)
+	}
 	if !d.preparedOK {
 		return false
 	}
@@ -128,6 +160,9 @@ func (d *desktopHandoffCoordinator) preparedStillValid() bool {
 	if d.ccswitch != nil {
 		_, err := d.r.ccSwitchBinding(context.Background(), d.target)
 		return err == nil
+	}
+	if d.manager != nil {
+		return d.r.requireNativeWriteOwner("desktop") == nil
 	}
 	candidate, err := d.r.findHandoffAuthCandidate(d.target, time.Now())
 	return err == nil && candidate.digest == d.prepared.candidateHash
@@ -188,6 +223,9 @@ func (d *desktopHandoffCoordinator) Observe(ctx context.Context, s HandoffState)
 		// Inferred from confirmed full exit, cold start and effective config
 		// home plus a whole-record match. This is not direct account/read.
 		o.IdentityVerified = o.RestartReady
+		if d.manager != nil {
+			o.IdentityVerified = o.RestartReady && e.RuntimeIdentityVerified
+		}
 		o.SettingsVerified = e.SettingsVerified
 		o.TargetMatches = o.TargetMatches && e.View.ID == d.id && e.Owner != "" && hasTurn
 		if s.Stage != "waiting_continue" {
@@ -195,6 +233,10 @@ func (d *desktopHandoffCoordinator) Observe(ctx context.Context, s HandoffState)
 		} else {
 			o.ContinueStarted = hasTurn && d.continuedTurn != "" && e.ContinueTurnID == d.continuedTurn && turn.ID == d.continuedTurn && (turn.Status == "inProgress" || turn.Status == "completed")
 		}
+		return o, nil
+	}
+	if d.manager != nil && !e.RuntimeIdentityVerified {
+		o.Warning = "Desktop 运行账号尚未独立确认，等待核查；不会自动退出或切号"
 		return o, nil
 	}
 	current, ok := d.sourceCurrent()
@@ -277,12 +319,36 @@ func (d *desktopHandoffCoordinator) Execute(ctx context.Context, action HandoffA
 		if d.ccswitch != nil {
 			return d.ccswitch.switchAccount(ctx, s, stopped)
 		}
+		if d.manager != nil {
+			if err := d.r.requireNativeWriteOwner("desktop"); err != nil {
+				return err
+			}
+			if err := stopped(ctx); err != nil {
+				return err
+			}
+			if !d.preparedStillValid() || d.r.handoffCancelled(s) {
+				return errors.New("原认证或授权已变化")
+			}
+			if err := d.r.requireNativeWriteOwner("desktop"); err != nil {
+				return err
+			}
+			if err := d.manager.apply(ctx, d.target, "desktop"); err != nil {
+				return err
+			}
+			if !d.targetInstalled() {
+				return errors.New("目标认证结果待核查")
+			}
+			return nil
+		}
 		_, err := d.r.commitHandoffAuth(ctx, d.prepared, s.Threshold, stopped, d.quota)
 		return err
 	}
 	e, err := d.runtime.observe(ctx, d.id)
 	if err != nil || !e.InterventionKnown || e.UserIntervened {
 		return errors.New("无法确认运行状态")
+	}
+	if d.manager != nil && !e.RuntimeIdentityVerified && (action == HandoffRequestStop || action == HandoffExit || action == HandoffContinue) {
+		return errors.New("Desktop 运行账号尚未独立确认")
 	}
 	switch action {
 	case HandoffRequestStop:
@@ -338,7 +404,7 @@ func (d *desktopHandoffCoordinator) Execute(ctx context.Context, action HandoffA
 		return d.runtime.requestRestart(ctx, d.id)
 	case HandoffContinue:
 		turn, ok := e.View.latest()
-		if !e.ColdStartVerified || !e.ConfigHomeVerified || !e.SettingsVerified || !d.targetInstalled() || !ok || !desktopHandoffStopObserved(d.r.Home, d.id, s.TurnID, e.Owner, d.provider, e.View, e.Owner) || d.r.handoffCancelled(s) {
+		if !e.ColdStartVerified || !e.ConfigHomeVerified || !e.SettingsVerified || (d.manager != nil && !e.RuntimeIdentityVerified) || !d.targetInstalled() || !ok || !desktopHandoffStopObserved(d.r.Home, d.id, s.TurnID, e.Owner, d.provider, e.View, e.Owner) || d.r.handoffCancelled(s) {
 			return errors.New("新实例或原会话不可确认")
 		}
 		newTurn, err := d.runtime.requestContinue(ctx, d.id, e.Owner, turn)
@@ -368,7 +434,7 @@ func (d *desktopHandoffCoordinator) finishCompleted(ctx context.Context, complet
 			return errors.New("目标凭证不一致")
 		}
 		e, err := d.runtime.observe(ctx, d.id)
-		if err != nil || !e.InterventionKnown || e.UserIntervened || !e.ColdStartVerified || !e.ConfigHomeVerified || !e.SettingsVerified || e.View.ID != d.id || e.Owner == "" || e.ContinueTurnID != d.continuedTurn {
+		if err != nil || !e.InterventionKnown || e.UserIntervened || !e.ColdStartVerified || !e.ConfigHomeVerified || !e.SettingsVerified || (d.manager != nil && !e.RuntimeIdentityVerified) || e.View.ID != d.id || e.Owner == "" || e.ContinueTurnID != d.continuedTurn {
 			return errors.New("新实例状态不可确认")
 		}
 		turn, ok := e.View.latest()
@@ -380,6 +446,8 @@ func (d *desktopHandoffCoordinator) finishCompleted(ctx context.Context, complet
 	var finishErr error
 	if d.ccswitch != nil {
 		finishErr = d.ccswitch.finish(ctx, completed, verify)
+	} else if d.manager != nil {
+		finishErr = verify(ctx, d.target)
 	} else {
 		finishErr = d.r.finishHandoffAuth(ctx, verify)
 	}

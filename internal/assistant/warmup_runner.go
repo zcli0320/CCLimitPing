@@ -187,7 +187,7 @@ func runIsolatedWarmup(ctx context.Context, executable string, credential quotaC
 		return result, errors.New("未找到可用的 Codex 可执行文件")
 	}
 	if credential.expires <= time.Now().Add(60*time.Second).Unix() {
-		return result, errors.New("有效访问凭证即将过期，等待 CC Switch 刷新")
+		return result, errors.New("有效访问凭证即将过期，等待账号登录更新")
 	}
 	root, err := os.MkdirTemp("", "codex-helper-warmup-")
 	if err != nil {

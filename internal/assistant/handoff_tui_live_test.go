@@ -107,6 +107,20 @@ func startNativeHandoffTestServer(t *testing.T, ctx context.Context, exe, home s
 		if m.Method != "" {
 			s.notifications[m.Method]++
 		}
+		if len(m.Error) > 0 && string(m.Error) != "null" {
+			var e struct {
+				Code    int    `json:"code"`
+				Message string `json:"message"`
+			}
+			if json.Unmarshal(m.Error, &e) == nil {
+				s.errorCode = e.Code
+				for _, word := range []string{"invalid", "thread", "turn", "active", "found", "interrupt", "cancel", "busy", "unsupported", "method", "initialized", "already", "loaded", "rollout", "storage", "file", "not found", "not yet"} {
+					if strings.Contains(strings.ToLower(e.Message), word) {
+						s.errorFlags = append(s.errorFlags, word)
+					}
+				}
+			}
+		}
 		if m.Method == "turn/completed" || m.Method == "turn/started" {
 			var p struct {
 				ThreadID string `json:"threadId"`

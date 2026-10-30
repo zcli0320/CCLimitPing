@@ -2,6 +2,7 @@ package assistant
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -139,6 +140,7 @@ type cliHandoffSupervisor struct {
 	seenActiveTurn  string
 	seenActiveEpoch uint64
 	client          *http.Client
+	manager         handoffAccountManager
 	output          io.Writer
 }
 
@@ -292,7 +294,7 @@ func (s *cliHandoffSupervisor) identifyAccounts(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	accounts, _ := s.r.accounts(ctx, filepath.Join(s.r.Home, ".cc-switch"), "", nil)
+	accounts := s.r.automationAccounts(ctx)
 	credentials := s.r.quotaCredentials(time.Now())
 	source := ""
 	for _, account := range accounts {
@@ -305,7 +307,7 @@ func (s *cliHandoffSupervisor) identifyAccounts(ctx context.Context) error {
 		}
 	}
 	if source == "" {
-		return errors.New("当前 CLI 账号未匹配 CC Switch")
+		return errors.New("当前 CLI 账号未匹配账号库")
 	}
 	target := ""
 	for _, account := range accounts {
@@ -323,6 +325,29 @@ func (s *cliHandoffSupervisor) identifyAccounts(ctx context.Context) error {
 	return nil
 }
 func (s *cliHandoffSupervisor) backupEvidence(ctx context.Context, threshold float64) (AccountQuota, bool) {
+	if s.manager != nil {
+		path, err := s.r.handoffAuthPath("cli")
+		if err != nil {
+			return AccountQuota{}, false
+		}
+		raw, err := readProtectedHandoffFile(path)
+		if err != nil || !s.r.handoffCurrentMatchesAccount(raw, s.sourceID) {
+			return AccountQuota{}, false
+		}
+		if s.preparedOK && sha256.Sum256(raw) != s.prepared.currentHash {
+			return AccountQuota{}, false
+		}
+		if s.manager.ready(ctx, s.targetID, "cli") != nil {
+			return AccountQuota{}, false
+		}
+		q, err := s.manager.quota(ctx, s.targetID)
+		if err != nil || !resumeQuotaReady(q) || !handoffTargetQuotaOK(q, threshold) {
+			return q, false
+		}
+		s.prepared = handoffAuthPreparation{scope: "cli", accountID: s.targetID, currentHash: sha256.Sum256(raw)}
+		s.preparedOK = true
+		return q, true
+	}
 	prep, candidate, err := s.r.prepareHandoffAuth("cli", s.targetID, time.Now())
 	if err != nil {
 		return AccountQuota{}, false
@@ -542,6 +567,9 @@ func (s *cliHandoffSupervisor) Observe(ctx context.Context, state HandoffState) 
 	return o, nil
 }
 func (s *cliHandoffSupervisor) authTargetInstalled() bool {
+	if s.manager != nil {
+		return s.r.nativeHandoffInstalled("cli", s.targetID)
+	}
 	path, err := s.r.handoffAuthPath("cli")
 	if err != nil {
 		return false
@@ -573,7 +601,7 @@ func (s *cliHandoffSupervisor) verifyTarget(ctx context.Context) error {
 		return errors.New("目标认证与账号不一致")
 	}
 	var store handoffManagedStore
-	if readJSON(filepath.Join(s.r.Home, ".cc-switch", "codex_oauth_auth.json"), &store) != nil {
+	if readJSON(s.r.managedAccountsStorePath(), &store) != nil {
 		return errors.New("账号信息不可读取")
 	}
 	account, ok := store.Accounts[s.targetID]
@@ -633,6 +661,26 @@ func (s *cliHandoffSupervisor) Execute(ctx context.Context, action HandoffAction
 	case HandoffSwitch:
 		if !s.preparedOK {
 			return errors.New("备用认证未准备")
+		}
+		if s.manager != nil {
+			if err := s.stoppedForHandoff(ctx); err != nil {
+				return err
+			}
+			path, err := s.r.handoffAuthPath("cli")
+			if err != nil {
+				return err
+			}
+			raw, err := readProtectedHandoffFile(path)
+			if err != nil || sha256.Sum256(raw) != s.prepared.currentHash || !s.r.handoffCurrentMatchesAccount(raw, s.sourceID) || s.r.handoffCancelled(state) {
+				return errors.New("原认证或授权已变化")
+			}
+			if err := s.manager.apply(ctx, s.targetID, "cli"); err != nil {
+				return err
+			}
+			if !s.authTargetInstalled() {
+				return errors.New("目标认证结果待核查")
+			}
+			return nil
 		}
 		_, err := s.r.commitHandoffAuth(ctx, s.prepared, state.Threshold, s.stoppedForHandoff, func(ctx context.Context, c quotaCredential) AccountQuota { return queryAccountQuota(ctx, s.client, c) })
 		return err
@@ -770,6 +818,24 @@ func (r Reader) PrepareCLIHandoff(ctx context.Context, id string, threshold floa
 	if _, err := r.scopeCredential("cli", time.Now()); err != nil {
 		return r.HandoffStatus(), err
 	}
+	if r.nativeAccountPreview() {
+		probe := &cliHandoffSupervisor{r: r}
+		if err := probe.identifyAccounts(ctx); err != nil {
+			return r.HandoffStatus(), err
+		}
+		manager, err := r.startNativeHandoffManager(ctx)
+		if err != nil {
+			return r.HandoffStatus(), err
+		}
+		defer manager.Close()
+		if err := manager.ready(ctx, probe.targetID, "cli"); err != nil {
+			return r.HandoffStatus(), err
+		}
+		q, err := manager.quota(ctx, probe.targetID)
+		if err != nil || !handoffTargetQuotaOK(q, threshold) {
+			return r.HandoffStatus(), errors.New("备用账号额度或登录不可用")
+		}
+	}
 	return r.ConfigureHandoff("cli", id, threshold, true)
 }
 
@@ -822,6 +888,15 @@ func (r Reader) RunCLIHandoff(ctx context.Context, id string, threshold float64,
 	ctx, cancel := context.WithCancel(ctx)
 	defer cancel()
 	s := &cliHandoffSupervisor{r: r, ctx: ctx, id: id, cwd: selected.Project, exe: exe, socket: filepath.Join(root, "control.sock"), env: cliEnvironment(r.Home), provider: provider, input: &cliHandoffInput{}, client: &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}}
+	if r.nativeAccountPreview() {
+		manager, e := r.startNativeHandoffManager(ctx)
+		if e != nil {
+			_ = os.RemoveAll(root)
+			return e
+		}
+		defer manager.Close()
+		s.manager = manager
+	}
 	if err = s.identifyAccounts(ctx); err != nil {
 		return err
 	}
@@ -912,7 +987,13 @@ func (r Reader) RunCLIHandoff(ctx context.Context, id string, threshold float64,
 					fmt.Fprintln(os.Stderr, updated.Message)
 				}
 				if updated.Stage == "completed" {
-					if err := r.finishHandoffAuth(ctx, s.verifyAccountID); err != nil {
+					var finishErr error
+					if s.manager != nil {
+						finishErr = s.verifyAccountID(ctx, s.targetID)
+					} else {
+						finishErr = r.finishHandoffAuth(ctx, s.verifyAccountID)
+					}
+					if err := finishErr; err != nil {
 						fmt.Fprintln(os.Stderr, "认证恢复副本等待核验清理：", err)
 						_, _ = r.handoffCleanupUncertain(updated)
 					} else if _, rearmed, err := r.rearmCompletedHandoff(updated); err != nil {

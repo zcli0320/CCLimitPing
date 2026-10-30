@@ -42,8 +42,8 @@ func (r Reader) desktopRunnerReady(s HandoffState) bool {
 
 func (r Reader) desktopHandoffAccounts() (string, string, error) {
 	var store handoffManagedStore
-	if readJSON(filepath.Join(r.Home, ".cc-switch/codex_oauth_auth.json"), &store) != nil || store.Version != 2 || len(store.Accounts) != 2 {
-		return "", "", errors.New("需要 CC Switch 中恰好两个账号")
+	if readJSON(r.managedAccountsStorePath(), &store) != nil || store.Version != 2 || len(store.Accounts) != 2 {
+		return "", "", errors.New("需要账号库中恰好两个账号")
 	}
 	path, err := r.handoffAuthPath("desktop")
 	if err != nil {
@@ -79,6 +79,16 @@ func (r Reader) desktopHandoffAccounts() (string, string, error) {
 	return source, target, nil
 }
 
+func requireReadyDesktopPreflight(selected DesktopHandoffPreflight) error {
+	if !selected.RuntimeIdentityVerified {
+		return errors.New("Desktop 运行账号未独立确认；请正常退出后以核验方式打开，再重新检查")
+	}
+	if !selected.Ready {
+		return errors.New("所选 Desktop 会话尚未就绪；请点击“检查所选会话”查看原因")
+	}
+	return nil
+}
+
 // PrepareDesktopHandoff authorizes only the selected session and records no
 // credentials. The UI must explain that the entire Desktop app will quit.
 func (r Reader) PrepareDesktopHandoff(ctx context.Context, id string, threshold float64) (HandoffState, error) {
@@ -87,6 +97,10 @@ func (r Reader) PrepareDesktopHandoff(ctx context.Context, id string, threshold 
 	}
 	if !desktopHandoffUUID.MatchString(id) || !validHandoffThreshold(threshold) {
 		return r.HandoffStatus(), errors.New("会话或阈值无效")
+	}
+	owner, err := r.desktopCCSwitchOwner()
+	if err != nil {
+		return r.HandoffStatus(), err
 	}
 	unlock, err := lockWarmup(filepath.Join(filepath.Dir(r.handoffPath()), "desktop-runner.lock"))
 	if err != nil {
@@ -120,15 +134,51 @@ func (r Reader) PrepareDesktopHandoff(ctx context.Context, id string, threshold 
 	if err != nil {
 		return r.HandoffStatus(), err
 	}
-	bridge, err := newDesktopCCSwitch(r)
+	if r.nativeAccountPreview() {
+		manager, err := r.startNativeHandoffManager(ctx)
+		if err != nil {
+			return r.HandoffStatus(), err
+		}
+		defer manager.Close()
+		if !owner {
+			if err := manager.ready(ctx, target, "desktop"); err != nil {
+				return r.HandoffStatus(), err
+			}
+		}
+		q, err := manager.quota(ctx, target)
+		if err != nil || !handoffTargetQuotaOK(q, threshold) {
+			return r.HandoffStatus(), errors.New("备用账号额度或登录不可用")
+		}
+	}
+	if !r.nativeAccountPreview() || owner {
+		bridge, err := newDesktopCCSwitch(r)
+		if err != nil {
+			return r.HandoffStatus(), err
+		}
+		if err := bridge.inspect(ctx, target); err != nil {
+			return r.HandoffStatus(), err
+		}
+	}
+	if r.nativeAccountPreview() {
+		// An existing history row is not proof that Desktop has the selected
+		// conversation loaded and ready to control. Do not report an armed
+		// monitor until the same read-only preflight succeeds.
+		selected, err := r.CheckDesktopHandoffPreflight(ctx, id)
+		if err != nil {
+			return r.HandoffStatus(), errors.New("所选 Desktop 会话无法核查；请在 Desktop 打开会话后重新检查")
+		}
+		if err := requireReadyDesktopPreflight(selected); err != nil {
+			return r.HandoffStatus(), err
+		}
+	} else if _, err := newDesktopHandoffLifecycle(ctx, r.Home); err != nil {
+		return r.HandoffStatus(), err
+	}
+	currentOwner, err := r.desktopCCSwitchOwner()
 	if err != nil {
 		return r.HandoffStatus(), err
 	}
-	if err := bridge.inspect(ctx, target); err != nil {
-		return r.HandoffStatus(), err
-	}
-	if _, err := newDesktopHandoffLifecycle(ctx, r.Home); err != nil {
-		return r.HandoffStatus(), err
+	if currentOwner != owner {
+		return r.HandoffStatus(), errors.New("Desktop 管理方已变化，请重新检查")
 	}
 	return r.ConfigureHandoff("desktop", id, threshold, true)
 }
@@ -141,13 +191,33 @@ func (r Reader) RunDesktopHandoff(ctx context.Context, id string, threshold floa
 	if !state.Enabled || state.Scope != "desktop" || state.SessionID != id || state.Stage != "watching" || state.AuthorizationID == "" || state.AuthorizationID != authorizationID || state.Threshold != threshold || r.handoffCancelled(state) {
 		return errors.New("该会话的切号授权已变化")
 	}
-	client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
-	bridge, err := newDesktopCCSwitch(r)
+	owner, err := r.desktopCCSwitchOwner()
 	if err != nil {
 		return err
 	}
+	client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
+	var bridge *desktopCCSwitch
+	var manager *nativeManagerClient
+	var handoffManager handoffAccountManager
+	if r.nativeAccountPreview() {
+		var err error
+		manager, err = r.startNativeHandoffManager(ctx)
+		if err != nil {
+			return err
+		}
+		defer manager.Close()
+		handoffManager = manager
+	}
+	if !r.nativeAccountPreview() || owner {
+		var err error
+		bridge, err = newDesktopCCSwitch(r)
+		if err != nil {
+			return err
+		}
+	}
 	deps := desktopRunnerDependencies{
 		ccswitch: bridge,
+		manager:  handoffManager,
 		makeRuntime: func(ctx context.Context, provider string) (desktopHandoffRuntime, error) {
 			lifecycle, err := newDesktopHandoffLifecycle(ctx, r.Home)
 			if err != nil {
@@ -184,6 +254,7 @@ func (r Reader) RunDesktopHandoff(ctx context.Context, id string, threshold floa
 
 type desktopRunnerDependencies struct {
 	ccswitch            *desktopCCSwitch
+	manager             handoffAccountManager
 	makeRuntime         func(context.Context, string) (desktopHandoffRuntime, error)
 	resetRuntime        func(context.Context, desktopHandoffRuntime) error
 	quota               func(context.Context, quotaCredential) AccountQuota
@@ -227,7 +298,7 @@ func (r Reader) runDesktopHandoff(ctx context.Context, id string, threshold floa
 	if err != nil {
 		return err
 	}
-	d := &desktopHandoffCoordinator{r: r, id: id, provider: provider, source: source, target: target, runtime: runtime, quota: deps.quota, ccswitch: deps.ccswitch}
+	d := &desktopHandoffCoordinator{r: r, id: id, provider: provider, source: source, target: target, runtime: runtime, quota: deps.quota, ccswitch: deps.ccswitch, manager: deps.manager}
 	if r.HandoffStatus() != state || r.handoffCancelled(state) {
 		return errors.New("切号授权已取消")
 	}

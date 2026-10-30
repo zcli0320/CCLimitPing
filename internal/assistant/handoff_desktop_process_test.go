@@ -3,6 +3,9 @@ package assistant
 import (
 	"context"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -37,6 +40,55 @@ func TestDesktopProcessIdentityAndExit(t *testing.T) {
 	if _, err := findDesktopProcessPair(append(procs, procs[0]), 501, app); err == nil {
 		t.Fatal("duplicate Desktop app accepted")
 	}
+}
+
+func TestReadDesktopProcessesIgnoresCallerLocale(t *testing.T) {
+	if _, err := os.Stat("/bin/ps"); err != nil {
+		t.Skip("ps unavailable")
+	}
+	t.Setenv("LANG", "zh_CN.UTF-8")
+	t.Setenv("LC_ALL", "zh_CN.UTF-8")
+	t.Setenv("LC_TIME", "zh_CN.UTF-8")
+	procs, err := readDesktopProcesses(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range procs {
+		if p.PID == os.Getpid() {
+			return
+		}
+	}
+	t.Fatal("current test process missing from the process list")
+}
+
+func TestReadDesktopProcessesKeepsNonASCIICommandPaths(t *testing.T) {
+	if _, err := os.Stat("/bin/sleep"); err != nil {
+		t.Skip("sleep unavailable")
+	}
+	t.Setenv("LANG", "zh_CN.UTF-8")
+	t.Setenv("LC_ALL", "zh_CN.UTF-8")
+	link := filepath.Join(t.TempDir(), "Codex 小助手账号测试版")
+	if err := os.Symlink("/bin/sleep", link); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command(link, "30")
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+	procs, err := readDesktopProcesses(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range procs {
+		if p.PID == cmd.Process.Pid {
+			if !strings.HasPrefix(p.Command, link+" ") {
+				t.Fatalf("command path was escaped: %q", p.Command)
+			}
+			return
+		}
+	}
+	t.Fatal("started process missing from the process list")
 }
 
 func TestDesktopEnvironmentRequiresExpectedRoot(t *testing.T) {
@@ -95,4 +147,35 @@ func TestLiveDesktopProcessReadOnly(t *testing.T) {
 		t.Fatal("backend home not confirmed")
 	}
 	t.Log("current Desktop app, direct backend and config home confirmed")
+}
+
+func TestDesktopProcessPairRequiresExactBridgeAndBundledChild(t *testing.T) {
+	const app = "/Applications/ChatGPT.app"
+	const bridge = "/Users/test/Applications/Helper.app/Contents/MacOS/codex-runtime-bridge"
+	main := desktopProcessIdentity{PID: 100, UID: 501, Start: "app", Command: app + "/Contents/MacOS/ChatGPT"}
+	proxy := desktopProcessIdentity{PID: 101, PPID: 100, UID: 501, Start: "bridge", Command: bridge + " app-server --listen stdio://"}
+	backend := desktopProcessIdentity{PID: 102, PPID: 101, UID: 501, Start: "backend", Command: app + "/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex app-server --listen stdio://"}
+	procs := []desktopProcessIdentity{main, proxy, backend}
+	pair, err := findDesktopProcessPairWithBridge(procs, 501, app, bridge)
+	if err != nil || pair.App != main || pair.Bridge != proxy || pair.Server != backend {
+		t.Fatal("exact bridged backend not recognized", err)
+	}
+	for _, bad := range []desktopProcessIdentity{
+		{PID: 101, PPID: 100, UID: 501, Start: "bridge", Command: "/tmp/other/codex-runtime-bridge app-server"},
+		{PID: 101, PPID: 999, UID: 501, Start: "bridge", Command: proxy.Command},
+		{PID: 101, PPID: 100, UID: 502, Start: "bridge", Command: proxy.Command},
+	} {
+		if _, err := findDesktopProcessPairWithBridge([]desktopProcessIdentity{main, bad, backend}, 501, app, bridge); err == nil {
+			t.Fatal("unrelated bridge accepted")
+		}
+	}
+	direct := backend
+	direct.PID = 103
+	direct.PPID = main.PID
+	if _, err := findDesktopProcessPairWithBridge(append(procs, direct), 501, app, bridge); err == nil {
+		t.Fatal("multiple Desktop backends accepted")
+	}
+	if desktopOldProcessesExited(pair, []desktopProcessIdentity{proxy}, 501, app) {
+		t.Fatal("orphaned bridge accepted as exited")
+	}
 }

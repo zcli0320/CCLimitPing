@@ -203,7 +203,7 @@ func (r Reader) handoffCurrentMatchesAccount(raw []byte, accountID string) bool 
 	access, okA := decodeTokenClaims(auth.Tokens.Access)
 	identity, okI := decodeTokenClaims(auth.Tokens.Identity)
 	var store handoffManagedStore
-	if !okA || !okI || access.Auth != identity.Auth || auth.Tokens.Workspace != access.Auth.Workspace || readJSON(filepath.Join(r.Home, ".cc-switch", "codex_oauth_auth.json"), &store) != nil || store.Version != 2 {
+	if !okA || !okI || access.Auth != identity.Auth || auth.Tokens.Workspace != access.Auth.Workspace || readJSON(r.managedAccountsStorePath(), &store) != nil || store.Version != 2 {
 		return false
 	}
 	account, ok := store.Accounts[accountID]

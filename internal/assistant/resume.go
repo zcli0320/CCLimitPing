@@ -22,7 +22,7 @@ type ResumeReport struct {
 }
 
 func (r Reader) resumePath() string {
-	return filepath.Join(r.Home, "Library/Application Support/CodexHelper/resume/policy.json")
+	return filepath.Join(r.helperStateRoot(), "resume", "policy.json")
 }
 
 // CC Switch names its official OAuth provider "custom" on this Mac. The
@@ -70,11 +70,23 @@ func (r Reader) ResumeStatus() ResumeReport {
 	return p
 }
 func (r Reader) scopeCredential(scope string, now time.Time) (quotaCredential, error) {
+	if r.nativeAccountPending() {
+		return quotaCredential{}, errNativePending
+	}
+	bindings, err := r.readNativeBindings()
+	if err != nil {
+		return quotaCredential{}, err
+	}
 	dir, label := ".codex", "Desktop"
+	bound := bindings.Desktop
 	if scope == "cli" {
 		dir, label = ".codex-cli", "CLI"
+		bound = bindings.CLI
 	} else if scope != "desktop" {
 		return quotaCredential{}, errors.New("会话来源无效")
+	}
+	if bound != nil && bound.NeedsReapply {
+		return quotaCredential{}, errNativeReapply
 	}
 	var auth struct {
 		Tokens struct {
@@ -82,7 +94,7 @@ func (r Reader) scopeCredential(scope string, now time.Time) (quotaCredential, e
 		} `json:"tokens"`
 	}
 	if readJSON(filepath.Join(r.Home, dir, "auth.json"), &auth) != nil {
-		return quotaCredential{}, errors.New("凭证不可用或已过期，请在 CC Switch 更新该账号后重试")
+		return quotaCredential{}, errors.New("凭证不可用或已过期，请更新该账号登录后重试")
 	}
 	for _, c := range r.quotaCredentialsFrom(now, dir) {
 		// Require this source's exact token, not a newer token from another
@@ -95,7 +107,7 @@ func (r Reader) scopeCredential(scope string, now time.Time) (quotaCredential, e
 			}
 		}
 	}
-	return quotaCredential{}, errors.New("凭证不可用或已过期，请在 CC Switch 更新该账号后重试")
+	return quotaCredential{}, errors.New("凭证不可用或已过期，请更新该账号登录后重试")
 }
 func (r Reader) ConfigureResume(ctx context.Context, scope, id string, enabled bool) (ResumeReport, error) {
 	unlock, err := lockWarmup(r.resumePath() + ".lock")
@@ -118,7 +130,7 @@ func (r Reader) ConfigureResume(ctx context.Context, scope, id string, enabled b
 	}
 	provider, supported := r.managedResumeProvider(scope)
 	if !supported {
-		return p, errors.New("所选端没有使用可确认的 CC Switch / OpenAI 登录配置")
+		return p, errors.New("所选端没有使用可确认的 OpenAI 登录配置")
 	}
 	snapshot := r.Snapshot(ctx)
 	found := false
@@ -219,6 +231,16 @@ func resumeQuotaReady(q AccountQuota) bool {
 	}
 	return five && week
 }
+
+func resumeCredentialMessage(err error, fallback string) string {
+	for _, known := range []error{errNativeBindings, errNativePending, errNativeReapply} {
+		if errors.Is(err, known) {
+			return known.Error()
+		}
+	}
+	return fallback
+}
+
 func (r Reader) checkResume(ctx context.Context, d resumeDependencies) (ResumeReport, error) {
 	// A separate execution lock allows the user to disable/change the target
 	// while quota or IPC is waiting. Recheck policy at the submission boundary.
@@ -256,7 +278,7 @@ func (r Reader) checkResume(ctx context.Context, d resumeDependencies) (ResumeRe
 	}
 	c, err := d.credential()
 	if err != nil {
-		return set("credential_error", "凭证不可用或已过期，请在 CC Switch 更新该账号后重试")
+		return set("credential_error", resumeCredentialMessage(err, "凭证不可用或已过期，请更新该账号登录后重试"))
 	}
 	if credentialIdentity(c) != p.Identity {
 		return set("account_changed", "账号已变化；请关闭后重新开启续跑以确认使用该账号")
@@ -275,7 +297,7 @@ func (r Reader) checkResume(ctx context.Context, d resumeDependencies) (ResumeRe
 		expectedProvider = "openai"
 	}
 	if v.ID != p.ID || v.ModelProvider != expectedProvider {
-		return set("provider_changed", "会话认证配置已变化，请重新确认 CC Switch 登录配置")
+		return set("provider_changed", "会话认证配置已变化，请重新确认登录配置")
 	}
 	turn, limited := v.limitedTurn()
 	if !limited {
@@ -307,7 +329,7 @@ func (r Reader) checkResume(ctx context.Context, d resumeDependencies) (ResumeRe
 	}
 	newCredential, err := d.credential()
 	if err != nil || credentialIdentity(newCredential) != p.Identity {
-		return set("credential_error", "凭证或账号已变化，请在 CC Switch 更新后重新开启续跑")
+		return set("credential_error", resumeCredentialMessage(err, "凭证或账号已变化，请更新登录后重新开启续跑"))
 	}
 	if provider, ok := r.managedResumeProvider("desktop"); !ok || provider != expectedProvider {
 		return set("provider_changed", "会话认证配置已变化，本次不发送继续")

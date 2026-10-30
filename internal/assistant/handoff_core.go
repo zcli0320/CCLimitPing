@@ -119,7 +119,7 @@ type HandoffOperations interface {
 }
 
 func (r Reader) handoffPath() string {
-	return filepath.Join(r.Home, "Library/Application Support/CodexHelper/handoff/state.json")
+	return filepath.Join(r.helperStateRoot(), "handoff", "state.json")
 }
 
 func (r Reader) handoffCancelPath() string {
@@ -194,7 +194,7 @@ func (r Reader) ConfigureHandoff(scope, sessionID string, threshold float64, ena
 		// Preserve the journal and require inspection before a fresh handoff.
 		_, txnErr := os.Lstat(r.handoffAuthTransactionPath())
 		_, ccErr := os.Lstat(r.ccSwitchTransactionPath())
-		if os.IsNotExist(txnErr) && os.IsNotExist(ccErr) && s.PendingAction == "" && (s.Stage == "off" || s.Stage == "watching" || s.Stage == "ready_stop" || s.Stage == "completed" || s.Stage == "cancelled") {
+		if os.IsNotExist(txnErr) && os.IsNotExist(ccErr) && !r.nativeAccountPending() && s.PendingAction == "" && (s.Stage == "off" || s.Stage == "watching" || s.Stage == "ready_stop" || s.Stage == "completed" || s.Stage == "cancelled") {
 			s.Stage, s.Message = "off", "自动切号已关闭"
 		} else {
 			s.LastStage = s.Stage
@@ -204,6 +204,9 @@ func (r Reader) ConfigureHandoff(scope, sessionID string, threshold float64, ena
 	}
 	if s.PendingAction != "" || s.Stage == "uncertain" {
 		return s, errors.New("上次交接结果未确认，请先核查")
+	}
+	if r.nativeAccountPending() {
+		return s, errors.New("账号切换有待核查记录，请先在账号管理中核查")
 	}
 	// Never discard the coordinates of an unfinished credential transaction.
 	// Even a completed handoff can have a recovery copy awaiting cleanup.
@@ -460,7 +463,7 @@ func (r Reader) rearmCompletedHandoff(expected HandoffState) (HandoffState, bool
 	}
 	defer unlock()
 	current := r.HandoffStatus()
-	if current != expected || current.Stage != "completed" || current.Enabled || current.AuthorizationID == "" || r.handoffCancelled(current) {
+	if current != expected || current.Stage != "completed" || current.Enabled || current.AuthorizationID == "" || r.handoffCancelled(current) || r.nativeAccountPending() {
 		return current, false, nil
 	}
 	current = HandoffState{Version: 1, Enabled: true, AuthorizationID: current.AuthorizationID, Scope: current.Scope, SessionID: current.SessionID, Threshold: current.Threshold, Stage: "watching", Message: "交接完成，继续监控此会话"}
@@ -507,6 +510,9 @@ func (r Reader) acknowledgeHandoff(ctx context.Context, verify func(context.Cont
 	}
 	defer unlock()
 	s := r.HandoffStatus()
+	if r.nativeAccountPending() {
+		return s, errors.New("账号切换有待核查记录，请先在账号管理中核查")
+	}
 	if _, err := os.Lstat(r.ccSwitchTransactionPath()); err == nil {
 		return r.reviewCCSwitchHandoff(ctx, s, verify)
 	} else if !os.IsNotExist(err) {

@@ -74,8 +74,12 @@ func (r Reader) quotaCredentials(now time.Time) map[string]quotaCredential {
 
 func (r Reader) quotaCredentialsFrom(now time.Time, only string) map[string]quotaCredential {
 	result := map[string]quotaCredential{}
+	bindings, err := r.readNativeBindings()
+	if err != nil || r.nativeAccountPending() {
+		return result
+	}
 	var store managedQuotaStore
-	if readJSON(filepath.Join(r.Home, ".cc-switch", "codex_oauth_auth.json"), &store) != nil || store.Version != 2 {
+	if readJSON(r.managedAccountsStorePath(), &store) != nil || store.Version != 2 {
 		return result
 	}
 	add := func(auth nativeQuotaAuth, label string, fallback bool) {
@@ -88,6 +92,9 @@ func (r Reader) quotaCredentialsFrom(now time.Time, only string) map[string]quot
 			return
 		}
 		for id, account := range store.Accounts {
+			if r.nativeAccountPreview() && !bindings.allowsLiveCredential(id, label) {
+				continue
+			}
 			managed, ok := decodeTokenClaims(account.IdentityToken)
 			if !ok || account.ID != id || account.Workspace != access.Auth.Workspace || managed.Auth != access.Auth {
 				continue
@@ -122,7 +129,7 @@ func (r Reader) quotaCredentialsFrom(now time.Time, only string) map[string]quot
 	}
 	// The CC Switch device-local stash is a snapshot, not its OAuth manager.
 	// Never use it to infer the running identity of a Desktop or CLI session.
-	if only == "" {
+	if only == "" && !r.nativeAccountPreview() {
 		var stash struct {
 			Version int                        `json:"version"`
 			Logins  map[string]nativeQuotaAuth `json:"logins"`
@@ -146,7 +153,7 @@ func (r Reader) ReadAccountQuotas(ctx context.Context, snapshot *Snapshot) {
 func (r Reader) readAccountQuotas(ctx context.Context, snapshot *Snapshot, client *http.Client) {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	credentials := r.quotaCredentials(time.Now())
+	credentials := r.warmupCredentials(ctx, time.Now())
 	var group sync.WaitGroup
 	semaphore := make(chan struct{}, 4)
 	for i := range snapshot.Accounts {
@@ -154,9 +161,18 @@ func (r Reader) readAccountQuotas(ctx context.Context, snapshot *Snapshot, clien
 		go func(index int) {
 			defer group.Done()
 			account := &snapshot.Accounts[index]
+			if account.ExternalOnly {
+				account.Quota = &AccountQuota{Status: "external_only", Message: "账号由 CC Switch 管理；如需在小助手中查询额度或预热，请先在小助手登录。", QueriedAt: time.Now().UTC(), CredentialSources: []string{}, Windows: []QuotaWindow{}}
+				account.QuotaStatus = account.Quota.Status
+				return
+			}
 			credential, ok := credentials[account.ID]
 			if !ok {
-				account.Quota = &AccountQuota{Status: "credential_unavailable", Message: "未找到此账号匹配且有效的访问凭证；请在 CC Switch 更新该账号后重试。", QueriedAt: time.Now().UTC(), CredentialSources: []string{}, Windows: []QuotaWindow{}}
+				message := "未找到此账号匹配且有效的访问凭证；请在 CC Switch 更新该账号后重试。"
+				if r.nativeAccountPreview() {
+					message = "当前未找到该账号可用的端内访问凭证；登录或应用到使用端后再刷新。"
+				}
+				account.Quota = &AccountQuota{Status: "credential_unavailable", Message: message, QueriedAt: time.Now().UTC(), CredentialSources: []string{}, Windows: []QuotaWindow{}}
 			} else {
 				select {
 				case semaphore <- struct{}{}:
@@ -167,13 +183,20 @@ func (r Reader) readAccountQuotas(ctx context.Context, snapshot *Snapshot, clien
 					return
 				}
 				quota := queryAccountQuota(ctx, client, credential)
+				if r.nativeAccountPreview() && quota.Status == "credential_rejected" {
+					quota.Message = "访问凭证被拒绝，请检查该端账号登录。"
+				}
 				account.Quota = &quota
 			}
 			account.QuotaStatus = account.Quota.Status
 		}(i)
 	}
 	group.Wait()
-	snapshot.Capabilities["account_quota"] = Capability{Available: true, Reason: "按 CC Switch 账号身份匹配现有有效凭证，读取官方额度；不复制凭证或轮换刷新令牌。"}
+	reason := "按 CC Switch 账号身份匹配现有有效凭证，读取官方额度；不复制凭证或轮换刷新令牌。"
+	if r.nativeAccountPreview() {
+		reason = "按小助手账号身份匹配现有有效访问凭证；不通过额度查询刷新凭证。"
+	}
+	snapshot.Capabilities["account_quota"] = Capability{Available: true, Reason: reason}
 }
 
 func queryAccountQuota(ctx context.Context, client *http.Client, credential quotaCredential) AccountQuota {

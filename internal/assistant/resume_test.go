@@ -100,6 +100,18 @@ func TestResumeOnlyExplicitLimitAndIdle(t *testing.T) {
 		})
 	}
 }
+
+func TestResumeReportsAccountReapplicationWithoutSubmitting(t *testing.T) {
+	r, f, d := resumeFixture(t)
+	d.credential = func() (quotaCredential, error) {
+		return quotaCredential{}, errNativeReapply
+	}
+	report, err := r.checkResume(context.Background(), d)
+	if err != nil || report.Status != "credential_error" || report.Message != "账号重新登录后，请先重新应用到使用端" || f.calls != 0 {
+		t.Fatal("resume did not report the required account reapplication")
+	}
+}
+
 func TestResumeDurableDedupAndAmbiguousSend(t *testing.T) {
 	for _, ambiguous := range []bool{false, true} {
 		t.Run(map[bool]string{false: "success", true: "ambiguous"}[ambiguous], func(t *testing.T) {

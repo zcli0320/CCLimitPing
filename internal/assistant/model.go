@@ -5,7 +5,7 @@ package assistant
 
 import "time"
 
-const Version = "0.3.8"
+const Version = "0.4.4"
 
 type Capability struct {
 	Available bool   `json:"available"`
@@ -18,6 +18,7 @@ type Account struct {
 	ProviderNames []string      `json:"provider_names"`
 	Selected      bool          `json:"selected"`
 	Default       bool          `json:"default"`
+	ExternalOnly  bool          `json:"external_only,omitempty"`
 	QuotaStatus   string        `json:"quota_status"`
 	Quota         *AccountQuota `json:"quota,omitempty"`
 }
@@ -92,9 +93,9 @@ func capabilities() map[string]Capability {
 	return map[string]Capability{
 		"account_quota":   {Available: true, Reason: "沿用 CC Switch 账号身份，匹配现有有效访问凭证并读取官方额度。"},
 		"account_warmup":  {Available: true, Reason: "独立 app-server 临时会话、每账号调度、请求登记与额度回查；需有效访问凭证。"},
-		"account_switch":  {Available: true, Reason: "为手动指定的会话在停稳并核验后切号；Desktop 通过 CC Switch 原有切换流程。"},
+		"account_switch":  {Available: true, Reason: "选中会话停稳并核验后切号；Desktop 使用该目录所属的账号管理器。"},
 		"cli_handoff":     {Available: true, Reason: "为选中会话启动托管 CLI；真实服务隔离交接已验证，需有效完整凭证。"},
-		"desktop_handoff": {Available: true, Reason: "手动指定一个 Desktop 会话；低额度时暂停，正常退出整个 Desktop，由 CC Switch 切号后恢复原会话。实机交接已通过，触发条件在测试中模拟。"},
+		"desktop_handoff": {Available: true, Reason: "选中 Desktop 会话低额度时暂停，退出后由该目录所属的账号管理器切号，再恢复原会话。"},
 		"desktop_resume":  {Available: true, Reason: "手动绑定本机原会话，限额恢复后继续一次；不切换账号。"},
 	}
 }

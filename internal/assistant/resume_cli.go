@@ -188,7 +188,7 @@ func (r Reader) RunCLIResume(ctx context.Context, id string) error {
 	}
 	_, supported := r.managedResumeProvider("cli")
 	if !supported {
-		return errors.New("CLI 没有使用可确认的 CC Switch / OpenAI 登录配置")
+		return errors.New("CLI 没有使用可确认的 OpenAI 登录配置")
 	}
 	exe := codexExecutable(r.Home)
 	if exe == "" {
@@ -315,7 +315,7 @@ func (r Reader) watchCLIResume(ctx context.Context, exe, socket, id string, env 
 		}
 		provider, supported := r.managedResumeProvider("cli")
 		if !supported {
-			r.cliMessage(id, "provider_changed", "CLI 认证配置已变化，请重新确认 CC Switch 登录配置")
+			r.cliMessage(id, "provider_changed", "CLI 认证配置已变化，请重新确认登录配置")
 			continue
 		}
 		turn, limited, e := cliThread(ctx, socket, id, provider)
@@ -345,7 +345,7 @@ func (r Reader) watchCLIResume(ctx context.Context, exe, socket, id string, env 
 		}
 		c, e := r.scopeCredential("cli", time.Now())
 		if e != nil {
-			r.cliMessage(id, "credential_error", "凭证不可用或已过期，请在 CC Switch 更新该账号")
+			r.cliMessage(id, "credential_error", "凭证不可用或已过期，请更新该账号登录")
 			continue
 		}
 		if credentialIdentity(c) != p.Identity {
@@ -372,7 +372,7 @@ func (r Reader) watchCLIResume(ctx context.Context, exe, socket, id string, env 
 func (r Reader) submitCLIResume(ctx context.Context, id, key, identity string, epoch uint64, terminal io.Writer, input *cliInputState) (bool, error) {
 	c, e := r.scopeCredential("cli", time.Now())
 	if e != nil || credentialIdentity(c) != identity {
-		return false, errors.New("CLI 凭证已变化，请在 CC Switch 更新后重新开启")
+		return false, errors.New("CLI 凭证已变化，请更新登录后重新开启")
 	}
 	lock, e := lockWarmup(r.resumePath() + ".lock")
 	if e != nil {

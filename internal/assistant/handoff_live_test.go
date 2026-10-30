@@ -15,12 +15,14 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
 )
 
 type liveHandoffServer struct {
+	stopOnce      sync.Once
 	cmd           *exec.Cmd
 	in            io.WriteCloser
 	socket        string
@@ -128,18 +130,20 @@ func startLiveHandoffServer(t *testing.T, ctx context.Context, exe, root string,
 	return s
 }
 func (s *liveHandoffServer) stop() {
-	_ = s.in.Close()
-	if s.cmd.Process != nil {
-		_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGTERM)
-	}
-	_ = s.cmd.Wait()
-	_ = os.RemoveAll(s.socketRoot)
+	s.stopOnce.Do(func() {
+		_ = s.in.Close()
+		if s.cmd.Process != nil {
+			_ = syscall.Kill(-s.cmd.Process.Pid, syscall.SIGTERM)
+		}
+		_ = s.cmd.Wait()
+		_ = os.RemoveAll(s.socketRoot)
+	})
 }
 func liveCall(t *testing.T, s *liveHandoffServer, method string, params any) json.RawMessage {
 	t.Helper()
 	b, err := s.rpc.call(method, params)
 	if err != nil {
-		t.Fatalf("%s failed", method)
+		t.Fatalf("%s failed (code=%d, flags=%v)", method, s.errorCode, s.errorFlags)
 	}
 	return b
 }
@@ -159,7 +163,14 @@ func liveWaitTurn(t *testing.T, s *liveHandoffServer, threadID, turnID string) s
 				} `json:"turns"`
 			} `json:"thread"`
 		}
-		data := liveCall(t, s, "thread/read", map[string]any{"threadId": threadID, "includeTurns": true})
+		data, err := s.rpc.call("thread/read", map[string]any{"threadId": threadID, "includeTurns": true})
+		if err != nil {
+			// A newly created non-ephemeral thread may not be visible to
+			// thread/read until its rollout is published; retry within the
+			// existing bounded wait instead of abandoning the fixture.
+			time.Sleep(250 * time.Millisecond)
+			continue
+		}
 		if json.Unmarshal(data, &response) != nil || response.Thread.ID != threadID {
 			t.Fatal("thread/read did not return the test thread")
 		}
@@ -190,6 +201,72 @@ func liveWaitStarted(t *testing.T, s *liveHandoffServer, threadID, turnID string
 	if !s.started[threadID+"\x00"+turnID] {
 		t.Fatal("did not observe the exact turn/started event")
 	}
+}
+
+// This opt-in probe uses only the current account's existing access token in
+// an ephemeral, isolated app-server. It never supplies a refresh token, sends
+// a model request, or writes to either real Codex home.
+func TestLiveIsolatedExistingAccountReadOnly(t *testing.T) {
+	if os.Getenv("CODEX_HELPER_LIVE_ACCOUNT_READ_TEST") != "1" {
+		t.Skip("explicit real-account read-only probe required")
+	}
+	t.Setenv("CODEX_HELPER_NATIVE_PREVIEW", "1")
+	r, err := NewReader()
+	if err != nil {
+		t.Fatal("cannot locate local home")
+	}
+	credentials := r.quotaCredentials(time.Now())
+	if len(credentials) == 0 {
+		t.Skip("no matching existing access token")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	defer cancel()
+	client := &http.Client{Timeout: 10 * time.Second, CheckRedirect: func(_ *http.Request, _ []*http.Request) error { return http.ErrUseLastResponse }}
+	var selected quotaCredential
+	for _, candidate := range credentials {
+		if resumeQuotaReady(queryAccountQuota(ctx, client, candidate)) {
+			selected = candidate
+			break
+		}
+	}
+	if selected.access == "" {
+		t.Skip("no account has an available read-only quota response")
+	}
+	root := t.TempDir()
+	for _, dir := range []string{"codex", "work", "config", "data", "cache"} {
+		if err := os.MkdirAll(filepath.Join(root, dir), 0700); err != nil {
+			t.Fatal("cannot prepare isolated test directory")
+		}
+	}
+	config := "cli_auth_credentials_store = \"ephemeral\"\nweb_search = \"disabled\"\n[analytics]\nenabled = false\n[features]\nhooks = false\napps = false\nmulti_agent = false\n"
+	if err := os.WriteFile(filepath.Join(root, "codex", "config.toml"), []byte(config), 0600); err != nil {
+		t.Fatal("cannot prepare isolated test configuration")
+	}
+	exe := codexExecutable(r.Home)
+	if exe == "" {
+		t.Fatal("local Codex executable unavailable")
+	}
+	server := startLiveHandoffServer(t, ctx, exe, root, selected)
+	defer server.stop()
+	raw := liveCall(t, server, "getAuthStatus", map[string]bool{"includeToken": true, "refreshToken": false})
+	var auth struct {
+		Method string `json:"authMethod"`
+		Token  string `json:"authToken"`
+	}
+	if json.Unmarshal(raw, &auth) != nil {
+		t.Fatal("isolated backend auth response could not be parsed")
+	}
+	claims, claimsOK := decodeTokenClaims(auth.Token)
+	if auth.Method != "chatgptAuthTokens" || !claimsOK || claims.Expires <= time.Now().Add(60*time.Second).Unix() || claims.NotBefore > time.Now().Unix() || auth.Token != selected.access || credentialIdentity(quotaCredential{access: auth.Token}) != credentialIdentity(selected) {
+		t.Fatal("isolated backend identity did not match the selected live account")
+	}
+	if _, err := server.rpc.call("account/rateLimits/read", map[string]any{}); err != nil {
+		t.Fatal("isolated backend quota read failed")
+	}
+	if _, err := os.Stat(filepath.Join(root, "codex", "auth.json")); !os.IsNotExist(err) {
+		t.Fatal("isolated backend wrote an authentication file")
+	}
+	t.Log("existing account identity and quota read verified in an ephemeral backend; no model request or refresh")
 }
 
 func TestLiveIsolatedTwoAccountHandoff(t *testing.T) {

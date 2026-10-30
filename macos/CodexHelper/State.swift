@@ -132,6 +132,7 @@ struct WarmupReport: Decodable {
 }
 
 struct HandoffPreflightReport: Decodable {
+	let scope: String?
     let threshold: Double
     let selected: Bool
     let source_name: String?
@@ -148,6 +149,7 @@ struct HandoffPreflightReport: Decodable {
 
     var summary: String {
         var lines = [message]
+		if scope == "desktop" { lines.append(execution_ready ? "当前检查通过，可以手动开启监控。" : "当前条件尚未满足，暂不能开启 Desktop 监控。") }
         if let name = source_name, let value = source_remaining {
             lines.append("当前目录账号 \(name)：剩余 \(String(format: "%.1f", value))%\(trigger_reached ? "，已低于阈值" : "，未低于阈值")。")
         }

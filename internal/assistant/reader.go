@@ -106,33 +106,62 @@ func (b *limitedBuffer) Write(p []byte) (int, error) {
 
 func (r Reader) Snapshot(ctx context.Context) Snapshot {
 	s := Snapshot{Version: Version, CapturedAt: time.Now().UTC(), Accounts: []Account{}, Sessions: []Session{}, Warnings: []string{}, Capabilities: capabilities()}
-	var settings struct {
-		CodexConfigDir  string `json:"codexConfigDir"`
-		CurrentProvider string `json:"currentProviderCodex"`
+	desktopOwned, ownerErr := r.desktopCCSwitchOwner()
+	if ownerErr != nil {
+		s.Warnings = append(s.Warnings, ownerErr.Error())
 	}
-	ccRoot := filepath.Join(r.Home, ".cc-switch")
-	if err := readJSON(filepath.Join(ccRoot, "settings.json"), &settings); err != nil {
-		s.Warnings = append(s.Warnings, "CC Switch 设置不可读取；账号选择未确认，会话仍按两个独立目录读取。")
-	}
-	s.CodexHome = settings.CodexConfigDir
-	if s.CodexHome == "" {
+	if r.nativeAccountPreview() {
 		s.CodexHome = filepath.Join(r.Home, ".codex")
+		s.Accounts, s.Warnings = r.nativeDisplayAccounts(ctx, s.Warnings)
+		s.Capabilities["account_quota"] = Capability{Available: true, Reason: "使用小助手账号库与现有有效访问凭证读取官方额度。"}
+		s.Capabilities["cli_handoff"] = Capability{Available: true, Reason: "通过本机账号管理器托管选中 CLI 会话；已验证真实 Codex 加本机模拟模型流程，真实账号完整交接待验收。"}
+		if ownerErr != nil {
+			s.Capabilities["account_switch"] = Capability{Available: true, Reason: "Desktop 管理方无法确认，已停止其原生写入；CLI 使用小助手账号管理器。"}
+			s.Capabilities["desktop_handoff"] = Capability{Available: false, Reason: ownerErr.Error()}
+		} else if desktopOwned {
+			s.Capabilities["account_switch"] = Capability{Available: true, Reason: "Desktop 由 CC Switch 管理；CLI 使用小助手账号管理器。"}
+			s.Capabilities["desktop_handoff"] = Capability{Available: true, Reason: "Desktop 由 CC Switch 管理；选中会话需核验运行账号，真实账号完整交接待验收。"}
+			if notice := r.desktopBindingLimitation(); notice != "" {
+				s.Warnings = append(s.Warnings, notice)
+			}
+		} else {
+			s.Capabilities["account_switch"] = Capability{Available: true, Reason: "Desktop 和 CLI 使用小助手账号管理器；CLI 可托管选中会话交接。"}
+			s.Capabilities["desktop_handoff"] = Capability{Available: true, Reason: "Desktop 使用小助手账号管理器；选中会话需核验运行账号，真实账号完整交接待验收。"}
+		}
+	} else {
+		var settings struct {
+			CodexConfigDir  string `json:"codexConfigDir"`
+			CurrentProvider string `json:"currentProviderCodex"`
+		}
+		ccRoot := filepath.Join(r.Home, ".cc-switch")
+		if err := readJSON(filepath.Join(ccRoot, "settings.json"), &settings); err != nil {
+			s.Warnings = append(s.Warnings, "CC Switch 设置不可读取；账号选择未确认，会话仍按两个独立目录读取。")
+		}
+		s.CodexHome = settings.CodexConfigDir
+		if s.CodexHome == "" {
+			s.CodexHome = filepath.Join(r.Home, ".codex")
+		}
+		if s.CodexHome == "~" {
+			s.CodexHome = r.Home
+		} else if strings.HasPrefix(s.CodexHome, "~/") {
+			s.CodexHome = filepath.Join(r.Home, strings.TrimPrefix(s.CodexHome, "~/"))
+		}
+		if !filepath.IsAbs(s.CodexHome) {
+			s.Warnings = append(s.Warnings, "CC Switch 配置目录不是绝对路径；会话仍按两个独立目录读取。")
+			s.CodexHome = ""
+		}
+		s.Accounts, s.Warnings = r.accounts(ctx, ccRoot, settings.CurrentProvider, s.Warnings)
 	}
-	if s.CodexHome == "~" {
-		s.CodexHome = r.Home
-	} else if strings.HasPrefix(s.CodexHome, "~/") {
-		s.CodexHome = filepath.Join(r.Home, strings.TrimPrefix(s.CodexHome, "~/"))
-	}
-	if !filepath.IsAbs(s.CodexHome) {
-		s.Warnings = append(s.Warnings, "CC Switch 配置目录不是绝对路径；会话仍按两个独立目录读取。")
-		s.CodexHome = ""
-	}
-	s.Accounts, s.Warnings = r.accounts(ctx, ccRoot, settings.CurrentProvider, s.Warnings)
 	// The user deliberately split Desktop and CLI. CC Switch's configured
 	// directory remains metadata, and must not redirect both session readers.
 	s.Sources = []SessionSource{
 		{ID: "desktop", Label: "Desktop", Home: filepath.Join(r.Home, ".codex"), Warnings: []string{}},
 		{ID: "cli", Label: "CLI", Home: filepath.Join(r.Home, ".codex-cli"), Warnings: []string{}},
+	}
+	if ownerErr != nil {
+		s.Sources[0].Label = "Desktop（管理方无法确认）"
+	} else if desktopOwned {
+		s.Sources[0].Label = "Desktop（由 CC Switch 管理）"
 	}
 	s.SessionsComplete = true
 	for i := range s.Sources {
@@ -170,7 +199,7 @@ func (r Reader) Snapshot(ctx context.Context) Snapshot {
 	var runner cliRunnerState
 	runnerReady := readJSON(r.cliRunnerPath(), &runner) == nil && runner.Ready && runner.ClientPID > 0 && syscall.Kill(runner.ClientPID, 0) == nil && r.cliManaged(handoff.SessionID)
 	ready := (handoff.Scope == "cli" && runnerReady) || (handoff.Scope == "desktop" && r.desktopRunnerReady(handoff))
-	s.Handoff = &HandoffSummary{Enabled: handoff.Enabled, Scope: handoff.Scope, SessionID: handoff.SessionID, Threshold: handoff.Threshold, Stage: handoff.Stage, Message: handoff.Message, RecoveryPending: recoveryErr == nil || !os.IsNotExist(recoveryErr) || !os.IsNotExist(ccRecoveryErr), RunnerReady: handoff.Enabled && ready}
+	s.Handoff = &HandoffSummary{Enabled: handoff.Enabled, Scope: handoff.Scope, SessionID: handoff.SessionID, Threshold: handoff.Threshold, Stage: handoff.Stage, Message: handoff.Message, RecoveryPending: recoveryErr == nil || !os.IsNotExist(recoveryErr) || !os.IsNotExist(ccRecoveryErr) || r.nativeAccountPending(), RunnerReady: handoff.Enabled && ready}
 	if handoff.Enabled && handoff.Scope == "cli" && !r.cliManaged(handoff.SessionID) {
 		s.Handoff.Enabled = false
 		s.Handoff.Message = "托管终端未运行，自动切号已暂停；请检查原会话状态。"

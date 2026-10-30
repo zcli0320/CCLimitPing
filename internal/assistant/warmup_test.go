@@ -113,7 +113,7 @@ func TestWarmupBothAccountsPersistClaimsAndAvoidDuplicateRequests(t *testing.T) 
 		t.Fatalf("both accounts not warmed independently: %d", calls)
 	}
 	for _, account := range report.Accounts {
-		if account.Status != "confirmed" || account.Attempts != 1 {
+		if account.Status != "confirmed" || account.Attempts != 1 || account.ConfirmedAttempt != 1 {
 			t.Fatalf("unconfirmed warmup: %+v", account)
 		}
 	}
@@ -296,7 +296,7 @@ func TestWarmupResetThenIdleStartsEachAccountExactlyOnce(t *testing.T) {
 		}
 		count++
 		sent[credentialIdentity(c)] = true
-		return WarmupExecution{Submitted: true, Completed: true}, nil
+		return WarmupExecution{Submitted: true, Completed: true, IdentityVerified: true}, nil
 	}}
 	_, err := r.checkWarmup(ctx, "", d)
 	if err != nil {

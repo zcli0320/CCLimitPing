@@ -17,6 +17,10 @@ import (
 )
 
 func main() {
+	if len(os.Args) >= 2 && os.Args[1] == "desktop-runtime" {
+		desktopRuntimeCommand()
+		return
+	}
 	if len(os.Args) >= 2 && os.Args[1] == "handoff" {
 		handoffCommand()
 		return
@@ -218,6 +222,8 @@ func warmupCommand() {
 		report, err = r.ConfigureWarmup(ctx, false)
 	case "check":
 		report, err = r.CheckWarmup(ctx, "")
+	case "refresh":
+		report, err = r.RefreshWarmup(ctx)
 	case "schedule":
 		if len(os.Args) != 6 || (os.Args[3] != "on" && os.Args[3] != "off") {
 			fmt.Fprintln(os.Stderr, "Usage: codex-helper warmup schedule on|off HH:MM HH:MM")
@@ -243,6 +249,29 @@ func warmupCommand() {
 		report.Accounts = []assistant.WarmupAccount{}
 	}
 	if json.NewEncoder(os.Stdout).Encode(report) != nil {
+		os.Exit(1)
+	}
+}
+
+func desktopRuntimeCommand() {
+	if len(os.Args) != 4 || os.Args[2] != "launch" {
+		fmt.Fprintln(os.Stderr, "Usage: codex-helper desktop-runtime launch <session>")
+		os.Exit(2)
+	}
+	r, err := assistant.NewReader()
+	if err == nil {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		err = r.LaunchDesktopWithRuntimeBridge(ctx, os.Args[3])
+	}
+	result := struct {
+		OK      bool   `json:"ok"`
+		Message string `json:"message"`
+	}{OK: err == nil, Message: "已请求打开所选会话；请等待 Desktop 启动后执行只读检查。"}
+	if err != nil {
+		result.Message = err.Error()
+	}
+	if json.NewEncoder(os.Stdout).Encode(result) != nil {
 		os.Exit(1)
 	}
 }

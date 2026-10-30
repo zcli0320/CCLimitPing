@@ -92,6 +92,13 @@ enum Tests {
         {"enabled":false,"authorization_pending":true,"scope":"desktop","session_id":"fixture","threshold":8,"stage":"uncertain","message":"执行器已停止"}
         """.utf8))
         precondition(!deadRunner.enabled && deadRunner.hasAuthorization, "A stopped runner must retain the Stop control until stale authority is revoked")
+        let preflightJSON = """
+        {"scope":"desktop","threshold":10,"selected":true,"trigger_reached":false,"quota_ready":true,"candidate_ready":true,"execution_ready":true,"message":"检查完成","limitations":[]}
+        """
+        let preflight = try JSONDecoder().decode(HandoffPreflightReport.self, from: Data(preflightJSON.utf8))
+        precondition(preflight.summary.contains("可以手动开启监控"), "Verified readiness must be visible to the user")
+        let blocked = try JSONDecoder().decode(HandoffPreflightReport.self, from: Data(preflightJSON.replacingOccurrences(of: "\"execution_ready\":true", with: "\"execution_ready\":false").utf8))
+        precondition(blocked.summary.contains("暂不能开启 Desktop 监控"), "Unverified readiness must remain visibly blocked")
         let started = Date()
         let schedule = WarmupSchedule(enabled: true, start: "22:00", end: "08:00", time_zone: "Asia/Singapore")
         precondition(schedule.caption.contains("次日 08:00"))

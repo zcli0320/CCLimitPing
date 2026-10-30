@@ -55,12 +55,30 @@ func TestDesktopRunnerDoesNotRetryUncertainStop(t *testing.T) {
 
 func TestDesktopActivationRequiresExplicitSelectedSession(t *testing.T) {
 	r := Reader{Home: t.TempDir()}
-	id := "01a17e51-5aa7-7103-a2aa-38bcd905c8dd"
+	id := "00000000-0000-7000-8000-000000000001"
 	if _, err := r.PrepareDesktopHandoff(context.Background(), id, 10); err == nil {
 		t.Fatal("unavailable session was enabled")
 	}
 	if err := r.RunDesktopHandoff(context.Background(), id, 10, "test"); err == nil {
 		t.Fatal("unauthorized runner was started")
+	}
+}
+
+func TestDesktopActivationRequiresRuntimeProofAndLoadedSession(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		preflight DesktopHandoffPreflight
+		wantReady bool
+	}{
+		{"missing runtime proof", DesktopHandoffPreflight{Ready: true}, false},
+		{"unready session", DesktopHandoffPreflight{RuntimeIdentityVerified: true}, false},
+		{"ready", DesktopHandoffPreflight{Ready: true, RuntimeIdentityVerified: true}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := requireReadyDesktopPreflight(tc.preflight) == nil; got != tc.wantReady {
+				t.Fatalf("ready=%v; want %v", got, tc.wantReady)
+			}
+		})
 	}
 }
 
