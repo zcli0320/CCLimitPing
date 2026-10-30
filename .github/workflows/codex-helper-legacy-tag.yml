@@ -1,0 +1,18 @@
+name: Create archival Codex Helper tag
+on:
+  push:
+    branches:
+      - codex/legacy-tag-fix
+permissions:
+  contents: write
+jobs:
+  tag:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Tag the 0.3.8 baseline
+        run: |
+          git tag codex-helper-0.3.8-source b7682a08a33b1b7fb1da56dde6684c455505aa0e
+          git push origin refs/tags/codex-helper-0.3.8-source
