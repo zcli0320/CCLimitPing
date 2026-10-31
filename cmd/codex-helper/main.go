@@ -21,6 +21,10 @@ func main() {
 		desktopRuntimeCommand()
 		return
 	}
+	if len(os.Args) >= 2 && os.Args[1] == "orchestra" {
+		orchestraCommand()
+		return
+	}
 	if len(os.Args) >= 2 && os.Args[1] == "handoff" {
 		handoffCommand()
 		return

@@ -24,7 +24,7 @@ cp bin/codex-helper "$app_dir/Contents/MacOS/codex-helper"
 cp bin/codex-runtime-bridge "$app_dir/Contents/MacOS/codex-runtime-bridge"
 cp native-accounts/target/release/codex-helper-accounts "$app_dir/Contents/MacOS/codex-accounts"
 cp native-accounts/CC-SWITCH-LICENSE "$app_dir/Contents/Resources/CC-SWITCH-LICENSE"
-swiftc -O macos/CodexHelper/State.swift macos/CodexHelper/Bridge.swift macos/CodexHelper/Theme.swift macos/CodexHelper/QuotaCard.swift macos/CodexHelper/CCSwitchControl.swift macos/CodexHelper/NativeAccounts.swift macos/CodexHelper/main.swift -o "$app_dir/Contents/MacOS/CodexHelper" -framework Cocoa -framework ServiceManagement
+swiftc -O macos/CodexHelper/State.swift macos/CodexHelper/Bridge.swift macos/CodexHelper/Theme.swift macos/CodexHelper/QuotaCard.swift macos/CodexHelper/CCSwitchControl.swift macos/CodexHelper/NativeAccounts.swift macos/CodexHelper/Orchestra.swift macos/CodexHelper/main.swift -o "$app_dir/Contents/MacOS/CodexHelper" -framework Cocoa -framework ServiceManagement
 cat > "$app_dir/Contents/Info.plist" <<'PLIST'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -36,7 +36,7 @@ cat > "$app_dir/Contents/Info.plist" <<'PLIST'
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleIconFile</key><string>CodexHelper.icns</string>
 <key>CFBundleShortVersionString</key><string>0.4.4</string>
-<key>CFBundleVersion</key><string>23</string>
+<key>CFBundleVersion</key><string>28</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>LSMinimumSystemVersion</key><string>12.0</string>
 </dict></plist>

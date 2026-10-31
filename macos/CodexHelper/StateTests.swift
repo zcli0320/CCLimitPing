@@ -93,10 +93,12 @@ enum Tests {
         """.utf8))
         precondition(!deadRunner.enabled && deadRunner.hasAuthorization, "A stopped runner must retain the Stop control until stale authority is revoked")
         let preflightJSON = """
-        {"scope":"desktop","threshold":10,"selected":true,"trigger_reached":false,"quota_ready":true,"candidate_ready":true,"execution_ready":true,"message":"检查完成","limitations":[]}
+        {"scope":"desktop","threshold":10,"selected":true,"source_name":"当前账号","source_remaining":20,"target_name":"备用账号","target_remaining":90,"trigger_reached":false,"quota_ready":true,"candidate_ready":true,"candidate_source":"CC Switch","execution_ready":true,"message":"检查完成","limitations":[]}
         """
         let preflight = try JSONDecoder().decode(HandoffPreflightReport.self, from: Data(preflightJSON.utf8))
-        precondition(preflight.summary.contains("可以手动开启监控"), "Verified readiness must be visible to the user")
+        precondition(preflight.summary.contains("可以开启监控"), "Verified readiness must be visible to the user")
+        precondition(preflight.summary.split(separator: "\n").count == 1, "The handoff summary should state the decision without dumping diagnostics")
+        precondition(preflight.details.contains("检查完成") && preflight.details.contains("当前目录账号") && preflight.details.contains("完整凭证候选"), "Full preflight evidence should remain available in details")
         let blocked = try JSONDecoder().decode(HandoffPreflightReport.self, from: Data(preflightJSON.replacingOccurrences(of: "\"execution_ready\":true", with: "\"execution_ready\":false").utf8))
         precondition(blocked.summary.contains("暂不能开启 Desktop 监控"), "Unverified readiness must remain visibly blocked")
         let started = Date()
@@ -106,7 +108,16 @@ enum Tests {
         {"enabled":true,"message":"时段外等待","accounts":[],"available":true,"schedule":{"enabled":true,"start":"22:00","end":"08:00","time_zone":"Asia/Singapore"},"schedule_allowed":false,"next_opening":"2026-10-26T22:00:00+08:00"}
         """
         let waiting = try JSONDecoder().decode(WarmupReport.self, from: Data(scheduleJSON.utf8))
-        precondition(waiting.summary.contains("22:00") && waiting.summary.contains("时段外等待"))
+        precondition(waiting.summary.contains("22:00") && waiting.headline.contains("当前时段外"))
+        let runningJSON = """
+        {"enabled":true,"message":"自动预热已开启","accounts":[{"key":"a","name":"a***@example.com","status":"confirmed","message":"本次独立预热已完成，额度窗口仍在运行","last_attempt":"2026-10-31T14:27:00+08:00","next_check":"2026-10-31T14:32:00+08:00","window_reset":1793446041,"attempts":1,"execution":{"submitted":true,"completed":true,"identity_verified":true}}],"available":true,"schedule":{"enabled":true,"start":"00:00","end":"23:00","time_zone":"Asia/Singapore"},"schedule_allowed":true}
+        """
+        let running = try JSONDecoder().decode(WarmupReport.self, from: Data(runningJSON.utf8))
+        precondition(running.summary.contains("后台运行中") && running.summary.contains("本轮预热已完成"), "Enabled warmup must distinguish an active scheduler from a completed request")
+        precondition(running.summary.contains("窗口重置 19:27") && running.summary.contains("下次评估 14:32") && running.summary.contains("不会重复发送"), "Warmup status should show timing and why no new request is sent")
+        let probe = try JSONDecoder().decode(WarmupReport.self, from: Data(runningJSON.replacingOccurrences(of: "\"status\":\"confirmed\"", with: "\"status\":\"probe_verified\"").utf8))
+        precondition(!probe.headline.contains("本轮预热已完成"), "A manually verified probe must not be presented as an automatic warmup cycle")
+        precondition(waiting.footerSummary.contains("等待首次检查"), "An enabled scheduler with no accounts must not claim that accounts are being monitored")
         do {
             _ = try BridgeClient.read(executable: URL(fileURLWithPath: "/bin/sleep"), arguments: ["5"], timeout: 0.1)
             preconditionFailure("Hung bridge was not timed out")

@@ -25,6 +25,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
     let fixture: URL?
     let status = NSTextField(wrappingLabelWithString: "正在读取小助手账号与会话记录…")
     var accountCenter: AccountCenterController?
+    var orchestraCenter: OrchestraWindowController?
     var accountClient: AccountCenterClient?
     let accountStack = NSStackView()
     let accountActionNotice = NSTextField(wrappingLabelWithString: "")
@@ -65,7 +66,9 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
     var observationMessage = ""
     var warmup: NSButton!
     var handoff: NSButton!
-    let warmupCheck = NSButton(title: "检查一次", target: nil, action: nil)
+    let warmupCheck = NSButton(title: "刷新状态", target: nil, action: nil)
+    let warmupStateIcon = NSImageView()
+    let warmupHeadline = NSTextField(labelWithString: "正在读取预热状态…")
     let warmupStatus = NSTextField(wrappingLabelWithString: "自动预热未开启")
     let scheduleLabel = NSTextField(labelWithString: "时段：全天允许 · UTC+8")
     let scheduleButton = NSButton(title: "自定义时段", target: nil, action: nil)
@@ -91,11 +94,16 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
     var runtimeLaunching = false
     let handoffPreflight = NSButton(title: "检查所选会话", target: nil, action: nil)
     let handoffStatus = NSTextField(wrappingLabelWithString: "选择会话后可以检查当前交接条件。")
+    let handoffDetailsToggle = NSButton(title: "查看核验详情", target: nil, action: nil)
+    let handoffDetails = NSTextField(wrappingLabelWithString: "")
+    var handoffPreflightReport: HandoffPreflightReport?
+    var handoffDetailsExpanded = false
     let handoffStart = NSButton(title: "托管并开启切号", target: nil, action: nil)
     let handoffStop = NSButton(title: "停止切号", target: nil, action: nil)
     let handoffAcknowledge = NSButton(title: "已检查，解除暂停", target: nil, action: nil)
     let cliHandoffAvailable = true
     let handoffRunStatus = NSTextField(wrappingLabelWithString: "")
+    let handoffRisk = NSTextField(wrappingLabelWithString: "")
     var handoffChecking = false
     var handoffCheckedKey: String?
     var handoffReport: HandoffReport?
@@ -226,7 +234,8 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         openSwitch.image = NSImage(systemSymbolName: "person.crop.circle.badge.plus", accessibilityDescription: nil)
         openSwitch.imagePosition = .imageLeading
         refresh.target = self; refresh.action = #selector(refreshNow); refresh.bezelStyle = .rounded
-        let header = Theme.hstack([icon, heading, Theme.flexible(), openSwitch, refresh], spacing: 12)
+        let collaboration = Theme.button(NSButton(title: "协作", target: self, action: #selector(openOrchestra)))
+        let header = Theme.hstack([icon, heading, Theme.flexible(), collaboration, openSwitch, refresh], spacing: 12)
         add(header, to: stack); gap(after: header)
 
         // Accounts, per-client state, and explicit manual switching.
@@ -251,9 +260,19 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         warmupCheck.target = self; warmupCheck.action = #selector(checkWarmupNow)
         Theme.button(warmupCheck, small: true)
         warmupCheck.isEnabled = false
+        warmupCheck.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)
+        warmupCheck.imagePosition = .imageLeading
+        warmupCheck.toolTip = "只重新查询额度和预热状态，不会发送预热请求。"
         warmupBox.add(Theme.hstack([warmup, Theme.flexible(), warmupCheck]))
+        warmupStateIcon.image = NSImage(systemSymbolName: "clock", accessibilityDescription: "预热状态")
+        warmupStateIcon.contentTintColor = .secondaryLabelColor
+        warmupStateIcon.setContentHuggingPriority(.required, for: .horizontal)
+        warmupHeadline.font = .systemFont(ofSize: 12, weight: .semibold)
+        warmupHeadline.maximumNumberOfLines = 2
+        warmupBox.add(Theme.hstack([warmupStateIcon, warmupHeadline], spacing: 7))
         warmupStatus.font = .systemFont(ofSize: 11); warmupStatus.textColor = .secondaryLabelColor
-        warmupStatus.maximumNumberOfLines = 3
+        warmupStatus.maximumNumberOfLines = 0
+        warmupStatus.setAccessibilityLabel("自动预热账号状态与下次评估时间")
         warmupBox.add(warmupStatus)
         warmupBox.addDivider()
         scheduleLabel.font = .systemFont(ofSize: 12); scheduleLabel.textColor = .labelColor
@@ -339,13 +358,29 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         handoffAcknowledge.target = self; handoffAcknowledge.action = #selector(acknowledgeHandoff); Theme.button(handoffAcknowledge)
         handoffBox.add(Theme.hstack([label("五小时剩余额度低于", size: 12, color: .labelColor), handoffThreshold, label("% 时切换", size: 12, color: .labelColor), Theme.flexible(), handoffPreflight], spacing: 6))
         handoffStatus.font = .systemFont(ofSize: 11); handoffStatus.textColor = .secondaryLabelColor
+        handoffStatus.maximumNumberOfLines = 2
         handoffBox.add(handoffStatus)
+        handoffDetailsToggle.target = self; handoffDetailsToggle.action = #selector(toggleHandoffDetails)
+        Theme.button(handoffDetailsToggle, small: true)
+        handoffDetailsToggle.image = NSImage(systemSymbolName: "chevron.right", accessibilityDescription: nil)
+        handoffDetailsToggle.imagePosition = .imageLeading
+        handoffDetailsToggle.isHidden = true
+        handoffBox.add(handoffDetailsToggle)
+        handoffDetails.font = .systemFont(ofSize: 11); handoffDetails.textColor = .secondaryLabelColor
+        handoffDetails.maximumNumberOfLines = 0
+        handoffDetails.isHidden = true
+        handoffBox.add(handoffDetails)
         handoffBox.addDivider()
         runtimeLaunch.target = self; runtimeLaunch.action = #selector(openDesktopWithRuntimeBridge); Theme.button(runtimeLaunch)
         runtimeLaunch.toolTip = "请先正常退出 Desktop；打开后可独立核对运行账号。"
         handoffBox.add(Theme.hstack([handoffStart, handoffStop, handoffAcknowledge, Theme.flexible(), runtimeLaunch]))
         handoffRunStatus.font = .systemFont(ofSize: 11); handoffRunStatus.textColor = .secondaryLabelColor
         handoffBox.add(handoffRunStatus)
+        handoffRisk.font = .systemFont(ofSize: 11); handoffRisk.textColor = .systemOrange
+        handoffRisk.maximumNumberOfLines = 2
+        handoffRisk.stringValue = "Desktop 切号触发时会退出整个 Desktop，其他会话及未提交输入可能受影响。"
+        handoffRisk.isHidden = true
+        handoffBox.add(handoffRisk)
         add(handoffBox, to: stack); gap(after: handoffBox)
 
         // Footer.
@@ -395,6 +430,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { !backgroundEnabled }
     func applicationWillTerminate(_ notification: Notification) {
+        orchestraCenter?.stopRunnerForTermination()
         shuttingDown = true; timer?.invalidate(); accountMetadataTimer?.invalidate()
         if let process = warmupProcess, process.isRunning { process.terminate() }
         if let process = resumeProcess, process.isRunning { process.terminate() }
@@ -552,6 +588,12 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         }
     }
 
+    @objc func openOrchestra() {
+        if orchestraCenter == nil {
+            orchestraCenter = OrchestraWindowController(executable: Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/codex-helper"))
+        }
+        orchestraCenter?.showWindow(nil)
+    }
     @objc func openNativeAccountCenter() {
         guard fixture == nil else { return }
         let executable = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/codex-accounts")
@@ -704,7 +746,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         warmup.toolTip = snapshot.capabilities["account_warmup"]?.reason
         handoff.toolTip = snapshot.capabilities["desktop_handoff"]?.reason
         applyFilter(preserveScroll: preserveScroll)
-        feedback.stringValue = warnings.isEmpty ? (backgroundEnabled ? "自动任务开启 · 关闭窗口后继续运行" : "自动任务关闭 · 关闭窗口即退出") : "\(warnings.count) 条读取提示，可在「接入说明」中查看。"
+        feedback.stringValue = warnings.isEmpty ? backgroundStatusCaption() : "\(warnings.count) 条读取提示，可在「接入说明」中查看。"
         layoutDocument()
     }
 
@@ -725,16 +767,25 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
 
     func updateWarmupUI() {
         let enabled = warmupReport?.enabled == true
+        let report = warmupReport
+        let headline = report?.headline ?? "正在读取预热状态…"
+        let allWindowsVerified = report.map { $0.enabled && $0.schedule_allowed != false && !$0.accounts.isEmpty && $0.accounts.allSatisfy { ["confirmed", "probe_verified", "window_running"].contains($0.status) } } ?? false
+        let needsAttention = report?.accounts.contains { ["quota_unavailable", "credential_unavailable", "weekly_exhausted", "account_limited", "activity_unknown", "setup_failed", "window_unknown"].contains($0.status) } == true
+        warmupHeadline.stringValue = headline
+        warmupStateIcon.image = NSImage(systemSymbolName: !enabled ? "pause.circle" : (needsAttention ? "exclamationmark.triangle.fill" : (allWindowsVerified ? "checkmark.circle.fill" : (report?.schedule_allowed == false ? "clock" : "arrow.triangle.2.circlepath"))), accessibilityDescription: headline)
+        let stateColor: NSColor = !enabled ? .secondaryLabelColor : ((needsAttention || report?.schedule_allowed == false) ? .systemOrange : (allWindowsVerified ? .systemGreen : .systemBlue))
+        warmupStateIcon.contentTintColor = stateColor
+        warmupHeadline.textColor = stateColor
+        warmupStatus.stringValue = report?.details ?? "正在读取自动预热策略与账号状态。"
         warmup.state = enabled ? .on : .off
         warmup.isEnabled = !warmupControlBusy && (enabled || warmupReport?.available == true) && fixture == nil
         warmupCheck.isEnabled = enabled && !warmupChecking && !warmupControlBusy && fixture == nil
-        warmupCheck.title = warmupChecking ? "检查中…" : "检查一次"
+        warmupCheck.title = warmupChecking ? "刷新中…" : "刷新状态"
         scheduleLabel.stringValue = "时段：" + (warmupReport?.schedule?.caption ?? "全天允许 · UTC+8")
         scheduleLabel.toolTip = scheduleLabel.stringValue
         scheduleButton.isEnabled = !warmupControlBusy && fixture == nil
-        warmupStatus.stringValue = (warmupReport?.summary ?? "预热状态不可用") + (enabled ? "\n每分钟检查 · 关闭窗口后继续运行" : "\n开启后会消耗少量额度，仅在需要时发出请求。")
-        warmupStatus.toolTip = warmupReport?.summary
-        if !warmupControlBusy { feedback.stringValue = backgroundEnabled ? "自动任务开启 · 关闭窗口后继续运行" : "自动任务关闭 · 关闭窗口即退出" }
+        warmupStatus.toolTip = report?.summary
+        if !warmupControlBusy { feedback.stringValue = backgroundStatusCaption() }
         if backgroundEnabled && warmupMenuItem == nil {
             let item = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
             item.button?.image = NSImage(systemSymbolName: "sun.max", accessibilityDescription: "Codex 小助手后台运行")
@@ -753,6 +804,15 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         resumeStopItem?.isEnabled = resumeReport?.enabled == true && !resumeBusy
         handoffStopItem?.isEnabled = (handoffReport?.hasAuthorization == true || handoffPendingKey != nil) && !handoffBusy
         layoutDocument()
+    }
+
+    func backgroundStatusCaption() -> String {
+        var active: [String] = []
+        if warmupReport?.enabled == true { active.append(warmupReport?.footerSummary ?? "预热后台运行") }
+        if resumeReport?.enabled == true { active.append("会话续跑监控") }
+        if handoffReport?.hasAuthorization == true || handoffPendingKey != nil { active.append("自动切号监控") }
+        guard !active.isEmpty else { return "没有后台自动任务 · 关闭窗口后退出小助手" }
+        return active.joined(separator: " · ") + " · 关闭窗口后继续；退出小助手会停止检查。"
     }
 
     func scheduleTime(_ picker: NSDatePicker) -> String {
@@ -1167,6 +1227,9 @@ extension Assistant {
         handoffPreflight.isEnabled = !runtimeLaunching && !handoffChecking && fixture == nil && selected?.archived == false && snapshot?.complete(in: state.activeScope) == true
         if handoffCheckedKey != nil && handoffCheckedKey != state.selectedKey {
             handoffCheckedKey = nil
+            handoffPreflightReport = nil; handoffDetailsExpanded = false
+            handoffDetailsToggle.isHidden = true; handoffDetails.isHidden = true
+            handoffDetailsToggle.title = "查看核验详情"
             handoffStatus.stringValue = "选择会话后可以检查当前交接条件。"
         }
     }
@@ -1191,6 +1254,8 @@ extension Assistant {
         guard let threshold = Double(handoffThreshold.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)), threshold.isFinite, threshold > 0, threshold < 100 else {
             handoffStatus.stringValue = "请输入大于 0、小于 100 的剩余额度阈值。"; return
         }
+        handoffPreflightReport = nil; handoffDetailsExpanded = false
+        handoffDetailsToggle.isHidden = true; handoffDetails.isHidden = true
         handoffChecking = true; handoffCheckedKey = target.key; updateResumeUI()
         handoffStatus.stringValue = "正在只读检查账号、额度及会话…"
         let bridge = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/codex-helper")
@@ -1200,11 +1265,26 @@ extension Assistant {
                 guard let self = self else { return }
                 self.handoffChecking = false
                 if self.state.selectedKey == target.key {
-                    self.handoffStatus.stringValue = report?.summary ?? "检查未完成；自动切号仍不可用。"
+                    if let report = report {
+                        self.handoffPreflightReport = report
+                        self.handoffStatus.stringValue = report.summary
+                        self.handoffDetails.stringValue = report.details
+                        self.handoffDetailsToggle.isHidden = false
+                    } else {
+                        self.handoffStatus.stringValue = "检查未完成；自动切号仍不可用。"
+                    }
                 }
                 self.updateResumeUI(); self.layoutDocument()
             }
         }
+    }
+    @objc func toggleHandoffDetails() {
+        guard handoffPreflightReport != nil else { return }
+        handoffDetailsExpanded.toggle()
+        handoffDetails.isHidden = !handoffDetailsExpanded
+        handoffDetailsToggle.title = handoffDetailsExpanded ? "收起核验详情" : "查看核验详情"
+        handoffDetailsToggle.image = NSImage(systemSymbolName: handoffDetailsExpanded ? "chevron.down" : "chevron.right", accessibilityDescription: nil)
+        layoutDocument()
     }
     func updateHandoffUI() {
         let matches = handoffReport?.hasAuthorization == true && handoffReport?.scope == state.activeScope && handoffReport?.session_id == selected?.id
@@ -1222,11 +1302,12 @@ extension Assistant {
         handoffStop.isEnabled = !handoffBusy
         handoffAcknowledge.isEnabled = !handoffBusy && fixture == nil
         handoffThreshold.isEnabled = !active && !handoffBusy
+        handoffRisk.isHidden = state.activeScope != "desktop"
         if handoffPendingKey != nil { handoffRunStatus.stringValue = state.activeScope == "desktop" ? "正在启动 Desktop 会话监控。" : "正在打开托管终端；请在该终端使用所选会话。" }
         else if matches { handoffRunStatus.stringValue = handoffReport?.message ?? "正在监控所选会话。" }
         else if needsReview || handoffReport?.stage == "error" { handoffRunStatus.stringValue = handoffReport?.recovery_pending == true ? (handoffReport?.scope == "desktop" ? "请停止交接并核查 Desktop 会话与账号，再确认保留当前认证。" : "请关闭托管终端并核查账号。确认后可保留当前认证并解除暂停。") : (handoffReport?.message ?? "请检查原会话状态。") }
         else if let failure = handoffStartFailure, failure.key == state.selectedKey { handoffRunStatus.stringValue = "上次开启失败：" + failure.message }
-        else if state.activeScope == "desktop" { handoffRunStatus.stringValue = available ? "仅监控选中会话；触发时会退出整个 Desktop，其他会话和未提交输入可能受影响。" : (snapshot?.capabilities["desktop_handoff"]?.reason ?? "Desktop 切号状态读取中。") }
+        else if state.activeScope == "desktop" { handoffRunStatus.stringValue = available ? "仅监控选中会话；当前未触发切号。" : (snapshot?.capabilities["desktop_handoff"]?.reason ?? "Desktop 切号状态读取中。") }
         else if resumeReport?.enabled == true { handoffRunStatus.stringValue = "请先关闭“不切号续跑”，再开启托管切号。" }
         else if !cliHandoffAvailable { handoffRunStatus.stringValue = "CLI 切号的真实服务验收尚未通过，暂不可开启。可先检查账号和额度。" }
         else { handoffRunStatus.stringValue = "先退出其他终端中的同一会话，再托管并开启切号。" }

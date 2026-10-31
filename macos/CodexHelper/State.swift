@@ -95,8 +95,75 @@ struct WarmupAccount: Decodable {
     let message: String
     let last_attempt: String?
     let next_check: String?
+    let window_reset: Int64?
     let attempts: Int
     let execution: WarmupExecution?
+
+    var statusTitle: String {
+        switch status {
+        case "confirmed": return "已完成"
+        case "probe_verified": return "测试完成"
+        case "window_running": return "窗口运行中"
+        case "window_uncertain", "window_check_pending", "verification_pending": return "等待核验"
+        case "confirming_idle": return "确认账号空闲"
+        case "awaiting_reset": return "等待额度重置"
+        case "account_busy": return "账号活动中"
+        case "activity_unknown": return "活动状态未知"
+        case "quota_unavailable": return "额度暂不可读"
+        case "credential_unavailable": return "凭证不可用"
+        case "weekly_exhausted": return "周额度耗尽"
+        case "account_limited": return "账号受限"
+        case "window_unknown": return "窗口信息不足"
+        case "setup_failed": return "启动失败"
+        default: return message
+        }
+    }
+
+    var timingCaption: String {
+        var values: [String] = []
+        if let window_reset = window_reset, window_reset > 0 {
+            values.append("窗口重置 \(warmupClock(Date(timeIntervalSince1970: Double(window_reset))))")
+        }
+        if let next_check = warmupDate(next_check) {
+            values.append("下次评估 \(warmupClock(next_check))")
+        }
+        if let last_attempt = warmupDate(last_attempt) {
+            values.append("最近请求 \(warmupClock(last_attempt))")
+        }
+        return values.joined(separator: " · ")
+    }
+
+    var reasonCaption: String {
+        switch status {
+        case "confirmed": return "请求已完成并核验；窗口运行期间不会重复发送。"
+        case "probe_verified": return "测试请求已完成并核验；自动调度仍按窗口状态判断。"
+        case "window_running": return "窗口已运行；等待窗口结束后再评估是否需要请求。"
+        case "window_uncertain", "window_check_pending", "verification_pending": return message
+        case "confirming_idle": return "正在复查窗口状态，避免重复发送。"
+        case "awaiting_reset": return message
+        default: return message
+        }
+    }
+
+    var dashboardLine: String {
+        let timing = timingCaption
+        return "\(name)  ·  \(statusTitle)" + (timing.isEmpty ? "" : "  ·  \(timing)") + "\n  \(reasonCaption)"
+    }
+}
+
+private func warmupDate(_ value: String?) -> Date? {
+    guard let value = value else { return nil }
+    let parser = ISO8601DateFormatter()
+    parser.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return parser.date(from: value) ?? ISO8601DateFormatter().date(from: value)
+}
+
+private func warmupClock(_ date: Date) -> String {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone(identifier: "Asia/Singapore")
+    formatter.dateFormat = "HH:mm"
+    return formatter.string(from: date)
 }
 struct WarmupSchedule: Decodable {
     let enabled: Bool
@@ -117,17 +184,39 @@ struct WarmupReport: Decodable {
     let schedule_allowed: Bool?
     let next_opening: String?
     let error: String?
-    var summary: String {
-        if !enabled { return message }
-        if schedule_allowed == false {
-            guard let next = next_opening else { return message }
-            let parser = ISO8601DateFormatter(); parser.formatOptions = [.withInternetDateTime,.withFractionalSeconds]
-            guard let date = parser.date(from: next) ?? ISO8601DateFormatter().date(from: next) else { return message }
-            let formatter = DateFormatter(); formatter.timeZone = TimeZone(identifier: "Asia/Singapore"); formatter.dateFormat = "MM/dd HH:mm"
-            return "\(message)；下次允许时间 \(formatter.string(from: date))（UTC+8）。"
+    var headline: String {
+        guard enabled else { return "自动预热已关闭" }
+        if schedule_allowed == false { return "后台已开启 · 当前时段外" }
+        guard available else { return "后台已开启 · 预热程序不可用" }
+        guard !accounts.isEmpty else { return "后台运行中 · 等待首次检查" }
+        if accounts.allSatisfy({ $0.status == "confirmed" }) { return "后台运行中 · 本轮预热已完成" }
+        if accounts.allSatisfy({ ["confirmed", "probe_verified", "window_running"].contains($0.status) }) {
+            return "后台运行中 · 窗口已开启，等待结束后评估"
         }
-        if accounts.isEmpty { return "已开启，等待首次检查；仅预热启用时已有账号。" }
-        return accounts.map { "\($0.name)：\($0.message)" }.joined(separator: "\n")
+        let blocked = accounts.filter { ["quota_unavailable", "credential_unavailable", "weekly_exhausted", "account_limited", "activity_unknown", "setup_failed", "window_unknown"].contains($0.status) }.count
+        if blocked > 0 { return "后台运行中 · \(blocked) 个账号需要关注" }
+        return "后台运行中 · 正在评估账号条件"
+    }
+
+    var details: String {
+        guard enabled else { return "开启后会按时段、额度窗口和账号活动判断是否需要发送预热请求。" }
+        if schedule_allowed == false {
+            guard let date = warmupDate(next_opening) else { return "当前不在允许预热时段；到达设定时段后重新评估。" }
+            return "当前不在允许预热时段；下次开放 \(warmupClock(date))（UTC+8）。"
+        }
+        if accounts.isEmpty { return "已开启，等待首次检查；仅已启用预热的账号会参与。" }
+        return accounts.map(\.dashboardLine).joined(separator: "\n")
+    }
+
+    var summary: String { ([headline] + [details]).joined(separator: "\n") }
+
+    var footerSummary: String {
+        guard !accounts.isEmpty else { return "预热后台运行 · 等待首次检查" }
+        let completed = accounts.filter { ["confirmed", "probe_verified", "window_running"].contains($0.status) }.count
+        if completed == accounts.count {
+            return "预热后台运行 · \(completed) 个账号窗口已核验"
+        }
+        return "预热后台运行 · \(accounts.count) 个账号监控中"
     }
 }
 
@@ -148,6 +237,15 @@ struct HandoffPreflightReport: Decodable {
     let limitations: [String]
 
     var summary: String {
+        if scope == "desktop" {
+            if !execution_ready { return "条件未满足，暂不能开启 Desktop 监控。" }
+            return trigger_reached ? "检查通过，已达到阈值，可以开启监控。" : "检查通过，可以开启监控；当前额度未达到触发阈值。"
+        }
+        if !execution_ready { return "检查未通过，暂不能开启自动切号。" }
+        return trigger_reached ? "检查通过，已达到阈值，可以开启自动切号。" : "检查通过，可以开启自动切号；当前额度未达到触发阈值。"
+    }
+
+    var details: String {
         var lines = [message]
 		if scope == "desktop" { lines.append(execution_ready ? "当前检查通过，可以手动开启监控。" : "当前条件尚未满足，暂不能开启 Desktop 监控。") }
         if let name = source_name, let value = source_remaining {
