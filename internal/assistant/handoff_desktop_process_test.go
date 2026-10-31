@@ -91,6 +91,19 @@ func TestReadDesktopProcessesKeepsNonASCIICommandPaths(t *testing.T) {
 	t.Fatal("started process missing from the process list")
 }
 
+func TestDesktopProcessLocaleUsesPlatformUTF8(t *testing.T) {
+	for _, tc := range []struct{ platform, want string }{{"darwin", "UTF-8"}, {"linux", "C.UTF-8"}} {
+		env := desktopProcessListEnvironmentForPlatform([]string{"LC_ALL=zh_CN.UTF-8", "LANG=zh_CN.UTF-8", "LC_TIME=zh_CN.UTF-8", "LC_CTYPE=zh_CN.UTF-8", "PATH=/bin"}, tc.platform)
+		got := strings.Join(env, "\n")
+		if !strings.Contains(got, "LC_CTYPE="+tc.want+"\n") && !strings.HasSuffix(got, "LC_CTYPE="+tc.want) {
+			t.Fatalf("%s: UTF-8 locale missing: %v", tc.platform, env)
+		}
+		if !strings.Contains(got, "LC_TIME=C") || strings.Contains(got, "LC_ALL=") || !strings.Contains(got, "PATH=/bin") {
+			t.Fatalf("%s: incompatible environment: %v", tc.platform, env)
+		}
+	}
+}
+
 func TestDesktopEnvironmentRequiresExpectedRoot(t *testing.T) {
 	for _, tc := range []struct {
 		env  string

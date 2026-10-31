@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 )
@@ -186,6 +187,10 @@ func readDesktopProcesses(ctx context.Context) ([]desktopProcessIdentity, error)
 // time is pinned to C. LC_ALL=C would also make ps escape non-ASCII bytes in
 // commands (M-e...), which hides a bridge installed under a Chinese app name.
 func desktopProcessListEnvironment(env []string) []string {
+	return desktopProcessListEnvironmentForPlatform(env, runtime.GOOS)
+}
+
+func desktopProcessListEnvironmentForPlatform(env []string, platform string) []string {
 	var out []string
 	for _, value := range env {
 		key, _, _ := strings.Cut(value, "=")
@@ -193,7 +198,12 @@ func desktopProcessListEnvironment(env []string) []string {
 			out = append(out, value)
 		}
 	}
-	return append(out, "LC_TIME=C", "LC_CTYPE=UTF-8")
+	// Darwin provides UTF-8; glibc-based Linux uses C.UTF-8 instead.
+	ctype := "UTF-8"
+	if platform == "linux" {
+		ctype = "C.UTF-8"
+	}
+	return append(out, "LC_TIME=C", "LC_CTYPE="+ctype)
 }
 
 func desktopServerUsesHome(ctx context.Context, p desktopProcessIdentity, home string) bool {
