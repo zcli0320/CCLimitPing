@@ -314,3 +314,21 @@ func (c *nativeManagerClient) apply(ctx context.Context, account, scope string) 
 	}
 	return nil
 }
+
+// orchestraDesktopStopped invokes the account manager's existing process
+// guard. The CC Switch route allows its own writer but not any Codex client.
+func (c *nativeManagerClient) orchestraDesktopStopped(ctx context.Context, route string) error {
+	if route != "native" && route != "ccswitch" {
+		return errors.New("账号管理归属不可确认")
+	}
+	var result struct {
+		Stopped bool `json:"stopped"`
+	}
+	if err := c.call(ctx, "handoff_orchestra_desktop_stopped", map[string]string{"route": route}, &result); err != nil {
+		return err
+	}
+	if !result.Stopped {
+		return errors.New("Desktop 状态不可确认")
+	}
+	return nil
+}

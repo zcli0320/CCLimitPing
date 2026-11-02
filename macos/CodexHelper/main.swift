@@ -1267,6 +1267,10 @@ extension Assistant {
                 if self.state.selectedKey == target.key {
                     if let report = report {
                         self.handoffPreflightReport = report
+                        if report.execution_ready && self.handoffStartFailure?.key == target.key {
+                            self.handoffStartFailure = nil
+                            self.updateHandoffUI()
+                        }
                         self.handoffStatus.stringValue = report.summary
                         self.handoffDetails.stringValue = report.details
                         self.handoffDetailsToggle.isHidden = false

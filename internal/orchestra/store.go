@@ -17,48 +17,86 @@ import (
 type Status string
 
 const (
-	Queued    Status = "queued"
-	Running   Status = "running"
-	Receipt   Status = "receipt"   // executor answered; waiting for the lead
-	Failed    Status = "failed"    // executor ended without an answer
-	Cancelled Status = "cancelled" // stopped by the lead or the user
-	Accepted  Status = "accepted"  // lead accepted the receipt
+	Queued         Status = "queued"
+	Running        Status = "running"
+	Reviewing      Status = "reviewing" // receipt is with the project's reviewer
+	Receipt        Status = "receipt"   // executor answered; waiting for the lead
+	Failed         Status = "failed"    // executor ended without an answer
+	QuotaExhausted Status = "quota_exhausted"
+	Cancelled      Status = "cancelled" // stopped by the lead or the user
+	Accepted       Status = "accepted"  // lead accepted the receipt
 )
 
 // Run is one executor process for a task (the first run or a rework).
 type Run struct {
-	Kind    string    `json:"kind"` // task | rework
-	Started time.Time `json:"started"`
-	Ended   time.Time `json:"ended,omitempty"`
-	Exit    int       `json:"exit"`
-	PID     int       `json:"pid,omitempty"`    // 0 while starting
-	Marker  string    `json:"marker,omitempty"` // identifies this run between the claim and launch steps
-	Log     string    `json:"log"`
-	Receipt string    `json:"receipt,omitempty"`
-	Error   string    `json:"error,omitempty"`
+	Kind        string          `json:"kind"` // task | rework
+	Started     time.Time       `json:"started"`
+	Ended       time.Time       `json:"ended,omitempty"`
+	Exit        int             `json:"exit"`
+	PID         int             `json:"pid,omitempty"`    // 0 while starting
+	Marker      string          `json:"marker,omitempty"` // identifies this run between the claim and launch steps
+	Log         string          `json:"log"`
+	Receipt     string          `json:"receipt,omitempty"`
+	Error       string          `json:"error,omitempty"`
+	Phase       string          `json:"phase,omitempty"`
+	Checks      []CheckResult   `json:"checks,omitempty"`
+	Changes     *ChangeEvidence `json:"changes,omitempty"`
+	Changed     []string        `json:"changed,omitempty"`
+	OutOfScope  []string        `json:"out_of_scope,omitempty"`
+	HeadChanged bool            `json:"head_changed,omitempty"`
+}
+
+type CheckResult struct {
+	Command  string  `json:"command"`
+	Status   string  `json:"status"`
+	Exit     int     `json:"exit"`
+	Duration float64 `json:"duration_seconds"`
+	TimedOut bool    `json:"timed_out,omitempty"`
+	Log      string  `json:"log,omitempty"`
+	Tail     string  `json:"tail,omitempty"`
+}
+type ChangeEvidence struct {
+	Status      string   `json:"status"`
+	Reason      string   `json:"reason,omitempty"`
+	Changed     []string `json:"changed,omitempty"`
+	OutOfScope  []string `json:"out_of_scope,omitempty"`
+	HeadChanged bool     `json:"head_changed,omitempty"`
 }
 
 // Task is one card from a lead to an executor.
 type Task struct {
-	ID              string    `json:"id"`
-	Lead            string    `json:"lead"`
-	Executor        string    `json:"executor"`
-	Folder          string    `json:"folder"`
-	FolderDev       uint64    `json:"folder_dev,omitempty"` // identity of Folder at dispatch
-	FolderIno       uint64    `json:"folder_ino,omitempty"`
-	Card            string    `json:"card"`
-	Status          Status    `json:"status"`
-	Session         string    `json:"session,omitempty"` // executor's own session id, for reworks
-	Rework          string    `json:"rework,omitempty"`  // queued rework text
-	CancelRequested bool      `json:"cancel_requested,omitempty"`
-	Unconfirmed     bool      `json:"unconfirmed,omitempty"` // a crashed run's executor may still be alive
-	Created         time.Time `json:"created"`
-	Updated         time.Time `json:"updated"`
-	Runs            []Run     `json:"runs,omitempty"`
+	ID                string    `json:"id"`
+	Project           string    `json:"project,omitempty"`
+	Lead              string    `json:"lead"`
+	Executor          string    `json:"executor"`
+	Folder            string    `json:"folder"`
+	FolderDev         uint64    `json:"folder_dev,omitempty"` // identity of Folder at dispatch
+	FolderIno         uint64    `json:"folder_ino,omitempty"`
+	Card              string    `json:"card"`
+	Status            Status    `json:"status"`
+	Session           string    `json:"session,omitempty"` // executor's own session id, for reworks
+	Rework            string    `json:"rework,omitempty"`  // queued rework text
+	CancelRequested   bool      `json:"cancel_requested,omitempty"`
+	Unconfirmed       bool      `json:"unconfirmed,omitempty"` // a crashed run's executor may still be alive
+	Created           time.Time `json:"created"`
+	Updated           time.Time `json:"updated"`
+	Runs              []Run     `json:"runs,omitempty"`
+	Checks            []string  `json:"checks,omitempty"`
+	Scope             []string  `json:"scope,omitempty"`
+	AutoReworkCount   int       `json:"auto_rework_count,omitempty"`
+	AutoReworkPending bool      `json:"auto_rework_pending,omitempty"`
+	ReviewOf          string    `json:"review_of,omitempty"`      // on a review task: the task it reviews
+	ReviewTask        string    `json:"review_task,omitempty"`    // on a reviewed task: current review task id
+	ReviewVerdict     string    `json:"review_verdict,omitempty"` // pass | changes | unavailable
+	ReviewText        string    `json:"review_text,omitempty"`    // reviewer's receipt
+	ReviewedRuns      int       `json:"reviewed_runs,omitempty"`  // len(Runs) at the last review dispatch
 }
 
 // Done reports whether the task waits for nothing from the executor.
-func (t *Task) Done() bool { return t.Status != Queued && t.Status != Running }
+// A receipt the project reviewer has yet to see is waited on with needsLead.
+func (t *Task) Done() bool {
+	return t.Status != Queued && t.Status != Running && t.Status != Reviewing
+}
 
 // LastReceipt is the newest executor answer, if any.
 func (t *Task) LastReceipt() string {
@@ -173,8 +211,28 @@ func (s Store) Update(id string, fn func(*Task) error) (*Task, error) {
 	return t, s.write(t)
 }
 
+// reviewParentActive is called under the store lock when claiming or launching
+// a task. An orphan review must never start after its parent has moved on.
+func (s Store) reviewParentActive(t *Task) bool {
+	if t.ReviewOf == "" {
+		return true
+	}
+	parent, err := s.read(t.ReviewOf)
+	return err == nil && parent.Status == Reviewing && parent.ReviewTask == t.ID
+}
+
 // Dispatch queues a new card for an executor.
 func (s Store) Dispatch(cfg Config, lead, executor, folder, id, card string) (*Task, error) {
+	return s.DispatchWithEvidence(cfg, lead, executor, folder, id, card, nil, nil)
+}
+func (s Store) DispatchWithEvidence(cfg Config, lead, executor, folder, id, card string, checks, scope []string) (*Task, error) {
+	return s.dispatch(cfg, lead, "", executor, folder, id, card, checks, scope, "")
+}
+
+func (s Store) dispatch(cfg Config, lead, project, executor, folder, id, card string, checks, scope []string, reviewOf string) (*Task, error) {
+	if err := validateEvidence(checks, scope); err != nil {
+		return nil, err
+	}
 	if !taskID.MatchString(id) {
 		return nil, fmt.Errorf("任务编号无效：%q（字母数字开头，最多 64 个字符）", id)
 	}
@@ -201,15 +259,38 @@ func (s Store) Dispatch(cfg Config, lead, executor, folder, id, card string) (*T
 		return nil, fmt.Errorf("无法读取工作目录：%v", err)
 	}
 	now := time.Now()
-	t := &Task{ID: id, Lead: lead, Executor: executor, Folder: dir, FolderDev: dev, FolderIno: ino,
-		Card: card, Status: Queued, Created: now}
+	t := &Task{ID: id, Project: project, Lead: lead, Executor: executor, Folder: dir, FolderDev: dev, FolderIno: ino,
+		Card: card, Status: Queued, Created: now, Checks: checks, Scope: scope, ReviewOf: reviewOf}
 	return t, s.write(t)
+}
+
+func validateEvidence(checks, scope []string) error {
+	if len(checks) > 10 {
+		return errors.New("检查命令不能超过 10 条")
+	}
+	for _, c := range checks {
+		if strings.TrimSpace(c) == "" || len([]rune(c)) > 500 || strings.ContainsRune(c, 0) {
+			return errors.New("检查命令无效")
+		}
+	}
+	for _, p := range scope {
+		if p == "" || filepath.IsAbs(p) || strings.ContainsRune(p, 0) || strings.Contains(p, "\\") {
+			return errors.New("允许改动范围无效")
+		}
+		for _, part := range strings.Split(p, "/") {
+			if part == ".." {
+				return errors.New("允许改动范围不能包含 ..")
+			}
+		}
+	}
+	return nil
 }
 
 // RequestRework queues a follow-up in the same executor session.
 func (s Store) RequestRework(id, text string) (*Task, error) {
-	return s.Update(id, func(t *Task) error {
-		if t.Status != Receipt && t.Status != Failed {
+	wasLimited := false
+	task, err := s.Update(id, func(t *Task) error {
+		if t.Status != Receipt && t.Status != Failed && t.Status != QuotaExhausted {
 			return fmt.Errorf("任务 %s 当前为 %s，只有已回执或失败的任务可以返工", id, t.Status)
 		}
 		if t.Unconfirmed {
@@ -218,9 +299,47 @@ func (s Store) RequestRework(id, text string) (*Task, error) {
 		if strings.TrimSpace(text) == "" {
 			return errors.New("返工说明为空")
 		}
+		wasLimited = t.Status == QuotaExhausted
 		t.Rework, t.Status, t.CancelRequested = text, Queued, false
 		return nil
 	})
+	if err == nil && wasLimited {
+		err = s.clearSeparatePause()
+	}
+	return task, err
+}
+
+// Resume continues the same quota-interrupted session.
+func (s Store) Resume(id string) (*Task, error) {
+	task, err := s.Update(id, func(t *Task) error {
+		if t.Status != QuotaExhausted || t.Session == "" || t.Unconfirmed {
+			return errors.New("任务没有可继续的已停止会话")
+		}
+		t.Rework, t.Status, t.CancelRequested = "Continue where you stopped.", Queued, false
+		return nil
+	})
+	if err == nil {
+		err = s.clearSeparatePause()
+	}
+	return task, err
+}
+
+func (s Store) clearSeparatePause() error {
+	settings, err := ReadSettings(s.Dir)
+	if err != nil {
+		return err
+	}
+	if settings.Account != "separate" {
+		return nil
+	}
+	status, err := ReadRunnerStatus(s.Dir)
+	if err != nil {
+		return err
+	}
+	if status.Account == "独立账号" && status.Paused {
+		return writeJSON(s.Dir, "runner-status.json", RunnerStatus{Account: "独立账号", Reason: "独立账号：开始前不检查额度", CheckedAt: time.Now().UTC()})
+	}
+	return nil
 }
 
 // ConfirmStopped records the user's check that a crashed run's executor is gone.
@@ -236,36 +355,55 @@ func (s Store) ConfirmStopped(id string) (*Task, error) {
 
 // Cancel stops a queued task at once, or asks the runner to stop a running one.
 func (s Store) Cancel(id string) (*Task, error) {
-	return s.Update(id, func(t *Task) error {
+	var child string
+	t, err := s.Update(id, func(t *Task) error {
 		switch t.Status {
 		case Queued:
 			t.Status = Cancelled
 		case Running:
 			t.CancelRequested = true
+		case Reviewing:
+			t.Status = Cancelled
+			child = t.ReviewTask
 		default:
 			return fmt.Errorf("任务 %s 已结束（%s），无需停止", id, t.Status)
 		}
 		return nil
 	})
+	if err == nil && child != "" {
+		_, _ = s.Cancel(child)
+	}
+	return t, err
 }
 
 // Accept closes a task the lead is satisfied with.
 func (s Store) Accept(id string) (*Task, error) {
-	return s.Update(id, func(t *Task) error {
-		if t.Status != Receipt && t.Status != Failed {
+	var child string
+	t, err := s.Update(id, func(t *Task) error {
+		if t.Status != Receipt && t.Status != Failed && t.Status != Reviewing {
 			return fmt.Errorf("任务 %s 当前为 %s，还不能验收", id, t.Status)
+		}
+		if t.Status == Reviewing {
+			child = t.ReviewTask
 		}
 		t.Status = Accepted
 		return nil
 	})
+	if err == nil && child != "" {
+		_, _ = s.Cancel(child)
+	}
+	return t, err
 }
+
+// needsLead reports whether the lead has to act: done, and not waiting for a review.
+func (s Store) needsLead(t *Task) bool { return t.Done() && s.pendingReview(t) == "" }
 
 // Wait blocks until the task needs the lead again, or the timeout passes.
 func (s Store) Wait(id string, timeout, poll time.Duration) (*Task, error) {
 	deadline := time.Now().Add(timeout)
 	for {
 		t, err := s.Get(id)
-		if err != nil || t.Done() || time.Now().After(deadline) {
+		if err != nil || s.needsLead(t) || time.Now().After(deadline) {
 			return t, err
 		}
 		time.Sleep(poll)

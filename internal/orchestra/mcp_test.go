@@ -88,7 +88,7 @@ func TestMCPProtocolAndTools(t *testing.T) {
 		t.Fatalf("notification got a reply: %v", r)
 	}
 	tools := r["result"].(map[string]any)["tools"].([]any)
-	if len(tools) != 9 {
+	if len(tools) != 14 {
 		t.Fatalf("tools=%v", tools)
 	}
 	seen := map[string]bool{}
@@ -99,7 +99,7 @@ func TestMCPProtocolAndTools(t *testing.T) {
 			t.Fatal(tool)
 		}
 	}
-	for _, name := range []string{"list_agents", "runner_status", "dispatch_task", "get_task", "list_tasks", "wait_task", "rework_task", "cancel_task", "accept_task"} {
+	for _, name := range []string{"list_agents", "runner_status", "dispatch_task", "get_task", "list_tasks", "wait_task", "rework_task", "cancel_task", "accept_task", "list_projects", "get_project", "create_project"} {
 		if !seen[name] {
 			t.Fatal(name)
 		}
@@ -113,6 +113,38 @@ func TestMCPProtocolAndTools(t *testing.T) {
 	r = f.receive(t)
 	if r["error"].(map[string]any)["code"] != float64(-32700) {
 		t.Fatal(r)
+	}
+}
+
+func TestMCPDispatchEvidenceValidationAndGet(t *testing.T) {
+	e := setup(t)
+	bad, _ := json.Marshal(map[string]any{"executor": "codex", "folder": e.folder, "id": "X1", "card": "test", "checks": []string{"ok"}, "scope": []string{"../escape"}})
+	if _, err := callMCPTool(context.Background(), e.cfg, e.store, "lead", "dispatch_task", bad); err == nil {
+		t.Fatal("unsafe scope accepted")
+	}
+	tooLong, _ := json.Marshal(map[string]any{"executor": "codex", "folder": e.folder, "id": "X1", "card": "test", "checks": []string{strings.Repeat("x", 501)}})
+	if _, err := callMCPTool(context.Background(), e.cfg, e.store, "lead", "dispatch_task", tooLong); err == nil {
+		t.Fatal("oversized check accepted")
+	}
+	good, _ := json.Marshal(map[string]any{"executor": "codex", "folder": e.folder, "id": "X1", "card": "test", "checks": []string{"true"}, "scope": []string{"src/"}})
+	if _, err := callMCPTool(context.Background(), e.cfg, e.store, "lead", "dispatch_task", good); err != nil {
+		t.Fatal(err)
+	}
+	_, err := e.store.Update("X1", func(t *Task) error {
+		t.Status = Receipt
+		t.Runs = []Run{{Checks: []CheckResult{{Command: "true", Status: "passed"}}, Changes: &ChangeEvidence{Status: "available", Changed: []string{"src/a"}}}}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := callMCPTool(context.Background(), e.cfg, e.store, "lead", "get_task", json.RawMessage(`{"id":"X1"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := got.(taskView)
+	if v.Evidence == nil || !strings.Contains(v.Evidence.Summary, "1/1") || len(v.Evidence.Changes.Changed) != 1 {
+		t.Fatalf("%+v", v)
 	}
 }
 func TestMCPTaskLifecycleAndErrors(t *testing.T) {
@@ -204,5 +236,64 @@ func TestMCPWaitDoesNotBlockOtherCallsAndCanBeCancelled(t *testing.T) {
 	f.send(t, `{"jsonrpc":"2.0","id":12,"method":"ping"}`)
 	if m := f.receive(t); m["id"] != float64(12) {
 		t.Fatalf("cancelled wait_task must not answer; got reply for %v", m["id"])
+	}
+}
+
+func TestMCPProjectsAndTaskFilter(t *testing.T) {
+	e := setup(t)
+	f := startMCP(t, e)
+	r := mcpCall(t, f, 1, "create_project", map[string]any{
+		"id": "P1", "name": "Project One", "folder": e.folder, "executor": "codex",
+		"checks": []string{"true"}, "scope": []string{"src/"},
+	})
+	v, bad := resultText(t, r)
+	if bad || v["id"] != "P1" || v["lead"] != "claude" {
+		t.Fatalf("create_project: %v", r)
+	}
+	r = mcpCall(t, f, 2, "get_project", map[string]any{"id": "P1"})
+	v, bad = resultText(t, r)
+	if bad || v["name"] != "Project One" {
+		t.Fatalf("get_project: %v", r)
+	}
+
+	// dispatch_task missing executor/folder without project fails.
+	r = mcpCall(t, f, 3, "dispatch_task", map[string]any{"id": "T0", "card": "TASK T0"})
+	_, bad = resultText(t, r)
+	if !bad {
+		t.Fatalf("expected missing executor/folder error: %v", r)
+	}
+
+	// dispatch_task with project only succeeds.
+	r = mcpCall(t, f, 4, "dispatch_task", map[string]any{"id": "T1", "project": "P1", "card": "TASK T1"})
+	v, bad = resultText(t, r)
+	if bad || v["project"] != "P1" || v["executor"] != "codex" || v["folder"] != realFolder(t, e.folder) {
+		t.Fatalf("dispatch with project: %v", r)
+	}
+	r = mcpCall(t, f, 5, "dispatch_task", map[string]any{"id": "T2", "executor": "codex", "folder": e.folder, "card": "TASK T2"})
+	if _, bad = resultText(t, r); bad {
+		t.Fatalf("dispatch without project: %v", r)
+	}
+
+	// list_tasks with project filter.
+	raw, err := callMCPTool(context.Background(), e.cfg, e.store, "claude", "list_tasks", json.RawMessage(`{"project":"P1"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tasks := raw.([]taskView)
+	if len(tasks) != 1 || tasks[0].ID != "T1" || tasks[0].Project != "P1" {
+		t.Fatalf("list_tasks filter: %+v", tasks)
+	}
+
+	// list_projects excludes archived by default.
+	if _, err := e.store.ArchiveProject("P1"); err != nil {
+		t.Fatal(err)
+	}
+	raw, err = callMCPTool(context.Background(), e.cfg, e.store, "claude", "list_projects", json.RawMessage(`{}`))
+	if err != nil || len(raw.([]*Project)) != 0 {
+		t.Fatalf("list_projects active: %v %v", raw, err)
+	}
+	raw, err = callMCPTool(context.Background(), e.cfg, e.store, "claude", "list_projects", json.RawMessage(`{"include_archived":true}`))
+	if err != nil || len(raw.([]*Project)) != 1 {
+		t.Fatalf("list_projects all: %v %v", raw, err)
 	}
 }

@@ -2,19 +2,26 @@ package orchestra
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/wavever/CCLimitPing/internal/assistant"
 )
 
 // Config is where tasks live and what executors may touch.
 type Config struct {
-	Dir          string           // state root (tasks, logs, runner lock)
+	Dir          string // state root (tasks, logs, runner lock)
+	Home         string
+	Quota        func(context.Context) (float64, bool)
+	Switch       func(context.Context, string, float64, func(string) error, func() bool) assistant.OrchestraSwitchResult
 	Agents       map[string]Agent // executors by name
 	AllowedRoots []string         // task folders must be inside one of these
 	Timeout      time.Duration    // one executor run at most this long
@@ -22,7 +29,7 @@ type Config struct {
 
 // DefaultConfig keeps state under root and allows folders in the home folder.
 func DefaultConfig(home, root string) Config {
-	return Config{Dir: root, Agents: DefaultAgents(home), AllowedRoots: []string{home}, Timeout: 3 * time.Hour}
+	return Config{Dir: root, Home: home, Agents: DefaultAgents(home), AllowedRoots: []string{home}, Timeout: 3 * time.Hour}
 }
 
 func (c Config) allowedFolder(folder string) (string, error) {
@@ -91,20 +98,22 @@ started by Codex Helper. No human is watching this run and you cannot ask questi
   says the user approved it; report it as blocked instead.
 - Report what actually happened. Never mark a check passed that you didn't run.
 Your final message is delivered to the lead as your receipt, in exactly this format:
-RECEIPT <id>: done | partial | blocked
-Changed: <files, or "none">
-Ran: <each command and its actual result; paste the key output lines>
-Evidence: <log paths, test output>
-Not done / doubts: <what's missing, what you're unsure of>
+RECEIPT <id>: <done|blocked>
+Changed: <files>
+Verified: <commands and results>
+Doubts: <remaining issues>
 `
 
 // Runner starts queued tasks, at most one per executor at a time.
 type Runner struct {
-	Cfg   Config
-	Store Store
-	Poll  time.Duration
-	Logf  func(format string, args ...any)
-	path  string // the user's login-shell PATH, so executors find Homebrew tools
+	Cfg             Config
+	Store           Store
+	Poll            time.Duration
+	Logf            func(format string, args ...any)
+	path            string // the user's login-shell PATH, so executors find Homebrew tools
+	quotaStatus     RunnerStatus
+	quotaSettings   Settings
+	lastSwitchCheck time.Time
 }
 
 // LoginPathMaxAge is how long a cached login-shell PATH is reused.
@@ -152,15 +161,27 @@ func readLoginPath() string {
 }
 
 type active struct {
-	id    string
-	cmd   *exec.Cmd
-	done  chan error
-	start time.Time
-	files runFiles
-	agent Agent
-	term  time.Time // when SIGTERM was sent
-	why   string    // why it was stopped
-	tree  []int     // executor's descendants seen when stopping (they may sit in other groups)
+	id           string
+	cmd          *exec.Cmd
+	done         chan error
+	start        time.Time
+	files        runFiles
+	agent        Agent
+	term         time.Time // when SIGTERM was sent
+	why          string    // why it was stopped
+	tree         []int     // executor's descendants seen when stopping (they may sit in other groups)
+	phase        string
+	baseline     gitSnapshot
+	folder       string
+	env          []string
+	checks       []string
+	checkIndex   int
+	checkTimeout time.Duration
+	checkLog     string
+	profile      string
+	sandboxBin   string
+	probeDir     string
+	checkStarted time.Time
 }
 
 type runFiles struct{ out, err, last string }
@@ -205,6 +226,18 @@ func (r *Runner) Run(ctx context.Context) error {
 	if err := syscall.Flock(int(lockFile.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		return ErrRunnerBusy
 	}
+	if status, e := ReadSwitchStatus(r.Cfg.Dir); e == nil && (status.Stage == "pending" || status.Stage == "resuming") {
+		status.Stage, status.ReviewRequired = "uncertain", true
+		if err := writeJSON(r.Cfg.Dir, "auto-switch.json", status); err != nil {
+			return err
+		}
+	}
+	// A restart must not bypass a recent persisted pause or hammer quota reads.
+	if status, e := ReadRunnerStatus(r.Cfg.Dir); e == nil && status.Paused && !status.CheckedAt.IsZero() {
+		if settings, e := ReadSettings(r.Cfg.Dir); e == nil && ((settings.Account == "desktop" && status.Account == "Desktop") || (settings.Account == "separate" && status.Account == "独立账号")) {
+			r.quotaStatus, r.quotaSettings = status, settings
+		}
+	}
 	r.recoverStale()
 	if r.path == "" {
 		r.path = LoginPath(r.Cfg.Dir, true)
@@ -226,7 +259,11 @@ func (r *Runner) Run(ctx context.Context) error {
 					<-a.done
 				}
 				a.reap()
-				r.finish(a, "执行器已关闭，任务被中断")
+				if a.phase == "probe" || a.phase == "check" {
+					r.finishChecksInterrupted(a, "执行器已关闭，任务被中断")
+				} else {
+					r.finish(a, "执行器已关闭，任务被中断")
+				}
 			}
 			return nil
 		default:
@@ -272,8 +309,19 @@ func (r *Runner) tick(running map[string]*active) {
 		select {
 		case <-a.done:
 			a.reap()
-			r.finish(a, a.why)
-			delete(running, name)
+			if a.phase == "probe" || a.phase == "check" {
+				if r.advanceChecks(a) {
+					delete(running, name)
+				}
+			} else {
+				started, handled := r.beginChecks(a)
+				if !handled {
+					r.finish(a, a.why)
+				}
+				if !started {
+					delete(running, name)
+				}
+			}
 			continue
 		default:
 		}
@@ -281,15 +329,30 @@ func (r *Runner) tick(running map[string]*active) {
 		switch {
 		case err == nil && t.CancelRequested && a.term.IsZero():
 			r.stop(a, "已按请求停止")
-		case r.Cfg.Timeout > 0 && time.Since(a.start) > r.Cfg.Timeout && a.term.IsZero():
+		case err == nil && a.term.IsZero() && !r.Store.reviewParentActive(t):
+			// The parent moved on but its cancel of this review was lost (the
+			// accepting process died between the two writes); stop it next tick.
+			_, _ = r.Store.Cancel(a.id)
+		case (a.phase == "probe" || a.phase == "check") && time.Since(a.checkStarted) > a.checkTimeout && a.term.IsZero():
+			r.stop(a, "检查超时")
+		case a.phase == "" && r.Cfg.Timeout > 0 && time.Since(a.start) > r.Cfg.Timeout && a.term.IsZero():
 			r.stop(a, fmt.Sprintf("超过 %s 未结束，已停止", r.Cfg.Timeout))
 		case !a.term.IsZero() && time.Since(a.term) > 10*time.Second:
 			a.kill()
 		}
 	}
 	tasks, _ := r.Store.List()
+	r.reviewTick(tasks)
+	tasks, _ = r.Store.List()
+	if running["codex"] == nil && r.quotaStatus.Paused && !r.quotaAllowed() {
+		r.maybeAutoSwitch(tasks)
+	}
 	for _, t := range tasks {
 		if t.Status != Queued || running[t.Executor] != nil {
+			continue
+		}
+		if t.Executor == "codex" && r.Cfg.Home != "" && !r.quotaAllowed() {
+			r.maybeAutoSwitch(tasks)
 			continue
 		}
 		if a := r.start(t); a != nil {
@@ -320,8 +383,21 @@ func (r *Runner) start(snap *Task) *active {
 		if t.Status != Queued || t.CancelRequested {
 			return errNotQueued
 		}
+		if !r.Store.reviewParentActive(t) {
+			t.Status = Cancelled
+			return nil
+		}
 		a, ok := r.Cfg.Agents[t.Executor]
 		agent = a
+		if ok && t.Executor == "codex" && r.Cfg.Home != "" {
+			settings, e := ReadSettings(r.Cfg.Dir)
+			if e != nil || settings != r.quotaSettings {
+				return errNotQueued
+			}
+			if settings.Account == "separate" {
+				agent.Env = append(agent.Env, "CODEX_HOME="+filepath.Join(r.Cfg.Home, ".codex-runner"))
+			}
+		}
 		n := len(t.Runs) + 1
 		base := filepath.Join(r.Cfg.Dir, "logs", fmt.Sprintf("%s-%d", t.ID, n))
 		files = runFiles{out: base + ".out.jsonl", err: base + ".err.txt", last: base + ".last.txt"}
@@ -329,6 +405,9 @@ func (r *Runner) start(snap *Task) *active {
 		kind, prompt, session := "task", Preamble+"\n--- card ---\n"+t.Card+"\n", ""
 		if t.Rework != "" {
 			kind = "rework"
+			if t.AutoReworkPending {
+				kind = "auto_rework"
+			}
 			if t.Session != "" {
 				session = t.Session
 				prompt = t.Rework + "\n\nFix only what this rework names, then end with a new receipt in the same RECEIPT format."
@@ -336,6 +415,7 @@ func (r *Runner) start(snap *Task) *active {
 				prompt += "\n--- rework of the card above ---\n" + t.Rework + "\n"
 			}
 		}
+		prompt += "\nEnd with RECEIPT <id>: <done|blocked> / Changed: / Verified: (commands and results) / Doubts:.\n"
 		var dir string
 		err := error(nil)
 		if !ok {
@@ -346,6 +426,7 @@ func (r *Runner) start(snap *Task) *active {
 		now := time.Now()
 		run := Run{Kind: kind, Started: now, Log: files.out, Marker: marker}
 		t.Rework = ""
+		t.AutoReworkPending = false
 		if err != nil {
 			run.Ended, run.Exit, run.Error = now, -1, "无法启动："+err.Error()
 			t.Runs, t.Status = append(t.Runs, run), Failed
@@ -371,13 +452,17 @@ func (r *Runner) start(snap *Task) *active {
 			return errNotQueued
 		}
 		run := &t.Runs[n]
-		if t.CancelRequested {
+		if t.CancelRequested || !r.Store.reviewParentActive(t) {
 			run.Ended, run.Exit, run.Error = time.Now(), -1, "启动前已按请求取消"
 			t.Status, t.CancelRequested = Cancelled, false
 			return nil
 		}
 		if testHookBeforeLaunch != nil {
 			testHookBeforeLaunch(t.ID)
+		}
+		baseline := gitSnapshot{}
+		if len(t.Checks) > 0 || len(t.Scope) > 0 {
+			baseline = snapshotGit(inv.Dir)
 		}
 		cmd, err := launch(inv, files)
 		if err != nil {
@@ -387,7 +472,7 @@ func (r *Runner) start(snap *Task) *active {
 			return nil
 		}
 		run.PID = cmd.Process.Pid
-		a = &active{id: t.ID, cmd: cmd, done: make(chan error, 1), start: run.Started, files: files, agent: agent}
+		a = &active{id: t.ID, cmd: cmd, done: make(chan error, 1), start: run.Started, files: files, agent: agent, baseline: baseline, folder: inv.Dir, env: inv.Env, checks: append([]string(nil), t.Checks...)}
 		return nil
 	})
 	if a == nil {
@@ -493,16 +578,36 @@ func descendants(pid int) []int {
 func (r *Runner) finish(a *active, why string) {
 	exit := a.cmd.ProcessState.ExitCode()
 	session, final, perr := a.agent.result(a.files.out, a.files.last)
+	limited := why == "" && a.agent.Name == "codex" && (final == "" || exit != 0) && usageLimit(a.files.out, a.files.err)
+	var changes *ChangeEvidence
+	if a.baseline.status != "" {
+		if t, e := r.Store.Get(a.id); e == nil {
+			changes = changesSince(a.folder, a.baseline, t.Scope)
+		}
+	}
+	if limited {
+		account := "Desktop"
+		if r.quotaSettings.Account == "separate" {
+			account = "独立账号"
+		}
+		r.quotaStatus = RunnerStatus{Paused: true, Reason: "Codex 使用额度已耗尽", Account: account, CheckedAt: time.Now().UTC()}
+		if err := writeJSON(r.Cfg.Dir, "runner-status.json", r.quotaStatus); err != nil {
+			r.Logf("无法保存暂停状态：%v", err)
+		}
+	}
 	r.Store.Update(a.id, func(t *Task) error {
 		n := len(t.Runs) - 1
 		if n < 0 {
 			return nil
 		}
 		run := &t.Runs[n]
+		assignChanges(run, changes)
 		run.Ended, run.Exit = time.Now(), exit
 		if session != "" {
 			t.Session = session
 		}
+		// A run that finished with an answer is a receipt even if a log line
+		// mentions a usage limit; only an unfinished run counts as exhausted.
 		switch {
 		case why != "":
 			run.Error = why
@@ -511,6 +616,8 @@ func (r *Runner) finish(a *active, why string) {
 			} else {
 				t.Status = Failed
 			}
+		case limited:
+			run.Error, t.Status = "Codex 使用额度已耗尽，等待额度恢复后继续", QuotaExhausted
 		case final != "":
 			run.Receipt, t.Status = final, Receipt
 		default:
@@ -529,10 +636,101 @@ func (r *Runner) finish(a *active, why string) {
 	r.Logf("%s 已结束（退出代码 %d）", a.id, exit)
 }
 
+func (r *Runner) quotaAllowed() bool {
+	if sw, e := ReadSwitchStatus(r.Cfg.Dir); e != nil || sw.ReviewRequired || sw.Stage == "pending" || sw.Stage == "resuming" || sw.Stage == "uncertain" {
+		r.switchPause("自动切号结果待核查")
+		return false
+	}
+	s, err := ReadSettings(r.Cfg.Dir)
+	if err != nil {
+		r.quotaStatus = RunnerStatus{Paused: true, Reason: "执行器设置不可读取", CheckedAt: time.Now().UTC()}
+		_ = writeJSON(r.Cfg.Dir, "runner-status.json", r.quotaStatus)
+		return false
+	}
+	if r.quotaSettings == s && !r.quotaStatus.CheckedAt.IsZero() && time.Since(r.quotaStatus.CheckedAt) < time.Minute {
+		return !r.quotaStatus.Paused
+	}
+	r.quotaSettings = s
+	if s.Account == "separate" {
+		status, e := ReadRunnerStatus(r.Cfg.Dir)
+		if e != nil || (status.Paused && status.Account == "独立账号") {
+			return false
+		}
+		r.quotaStatus = RunnerStatus{Account: "独立账号", Reason: "独立账号：开始前不检查额度", CheckedAt: time.Now().UTC()}
+		if writeJSON(r.Cfg.Dir, "runner-status.json", r.quotaStatus) != nil {
+			r.quotaStatus.Paused = true
+			return false
+		}
+		return true
+	}
+	query := r.Cfg.Quota
+	if query == nil {
+		query = (assistant.Reader{Home: r.Cfg.Home}).DesktopFiveHourRemaining
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	remaining, known := query(ctx)
+	status := RunnerStatus{Account: "Desktop", CheckedAt: time.Now().UTC()}
+	if known && remaining >= 0 && remaining <= 100 {
+		status.Remaining = &remaining
+		if remaining < s.MinRemaining {
+			status.Paused = true
+			status.Reason = "五小时剩余额度低于阈值"
+		}
+	} else {
+		status.Paused = true
+		status.Reason = "无法确定五小时剩余额度"
+	}
+	if err := writeJSON(r.Cfg.Dir, "runner-status.json", status); err != nil {
+		status.Paused = true
+		status.Reason = "无法保存执行器状态"
+	}
+	r.quotaStatus = status
+	return !status.Paused
+}
+
+func usageLimit(outPath, errPath string) bool {
+	contains := func(s string) bool {
+		s = strings.ToLower(s)
+		return strings.Contains(s, "usage_limit") || strings.Contains(s, "usage limit")
+	}
+	if contains(readTail(errPath, 65536)) {
+		return true
+	}
+	b, _ := os.ReadFile(outPath)
+	for _, line := range strings.Split(string(b), "\n") {
+		var event struct {
+			Type  string          `json:"type"`
+			Error json.RawMessage `json:"error"`
+			Item  struct {
+				Type    string `json:"type"`
+				Message string `json:"message"`
+			} `json:"item"`
+			Message string `json:"message"`
+		}
+		if json.Unmarshal([]byte(line), &event) == nil && ((event.Type == "error" || event.Type == "turn.failed") && (contains(string(event.Error)) || contains(event.Message)) || event.Item.Type == "error" && contains(event.Item.Message)) {
+			return true
+		}
+	}
+	return false
+}
+
 func readTail(path string, n int) string {
-	data, err := os.ReadFile(path)
+	f, err := os.Open(path)
 	if err != nil {
 		return ""
 	}
-	return strings.TrimSpace(tail(string(data), n))
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil {
+		return ""
+	}
+	if info.Size() > int64(n) {
+		_, _ = f.Seek(-int64(n), io.SeekEnd)
+	}
+	data, err := io.ReadAll(io.LimitReader(f, int64(n)))
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(data))
 }

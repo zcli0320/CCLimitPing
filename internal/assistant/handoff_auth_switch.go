@@ -39,6 +39,9 @@ func (r Reader) handoffAuthTransactionPath() string {
 }
 
 func handoffAuthSessionKey(s HandoffState) string {
+	if s.Kind == "orchestra_auto_switch" {
+		return privateKey(s.Kind + "\x00" + s.AuthorizationID + "\x00" + s.Scope + "\x00" + s.SourceAccount + "\x00" + s.TargetAccount)
+	}
 	return privateKey(s.Scope + "\x00" + s.SessionID + "\x00" + s.TurnID + "\x00" + s.SourceAccount + "\x00" + s.TargetAccount)
 }
 
@@ -85,7 +88,8 @@ func (r Reader) commitHandoffAuth(ctx context.Context, p handoffAuthPreparation,
 	}
 	defer unlock()
 	state := r.HandoffStatus()
-	if !state.Enabled || state.Stage != "pending" || state.PendingAction != string(HandoffSwitch) || state.Scope != p.scope || state.TargetAccount != p.accountID || state.SessionID == "" || state.TurnID == "" || state.SourceAccount == "" || state.SourceAccount == state.TargetAccount || state.Threshold != threshold {
+	validTarget := (state.Kind == "" && state.SessionID != "" && state.TurnID != "") || (state.Kind == "orchestra_auto_switch" && state.SessionID == "" && state.TurnID == "" && state.AuthorizationID != "")
+	if !validTarget || !state.Enabled || state.Stage != "pending" || state.PendingAction != string(HandoffSwitch) || state.Scope != p.scope || state.TargetAccount != p.accountID || state.SourceAccount == "" || state.SourceAccount == state.TargetAccount || state.Threshold != threshold {
 		return result, errors.New("没有匹配的切号交接授权")
 	}
 	if _, err := os.Lstat(r.handoffAuthTransactionPath()); err == nil || !os.IsNotExist(err) {

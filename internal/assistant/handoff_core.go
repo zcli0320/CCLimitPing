@@ -18,6 +18,7 @@ import (
 // into this structure. A pending action means its external result is unknown.
 type HandoffState struct {
 	Version         int     `json:"version"`
+	Kind            string  `json:"kind,omitempty"`
 	Enabled         bool    `json:"enabled"`
 	AuthorizationID string  `json:"authorization_id,omitempty"`
 	Scope           string  `json:"scope"`
@@ -253,6 +254,9 @@ func (r Reader) AdvanceHandoff(ctx context.Context, ops HandoffOperations) (Hand
 	}
 	defer unlockExec()
 	before := r.HandoffStatus()
+	if before.Kind != "" {
+		return before, errors.New("非会话交接不能通过会话入口执行")
+	}
 	if !before.Enabled || before.Stage == "error" || before.Stage == "completed" || before.Stage == "uncertain" {
 		return before, nil
 	}

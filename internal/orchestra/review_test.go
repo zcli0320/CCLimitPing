@@ -266,3 +266,450 @@ func TestRecoveryNeverKillsAndRequiresConfirmation(t *testing.T) {
 		t.Fatal("rework must wait for confirm-stopped")
 	}
 }
+
+const fakeReviewer = `#!/bin/bash
+echo "$@" >> "$ARGS_LOG"
+cat > "$ARGS_LOG.reviewer_prompt"
+[ -n "$REVIEW_SLEEP" ] && sleep "$REVIEW_SLEEP"
+[ -n "$REVIEW_FAIL" ] && { echo "reviewer boom" >&2; exit 2; }
+verdict="${REVIEW_VERDICT:-VERDICT: PASS}"
+printf '{"type":"result","session_id":"rev-s1","is_error":false,"result":"Review complete.\\n%s"}\n' "$verdict"
+`
+
+func setupReviewEnv(t *testing.T) env {
+	t.Helper()
+	e := setup(t)
+	bin := filepath.Join(t.TempDir(), "reviewer-claude")
+	if err := os.WriteFile(bin, []byte(fakeReviewer), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	claude := e.cfg.Agents["claude"]
+	claude.Bin = bin
+	e.cfg.Agents["claude"] = claude
+	return e
+}
+
+func TestParseVerdict(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{"pass", "All good.\nVERDICT: PASS", "pass"},
+		{"changes", "Fix line 10.\nVERDICT: CHANGES", "changes"},
+		{"case and spaces", "  verdict:   pass  \n", "pass"},
+		{"last line wins", "VERDICT: PASS\nWait, found a bug\nVERDICT: CHANGES", "changes"},
+		{"last line wins pass", "VERDICT: CHANGES\nActually fine\nVERDICT: PASS", "pass"},
+		{"bold", "Summary\n**VERDICT: PASS**", "pass"},
+		{"bold label", "**VERDICT:** CHANGES", "changes"},
+		{"bullet", "- VERDICT: PASS", "pass"},
+		{"bullet bold", "- **VERDICT: CHANGES**", "changes"},
+		{"code span", "`VERDICT: PASS`", "pass"},
+		{"none", "RECEIPT R1: done\nLooks fine", "unavailable"},
+		{"empty", "", "unavailable"},
+		{"inline prose ignored", "The VERDICT: PASS line must be standalone", "unavailable"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := parseVerdict(tc.in); got != tc.want {
+				t.Fatalf("parseVerdict(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestReviewIDTruncation(t *testing.T) {
+	if got := reviewID("T1", 1); got != "T1-r1" || !taskID.MatchString(got) {
+		t.Fatalf("short: %q", got)
+	}
+	long := strings.Repeat("a", 64)
+	for _, n := range []int{1, 9, 12, 999} {
+		got := reviewID(long, n)
+		if len(got) > 64 || !taskID.MatchString(got) || !strings.HasSuffix(got, "-r"+strings.TrimSpace(strings.Split(got, "-r")[1])) {
+			t.Fatalf("n=%d: len=%d id=%q", n, len(got), got)
+		}
+	}
+}
+
+func TestReviewPassAndWait(t *testing.T) {
+	e := setupReviewEnv(t)
+	t.Setenv("REVIEW_SLEEP", "0.3")
+	t.Setenv("REVIEW_VERDICT", "VERDICT: PASS")
+	if _, err := e.store.CreateProject(e.cfg, Project{
+		ID: "P1", Name: "Proj", Folder: e.folder, Lead: "lead", Executor: "codex", Reviewer: "claude",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runFor(t, e)
+	if _, err := e.store.DispatchInProject(e.cfg, "", "P1", "", "", "T1", "TASK T1: build feature", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	var sawReviewing bool
+	for i := 0; i < 200; i++ {
+		if tk, _ := e.store.Get("T1"); tk != nil && tk.Status == Reviewing {
+			sawReviewing = true
+			break
+		}
+		time.Sleep(15 * time.Millisecond)
+	}
+	if !sawReviewing {
+		t.Fatal("parent never entered reviewing status")
+	}
+	// Wait with a short timeout must not return early thinking Reviewing is Done.
+	mid, err := e.store.Wait("T1", 40*time.Millisecond, 10*time.Millisecond)
+	if err != nil || mid.Status != Reviewing || mid.Done() {
+		t.Fatalf("Wait during reviewing: task=%+v err=%v", mid, err)
+	}
+	done := waitDone(t, e, "T1")
+	if done.Status != Receipt || done.ReviewVerdict != "pass" || done.ReviewTask != "T1-r1" || done.ReviewedRuns != 1 || !strings.Contains(done.ReviewText, "VERDICT: PASS") {
+		t.Fatalf("parent after pass: %+v", done)
+	}
+	child, err := e.store.Get("T1-r1")
+	if err != nil || child.Status != Accepted || child.ReviewOf != "T1" || child.Project != "P1" {
+		t.Fatalf("child=%+v err=%v", child, err)
+	}
+	prompt, _ := os.ReadFile(e.args + ".reviewer_prompt")
+	if !strings.Contains(string(prompt), "You are the reviewer for project P1. Review, do not modify files.") ||
+		!strings.Contains(string(prompt), "TASK T1: build feature") ||
+		!strings.Contains(string(prompt), "RECEIPT T1: done") {
+		t.Fatalf("review card prompt: %s", prompt)
+	}
+}
+
+func TestReviewChangesAutoRework(t *testing.T) {
+	e := setupReviewEnv(t)
+	t.Setenv("REVIEW_VERDICT", "foo.go:10: missing check\\nVERDICT: CHANGES")
+	if err := WriteSettings(e.cfg.Dir, Settings{Account: "desktop", MinRemaining: 10, AutoReworkMax: 1, CheckTimeoutSeconds: 600}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.store.CreateProject(e.cfg, Project{
+		ID: "P1", Name: "Proj", Folder: e.folder, Lead: "lead", Executor: "codex", Reviewer: "claude",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runFor(t, e)
+	if _, err := e.store.DispatchInProject(e.cfg, "", "P1", "", "", "T1", "TASK T1: work", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	done := waitDone(t, e, "T1")
+	if done.Status != Receipt || done.ReviewVerdict != "changes" || done.AutoReworkCount != 1 || len(done.Runs) != 2 || done.ReviewedRuns != 2 || done.ReviewTask != "T1-r2" {
+		t.Fatalf("final task=%+v", done)
+	}
+	if done.Runs[1].Kind != "auto_rework" {
+		t.Fatalf("second run kind=%q, want auto_rework", done.Runs[1].Kind)
+	}
+	r1, err := e.store.Get("T1-r1")
+	if err != nil || r1.Status != Accepted {
+		t.Fatalf("r1=%+v err=%v", r1, err)
+	}
+	r2, err := e.store.Get("T1-r2")
+	if err != nil || r2.Status != Accepted {
+		t.Fatalf("r2=%+v err=%v", r2, err)
+	}
+}
+
+func TestReviewSkippedWhenReviewerIsLeadOrNoProject(t *testing.T) {
+	e := setupReviewEnv(t)
+	if _, err := e.store.CreateProject(e.cfg, Project{
+		ID: "P1", Name: "Proj", Folder: e.folder, Lead: "claude", Executor: "codex", Reviewer: "claude",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runFor(t, e)
+	if _, err := e.store.DispatchInProject(e.cfg, "", "P1", "", "", "T1", "TASK T1", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	t1 := waitDone(t, e, "T1")
+	if t1.Status != Receipt || t1.ReviewTask != "" || t1.ReviewedRuns != 0 {
+		t.Fatalf("reviewer==lead task=%+v", t1)
+	}
+	if _, err := e.store.Get("T1-r1"); err == nil {
+		t.Fatal("review child should not exist when reviewer == lead")
+	}
+
+	if _, err := e.store.Dispatch(e.cfg, "lead", "codex", e.folder, "T2", "TASK T2"); err != nil {
+		t.Fatal(err)
+	}
+	t2 := waitDone(t, e, "T2")
+	if t2.Status != Receipt || t2.ReviewTask != "" || t2.ReviewedRuns != 0 {
+		t.Fatalf("no-project task=%+v", t2)
+	}
+}
+
+func TestReviewerFails(t *testing.T) {
+	e := setupReviewEnv(t)
+	t.Setenv("REVIEW_FAIL", "1")
+	if _, err := e.store.CreateProject(e.cfg, Project{
+		ID: "P1", Name: "Proj", Folder: e.folder, Lead: "lead", Executor: "codex", Reviewer: "claude",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runFor(t, e)
+	if _, err := e.store.DispatchInProject(e.cfg, "", "P1", "", "", "T1", "TASK T1", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	done := waitDone(t, e, "T1")
+	if done.Status != Receipt || done.ReviewVerdict != "unavailable" || !strings.Contains(done.ReviewText, "reviewer boom") {
+		t.Fatalf("failed reviewer parent=%+v", done)
+	}
+	child, err := e.store.Get("T1-r1")
+	if err != nil || child.Status != Accepted {
+		t.Fatalf("failed reviewer child=%+v err=%v", child, err)
+	}
+}
+
+func TestAcceptAndCancelWhileReviewing(t *testing.T) {
+	e := setupReviewEnv(t)
+	t.Setenv("REVIEW_SLEEP", "30")
+	if _, err := e.store.CreateProject(e.cfg, Project{
+		ID: "P1", Name: "Proj", Folder: e.folder, Lead: "lead", Executor: "codex", Reviewer: "claude",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runFor(t, e)
+
+	// Accept while reviewing cancels child.
+	if _, err := e.store.DispatchInProject(e.cfg, "", "P1", "", "", "T1", "TASK T1", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 200; i++ {
+		tk, _ := e.store.Get("T1")
+		ch, _ := e.store.Get("T1-r1")
+		if tk != nil && tk.Status == Reviewing && ch != nil && ch.Status == Running {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if _, err := e.store.RequestRework("T1", "no rework while reviewing"); err == nil {
+		t.Fatal("RequestRework must fail while Reviewing")
+	}
+	acc, err := e.store.Accept("T1")
+	if err != nil || acc.Status != Accepted {
+		t.Fatalf("Accept while reviewing: %+v %v", acc, err)
+	}
+	ch1 := waitDone(t, e, "T1-r1")
+	if ch1.Status != Cancelled {
+		t.Fatalf("child after parent Accept: %+v", ch1)
+	}
+
+	// Cancel while reviewing cancels both.
+	if _, err := e.store.DispatchInProject(e.cfg, "", "P1", "", "", "T2", "TASK T2", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 200; i++ {
+		tk, _ := e.store.Get("T2")
+		ch, _ := e.store.Get("T2-r1")
+		if tk != nil && tk.Status == Reviewing && ch != nil && ch.Status == Running {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	can, err := e.store.Cancel("T2")
+	if err != nil || can.Status != Cancelled {
+		t.Fatalf("Cancel while reviewing: %+v %v", can, err)
+	}
+	ch2 := waitDone(t, e, "T2-r1")
+	if ch2.Status != Cancelled {
+		t.Fatalf("child after parent Cancel: %+v", ch2)
+	}
+}
+
+func TestReviewCrashRecovery(t *testing.T) {
+	e := setupReviewEnv(t)
+	r := idleRunner(t, e)
+	if _, err := e.store.CreateProject(e.cfg, Project{
+		ID: "P1", Name: "Proj", Folder: e.folder, Lead: "lead", Executor: "codex", Reviewer: "claude",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.store.DispatchInProject(e.cfg, "", "P1", "", "", "T1", "TASK T1", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.store.Update("T1", func(tk *Task) error {
+		tk.Status = Receipt
+		tk.Runs = []Run{{Kind: "task", Started: time.Now(), Ended: time.Now(), Receipt: "RECEIPT T1: done"}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// Pre-existing review child (as if runner crashed after dispatch before parent Update).
+	if _, err := e.store.dispatch(e.cfg, "orchestra", "P1", "claude", e.folder, "T1-r1", "existing review card", nil, nil, "T1"); err != nil {
+		t.Fatal(err)
+	}
+	tasks, _ := e.store.List()
+	r.reviewTick(tasks)
+
+	parent, err := e.store.Get("T1")
+	if err != nil || parent.Status != Reviewing || parent.ReviewTask != "T1-r1" || parent.ReviewedRuns != 1 {
+		t.Fatalf("recovered parent=%+v err=%v", parent, err)
+	}
+	all, _ := e.store.List()
+	if len(all) != 2 {
+		t.Fatalf("expected 2 tasks (parent + child), got %d", len(all))
+	}
+}
+
+func receiptInProject(t *testing.T, e env, reviewer string) {
+	t.Helper()
+	if _, err := e.store.CreateProject(e.cfg, Project{
+		ID: "P1", Name: "Proj", Folder: e.folder, Lead: "lead", Executor: "codex", Reviewer: reviewer,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.store.DispatchInProject(e.cfg, "", "P1", "", "", "T1", "TASK T1", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.store.Update("T1", func(tk *Task) error {
+		tk.Status = Receipt
+		tk.Runs = []Run{{Kind: "task", Started: time.Now(), Ended: time.Now(), Receipt: "RECEIPT T1: done"}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestReviewUndispatchableIsRecorded(t *testing.T) {
+	e := setupReviewEnv(t)
+	receiptInProject(t, e, "claude")
+	delete(e.cfg.Agents, "claude") // reviewer removed after the project was created
+	r := idleRunner(t, e)
+	tasks, _ := e.store.List()
+	r.reviewTick(tasks)
+	p, _ := e.store.Get("T1")
+	if p.Status != Receipt || p.ReviewVerdict != "unavailable" || !strings.Contains(p.ReviewText, "claude") || p.ReviewedRuns != 1 {
+		t.Fatalf("parent=%+v", p)
+	}
+	if !e.store.needsLead(p) {
+		t.Fatal("lead still waits on a review that can never run")
+	}
+}
+
+func TestWaitDoesNotReturnBeforeReviewStarts(t *testing.T) {
+	e := setupReviewEnv(t)
+	receiptInProject(t, e, "claude")
+	got, err := e.store.Wait("T1", 300*time.Millisecond, 50*time.Millisecond)
+	if err != nil || got.Status != Receipt || e.store.needsLead(got) {
+		t.Fatalf("wait returned a receipt awaiting review as needing the lead: %+v %v", got, err)
+	}
+}
+
+func TestReviewStaleReceiptCannotStartAfterAccept(t *testing.T) {
+	e := setupReviewEnv(t)
+	receiptInProject(t, e, "claude")
+	r := idleRunner(t, e)
+	stale, _ := e.store.List()
+	if _, err := e.store.Accept("T1"); err != nil {
+		t.Fatal(err)
+	}
+	r.reviewTick(stale)
+	child, err := e.store.Get("T1-r1")
+	if err != nil || child.Status != Cancelled {
+		t.Fatalf("stale review child=%+v err=%v", child, err)
+	}
+	if a := r.start(child); a != nil {
+		finishRun(r, a)
+		t.Fatal("stale review was launched")
+	}
+}
+
+func TestOrphanReviewCannotStartAfterCrashAndAccept(t *testing.T) {
+	e := setupReviewEnv(t)
+	receiptInProject(t, e, "claude")
+	child, err := e.store.dispatch(e.cfg, "orchestra", "P1", "claude", e.folder, "T1-r1", "review", nil, nil, "T1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.store.Accept("T1"); err != nil {
+		t.Fatal(err)
+	}
+	r := idleRunner(t, e)
+	if a := r.start(child); a != nil {
+		finishRun(r, a)
+		t.Fatal("orphan review was launched")
+	}
+	child, _ = e.store.Get(child.ID)
+	if child.Status != Cancelled {
+		t.Fatalf("orphan status=%s", child.Status)
+	}
+}
+
+func TestReviewParentChangesAfterClaimPreventsLaunch(t *testing.T) {
+	e := setupReviewEnv(t)
+	receiptInProject(t, e, "claude")
+	r := idleRunner(t, e)
+	tasks, _ := e.store.List()
+	r.reviewTick(tasks)
+	child, err := e.store.Get("T1-r1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	testHookAfterClaim = func(string) {
+		_, err := e.store.Update("T1", func(parent *Task) error {
+			parent.Status = Accepted // simulate interruption before child cancellation
+			return nil
+		})
+		if err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() { testHookAfterClaim = nil })
+	if a := r.start(child); a != nil {
+		finishRun(r, a)
+		t.Fatal("review launched after parent changed")
+	}
+	child, _ = e.store.Get(child.ID)
+	if child.Status != Cancelled {
+		t.Fatalf("child status=%s", child.Status)
+	}
+}
+
+func TestReviewRejectsReplacedParentFolder(t *testing.T) {
+	e := setupReviewEnv(t)
+	receiptInProject(t, e, "claude")
+	if err := os.Rename(e.folder, e.folder+"-original"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(e.folder, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	r := idleRunner(t, e)
+	tasks, _ := e.store.List()
+	r.reviewTick(tasks)
+	parent, _ := e.store.Get("T1")
+	if parent.Status != Receipt || parent.ReviewVerdict != "unavailable" || !strings.Contains(parent.ReviewText, "工作目录") {
+		t.Fatalf("parent=%+v", parent)
+	}
+	if _, err := e.store.Get("T1-r1"); err == nil {
+		t.Fatal("review was created for replacement directory")
+	}
+}
+
+// The process that accepts a reviewing task can die between accepting the
+// parent and cancelling its review; the runner must still stop the review.
+func TestRunningReviewStopsWhenParentCancelWasLost(t *testing.T) {
+	e := setupReviewEnv(t)
+	t.Setenv("REVIEW_SLEEP", "30")
+	if _, err := e.store.CreateProject(e.cfg, Project{
+		ID: "P1", Name: "Proj", Folder: e.folder, Lead: "lead", Executor: "codex", Reviewer: "claude",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runFor(t, e)
+	if _, err := e.store.DispatchInProject(e.cfg, "", "P1", "", "", "T1", "TASK T1", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 200; i++ {
+		ch, _ := e.store.Get("T1-r1")
+		if ch != nil && ch.Status == Running {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	// Accept the parent only, as if the accepting process died before Cancel(child).
+	if _, err := e.store.Update("T1", func(p *Task) error { p.Status = Accepted; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if ch := waitDone(t, e, "T1-r1"); ch.Status != Cancelled {
+		t.Fatalf("orphaned running review: %+v", ch)
+	}
+}

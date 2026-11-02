@@ -1,0 +1,191 @@
+package orchestra
+
+import (
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"path/filepath"
+	"sort"
+	"strings"
+	"time"
+)
+
+type Project struct {
+	ID        string    `json:"id"`
+	Name      string    `json:"name"`
+	Folder    string    `json:"folder"`
+	FolderDev uint64    `json:"folder_dev,omitempty"`
+	FolderIno uint64    `json:"folder_ino,omitempty"`
+	Lead      string    `json:"lead,omitempty"`
+	Executor  string    `json:"executor"`
+	Reviewer  string    `json:"reviewer,omitempty"` // stored only; no review flow yet
+	Checks    []string  `json:"checks,omitempty"`
+	Scope     []string  `json:"scope,omitempty"`
+	Archived  bool      `json:"archived,omitempty"`
+	Created   time.Time `json:"created"`
+	Updated   time.Time `json:"updated"`
+}
+
+func (s Store) projectPath(id string) string { return filepath.Join(s.Dir, "projects", id+".json") }
+
+func (s Store) readProject(id string) (*Project, error) {
+	data, err := os.ReadFile(s.projectPath(id))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, fmt.Errorf("没有编号为 %s 的项目", id)
+	}
+	if err != nil {
+		return nil, err
+	}
+	var p Project
+	if err := json.Unmarshal(data, &p); err != nil {
+		return nil, fmt.Errorf("项目 %s 的记录已损坏", id)
+	}
+	return &p, nil
+}
+
+func (s Store) writeProject(p *Project) error {
+	if err := os.MkdirAll(filepath.Join(s.Dir, "projects"), 0o700); err != nil {
+		return err
+	}
+	p.Updated = time.Now()
+	data, err := json.MarshalIndent(p, "", "  ")
+	if err != nil {
+		return err
+	}
+	tmp := s.projectPath(p.ID) + ".tmp"
+	if err := os.WriteFile(tmp, data, 0o600); err != nil {
+		return err
+	}
+	return os.Rename(tmp, s.projectPath(p.ID))
+}
+
+func (s Store) CreateProject(cfg Config, p Project) (*Project, error) {
+	if !taskID.MatchString(p.ID) {
+		return nil, fmt.Errorf("项目编号无效：%q", p.ID)
+	}
+	p.Name = strings.TrimSpace(p.Name)
+	if p.Name == "" || len([]rune(p.Name)) > 100 {
+		return nil, errors.New("项目名称无效")
+	}
+	if _, ok := cfg.Agents[p.Executor]; !ok {
+		return nil, fmt.Errorf("未知的执行代理：%s", p.Executor)
+	}
+	if p.Reviewer != "" {
+		if _, ok := cfg.Agents[p.Reviewer]; !ok && p.Reviewer != "claude" && p.Reviewer != "codex" {
+			return nil, fmt.Errorf("未知的审查代理：%s", p.Reviewer)
+		}
+	}
+	if p.Lead != "" && !taskID.MatchString(p.Lead) {
+		return nil, fmt.Errorf("负责代理无效：%q", p.Lead)
+	}
+	if err := validateEvidence(p.Checks, p.Scope); err != nil {
+		return nil, err
+	}
+	dir, err := cfg.allowedFolder(p.Folder)
+	if err != nil {
+		return nil, err
+	}
+	unlock, err := s.lock()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	if _, err := os.Stat(s.projectPath(p.ID)); err == nil {
+		return nil, fmt.Errorf("项目编号 %s 已存在", p.ID)
+	}
+	dev, ino, err := folderID(dir)
+	if err != nil {
+		return nil, fmt.Errorf("无法读取工作目录：%v", err)
+	}
+	p.Folder, p.FolderDev, p.FolderIno = dir, dev, ino
+	p.Created = time.Now()
+	return &p, s.writeProject(&p)
+}
+
+func (s Store) GetProject(id string) (*Project, error) {
+	if !taskID.MatchString(id) {
+		return nil, fmt.Errorf("项目编号无效：%q", id)
+	}
+	return s.readProject(id)
+}
+
+func (s Store) ListProjects() ([]*Project, error) {
+	entries, err := os.ReadDir(filepath.Join(s.Dir, "projects"))
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var out []*Project
+	for _, e := range entries {
+		name := e.Name()
+		if !strings.HasSuffix(name, ".json") {
+			continue
+		}
+		if p, err := s.readProject(strings.TrimSuffix(name, ".json")); err == nil {
+			out = append(out, p)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Created.Before(out[j].Created) })
+	return out, nil
+}
+
+func (s Store) ArchiveProject(id string) (*Project, error) {
+	if !taskID.MatchString(id) {
+		return nil, fmt.Errorf("项目编号无效：%q", id)
+	}
+	unlock, err := s.lock()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	p, err := s.readProject(id)
+	if err != nil {
+		return nil, err
+	}
+	p.Archived = true
+	return p, s.writeProject(p)
+}
+
+func (s Store) DispatchInProject(cfg Config, lead, project, executor, folder, id, card string, checks, scope []string) (*Task, error) {
+	if project == "" {
+		return s.DispatchWithEvidence(cfg, lead, executor, folder, id, card, checks, scope)
+	}
+	p, err := s.GetProject(project)
+	if err != nil {
+		return nil, err
+	}
+	if p.Archived {
+		return nil, fmt.Errorf("项目 %s 已归档", project)
+	}
+	if executor == "" {
+		executor = p.Executor
+	}
+	if folder == "" {
+		folder = p.Folder
+	} else {
+		dir, err := cfg.allowedFolder(folder)
+		if err != nil {
+			return nil, err
+		}
+		if dir != p.Folder {
+			return nil, fmt.Errorf("工作目录与项目 %s 不一致", project)
+		}
+		folder = dir
+	}
+	if dev, ino, err := folderID(p.Folder); err != nil || dev != p.FolderDev || ino != p.FolderIno {
+		return nil, fmt.Errorf("项目 %s 的工作目录已变化，请重新创建项目", project)
+	}
+	if checks == nil {
+		checks = p.Checks
+	}
+	if scope == nil {
+		scope = p.Scope
+	}
+	if lead == "" {
+		lead = p.Lead
+	}
+	return s.dispatch(cfg, lead, p.ID, executor, folder, id, card, checks, scope, "")
+}

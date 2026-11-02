@@ -35,15 +35,11 @@ cat > "$app_dir/Contents/Info.plist" <<'PLIST'
 <key>CFBundleExecutable</key><string>CodexHelper</string>
 <key>CFBundlePackageType</key><string>APPL</string>
 <key>CFBundleIconFile</key><string>CodexHelper.icns</string>
-<key>CFBundleShortVersionString</key><string>0.4.4</string>
-<key>CFBundleVersion</key><string>28</string>
+<key>CFBundleShortVersionString</key><string>0.4.5</string>
+<key>CFBundleVersion</key><string>37</string>
 <key>NSHighResolutionCapable</key><true/>
 <key>LSMinimumSystemVersion</key><string>12.0</string>
 </dict></plist>
 PLIST
-codesign --force --sign - "$app_dir/Contents/MacOS/codex-helper"
-codesign --force --sign - "$app_dir/Contents/MacOS/codex-runtime-bridge"
-codesign --force --sign - "$app_dir/Contents/MacOS/codex-accounts"
-codesign --force --sign - "$app_dir"
-codesign --verify --deep --strict "$app_dir"
+bash scripts/sign-macos-helper.sh "$app_dir"
 printf '%s\n' "$app_dir"

@@ -41,34 +41,51 @@ func schema(required []string, fields map[string]any) map[string]any {
 
 func mcpTools() []mcpTool {
 	str := map[string]any{"type": "string", "minLength": 1}
+	checks := map[string]any{"type": "array", "items": str, "maxItems": 10}
+	scope := map[string]any{"type": "array", "items": str}
 	empty := func() map[string]any { return schema(nil, map[string]any{}) }
 	id := func() map[string]any { return schema([]string{"id"}, map[string]any{"id": str}) }
 	return []mcpTool{
 		{"list_agents", "列出执行代理 / List agents", empty()},
 		{"runner_status", "查看执行器状态 / Check runner status", empty()},
-		{"dispatch_task", "提交任务卡 / Dispatch a task", schema([]string{"executor", "folder", "id", "card"}, map[string]any{"executor": str, "folder": str, "id": str, "card": str})},
+		{"get_runner_status", "查看执行器额度暂停状态", empty()},
+		{"resume_task", "继续额度耗尽的原会话", id()},
+		{"dispatch_task", "提交任务卡 / Dispatch a task", schema([]string{"id", "card"}, map[string]any{"project": str, "executor": str, "folder": str, "id": str, "card": str, "checks": checks, "scope": scope})},
 		{"get_task", "读取任务 / Get a task", id()},
-		{"list_tasks", "列出任务 / List tasks", schema(nil, map[string]any{"status": map[string]any{"type": "string", "enum": []string{"queued", "running", "receipt", "failed", "cancelled", "accepted"}}})},
+		{"list_tasks", "列出任务 / List tasks", schema(nil, map[string]any{"status": map[string]any{"type": "string", "enum": []string{"queued", "running", "reviewing", "receipt", "failed", "quota_exhausted", "cancelled", "accepted"}}, "project": str})},
 		{"wait_task", "等待任务 / Wait for a task", schema([]string{"id"}, map[string]any{"id": str, "timeout_seconds": map[string]any{"type": "integer", "minimum": 0, "maximum": 540, "default": 300}})},
 		{"rework_task", "请求返工 / Request rework", schema([]string{"id", "text"}, map[string]any{"id": str, "text": str})},
 		{"cancel_task", "取消任务 / Cancel a task", id()},
 		{"accept_task", "验收任务 / Accept a task", id()},
+		{"list_projects", "列出项目 / List projects", schema(nil, map[string]any{"include_archived": map[string]any{"type": "boolean", "default": false}})},
+		{"get_project", "读取项目 / Get a project", id()},
+		{"create_project", "创建项目 / Create a project", schema([]string{"id", "name", "folder", "executor"}, map[string]any{"id": str, "name": str, "folder": str, "executor": str, "lead": str, "reviewer": str, "checks": checks, "scope": scope})},
 	}
 }
 
 type taskView struct {
-	ID          string `json:"id"`
-	Status      Status `json:"status"`
-	Executor    string `json:"executor"`
-	Folder      string `json:"folder"`
-	Session     string `json:"session"`
-	Runs        int    `json:"runs"`
-	LastReceipt string `json:"last_receipt"`
-	Note        string `json:"note,omitempty"`
+	ID            string        `json:"id"`
+	Project       string        `json:"project,omitempty"`
+	Status        Status        `json:"status"`
+	Executor      string        `json:"executor"`
+	Folder        string        `json:"folder"`
+	Session       string        `json:"session"`
+	Runs          int           `json:"runs"`
+	LastReceipt   string        `json:"last_receipt"`
+	ReviewOf      string        `json:"review_of,omitempty"`
+	ReviewTask    string        `json:"review_task,omitempty"`
+	ReviewVerdict string        `json:"review_verdict,omitempty"`
+	Note          string        `json:"note,omitempty"`
+	Evidence      *EvidenceView `json:"evidence,omitempty"`
 }
 
 func view(t *Task) taskView {
-	return taskView{ID: t.ID, Status: t.Status, Executor: t.Executor, Folder: t.Folder, Session: t.Session, Runs: len(t.Runs), LastReceipt: t.LastReceipt()}
+	return taskView{
+		ID: t.ID, Project: t.Project, Status: t.Status, Executor: t.Executor, Folder: t.Folder,
+		Session: t.Session, Runs: len(t.Runs), LastReceipt: t.LastReceipt(),
+		ReviewOf: t.ReviewOf, ReviewTask: t.ReviewTask, ReviewVerdict: t.ReviewVerdict,
+		Evidence: Evidence(t),
+	}
 }
 
 func toolText(value any, err error) map[string]any {
@@ -106,13 +123,20 @@ func waitTimeout(seconds *int) (time.Duration, error) {
 
 func callMCPTool(ctx context.Context, cfg Config, store Store, lead, name string, raw json.RawMessage) (any, error) {
 	var args struct {
-		Executor string `json:"executor"`
-		Folder   string `json:"folder"`
-		ID       string `json:"id"`
-		Card     string `json:"card"`
-		Status   string `json:"status"`
-		Text     string `json:"text"`
-		Timeout  *int   `json:"timeout_seconds"`
+		Project         string   `json:"project"`
+		Name            string   `json:"name"`
+		Lead            string   `json:"lead"`
+		Reviewer        string   `json:"reviewer"`
+		IncludeArchived bool     `json:"include_archived"`
+		Executor        string   `json:"executor"`
+		Folder          string   `json:"folder"`
+		ID              string   `json:"id"`
+		Card            string   `json:"card"`
+		Status          string   `json:"status"`
+		Text            string   `json:"text"`
+		Timeout         *int     `json:"timeout_seconds"`
+		Checks          []string `json:"checks"`
+		Scope           []string `json:"scope"`
 	}
 	if len(raw) == 0 {
 		raw = []byte("{}")
@@ -140,8 +164,36 @@ func callMCPTool(ctx context.Context, cfg Config, store Store, lead, name string
 		return rows, nil
 	case "runner_status":
 		return map[string]bool{"active": RunnerActive(cfg.Dir)}, nil
+	case "get_runner_status":
+		return ReadRunnerStatus(cfg.Dir)
+	case "create_project":
+		projLead := args.Lead
+		if projLead == "" {
+			projLead = lead
+		}
+		return store.CreateProject(cfg, Project{
+			ID: args.ID, Name: args.Name, Folder: args.Folder, Lead: projLead,
+			Executor: args.Executor, Reviewer: args.Reviewer, Checks: args.Checks, Scope: args.Scope,
+		})
+	case "get_project":
+		return store.GetProject(args.ID)
+	case "list_projects":
+		ps, e := store.ListProjects()
+		if e != nil {
+			return nil, e
+		}
+		out := []*Project{}
+		for _, p := range ps {
+			if args.IncludeArchived || !p.Archived {
+				out = append(out, p)
+			}
+		}
+		return out, nil
 	case "dispatch_task":
-		t, e := store.Dispatch(cfg, lead, args.Executor, args.Folder, args.ID, args.Card)
+		if args.Project == "" && (args.Executor == "" || args.Folder == "") {
+			return nil, errors.New("缺少 executor 或 folder（或指定 project）")
+		}
+		t, e := store.DispatchInProject(cfg, lead, args.Project, args.Executor, args.Folder, args.ID, args.Card, args.Checks, args.Scope)
 		if e != nil {
 			return nil, e
 		}
@@ -153,7 +205,7 @@ func callMCPTool(ctx context.Context, cfg Config, store Store, lead, name string
 	case "list_tasks":
 		if args.Status != "" {
 			switch Status(args.Status) {
-			case Queued, Running, Receipt, Failed, Cancelled, Accepted:
+			case Queued, Running, Reviewing, Receipt, Failed, QuotaExhausted, Cancelled, Accepted:
 			default:
 				return nil, errors.New("任务状态无效")
 			}
@@ -164,12 +216,12 @@ func callMCPTool(ctx context.Context, cfg Config, store Store, lead, name string
 		}
 		out := []taskView{}
 		for _, t := range ts {
-			if args.Status == "" || string(t.Status) == args.Status {
+			if (args.Status == "" || string(t.Status) == args.Status) && (args.Project == "" || t.Project == args.Project) {
 				out = append(out, view(t))
 			}
 		}
 		return out, nil
-	case "get_task", "cancel_task", "accept_task", "rework_task", "wait_task":
+	case "get_task", "cancel_task", "accept_task", "rework_task", "resume_task", "wait_task":
 		if strings.TrimSpace(args.ID) == "" {
 			return nil, errors.New("缺少任务编号")
 		}
@@ -184,6 +236,8 @@ func callMCPTool(ctx context.Context, cfg Config, store Store, lead, name string
 			t, e = store.Accept(args.ID)
 		case "rework_task":
 			t, e = store.RequestRework(args.ID, args.Text)
+		case "resume_task":
+			t, e = store.Resume(args.ID)
 		case "wait_task":
 			d, e2 := waitTimeout(args.Timeout)
 			if e2 != nil {
@@ -193,7 +247,7 @@ func callMCPTool(ctx context.Context, cfg Config, store Store, lead, name string
 			defer deadline.Stop()
 			for {
 				t, e = store.Get(args.ID)
-				if e != nil || t.Done() {
+				if e != nil || store.needsLead(t) {
 					break
 				}
 				select {

@@ -48,14 +48,14 @@ func DefaultAgents(home string) map[string]Agent {
 	}
 	codex := Agent{Name: "codex", Label: "Codex", Bin: codexBin,
 		// -c, not -s: `codex exec resume` takes only -c overrides.
-		Args: []string{"-c", `sandbox_mode="workspace-write"`, "-c", "sandbox_workspace_write.network_access=true"}}
-	// A separate CODEX_HOME keeps the executor's account out of account-switch tests.
-	codex.Env = []string{"CODEX_HOME=" + filepath.Join(home, ".codex-runner")}
+		Args: []string{"-c", `model="gpt-6.1-terra"`, "-c", `model_reasoning_effort="xhigh"`,
+			"-c", `sandbox_mode="workspace-write"`, "-c", "sandbox_workspace_write.network_access=true"}}
 	return map[string]Agent{
 		"codex": codex,
 		"claude": {Name: "claude", Label: "Claude Code", Bin: "claude",
 			Args: []string{"--permission-mode", "acceptEdits", "--allowedTools", "Bash,Read,Edit,Write,Glob,Grep"}},
-		"antigravity": {Name: "antigravity", Label: "Antigravity", Bin: "agy"},
+		"antigravity": {Name: "antigravity", Label: "Antigravity", Bin: "agy",
+			Args: []string{"--model", "gemini-4-argon-medium", "--mode", "accept-edits", "--settings", `{"permissions":{"allow":["command(*)"]}}`, "--output-format", "json"}},
 	}
 }
 
@@ -68,9 +68,6 @@ func isFile(p string) bool {
 // PATH, so it matches what the executor process gets); an error says why it
 // can't be used.
 func (a Agent) Resolve(path string) (string, error) {
-	if a.Name == "antigravity" {
-		return "", fmt.Errorf("Antigravity 的无界面命令行尚未接入（未找到 agy 或参数未核实）")
-	}
 	if filepath.IsAbs(a.Bin) {
 		if !isFile(a.Bin) {
 			return "", fmt.Errorf("%s 程序不存在：%s", a.Label, a.Bin)
@@ -98,7 +95,17 @@ func (a Agent) prepare(path, session, folder, prompt, lastFile string) (Invocati
 	if err != nil {
 		return Invocation{}, err
 	}
-	inv := Invocation{Dir: folder, Env: append(os.Environ(), a.Env...), Stdin: prompt}
+	env := os.Environ()
+	if a.Name == "codex" {
+		filtered := env[:0]
+		for _, v := range env {
+			if !strings.HasPrefix(v, "CODEX_HOME=") {
+				filtered = append(filtered, v)
+			}
+		}
+		env = filtered
+	}
+	inv := Invocation{Dir: folder, Env: append(env, a.Env...), Stdin: prompt}
 	switch a.Name {
 	case "codex":
 		argv := []string{bin, "exec"}
@@ -117,6 +124,13 @@ func (a Agent) prepare(path, session, folder, prompt, lastFile string) (Invocati
 			argv = append(argv, "--resume", session)
 		}
 		inv.Argv = append(argv, a.Args...)
+	case "antigravity":
+		argv := append([]string{bin}, a.Args...)
+		if session != "" {
+			argv = append(argv, "--conversation", session)
+		}
+		inv.Argv = append(argv, "-p", prompt)
+		inv.Stdin = ""
 	default:
 		return Invocation{}, fmt.Errorf("%s: %w", a.Label, errNoCLI)
 	}
@@ -142,6 +156,48 @@ func (a Agent) result(stdoutPath, lastFile string) (session, final string, err e
 		}
 		last, _ := os.ReadFile(lastFile)
 		return session, strings.TrimSpace(string(last)), nil
+	case "antigravity":
+		var out struct {
+			ConversationID string `json:"conversation_id"`
+			Status         string `json:"status"`
+			Response       string `json:"response"`
+			DeniedActions  []struct {
+				Action      string `json:"action"`
+				DisplayName string `json:"display_name"`
+			} `json:"denied_actions"`
+		}
+		payload := bytesTrim(data)
+		if json.Unmarshal(payload, &out) != nil {
+			lines := strings.Split(string(payload), "\n")
+			for i := len(lines) - 1; i >= 0; i-- {
+				line := strings.TrimSpace(lines[i])
+				if strings.HasPrefix(line, "{") {
+					payload = []byte(line)
+					break
+				}
+			}
+		}
+		if e := json.Unmarshal(payload, &out); e != nil {
+			return out.ConversationID, "", errors.New("Antigravity 输出不是预期的 JSON")
+		}
+		if out.Status != "SUCCESS" {
+			return out.ConversationID, "", fmt.Errorf("Antigravity 报告错误：%s", out.Status)
+		}
+		if len(out.DeniedActions) > 0 {
+			names := make([]string, 0, len(out.DeniedActions))
+			for _, action := range out.DeniedActions {
+				name := action.DisplayName
+				if name == "" {
+					name = action.Action
+				}
+				names = append(names, name)
+			}
+			return out.ConversationID, "", fmt.Errorf("Antigravity 拒绝了操作：%s", strings.Join(names, "、"))
+		}
+		if strings.TrimSpace(out.Response) == "" {
+			return out.ConversationID, "", errors.New("Antigravity 返回的回复为空")
+		}
+		return out.ConversationID, strings.TrimSpace(out.Response), nil
 	case "claude":
 		var out struct {
 			SessionID string `json:"session_id"`

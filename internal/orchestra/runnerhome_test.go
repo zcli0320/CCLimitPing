@@ -66,11 +66,11 @@ func TestRunnerLoginReportsOnlySanitizedState(t *testing.T) {
 	}
 }
 
-func TestDefaultCodexNeverFallsBackToDesktopHome(t *testing.T) {
+func TestDefaultCodexUsesDesktopHome(t *testing.T) {
 	home := t.TempDir()
 	codex := DefaultAgents(home)["codex"]
-	if len(codex.Env) != 1 || codex.Env[0] != "CODEX_HOME="+filepath.Join(home, ".codex-runner") {
-		t.Fatalf("missing isolated home: %#v", codex.Env)
+	if len(codex.Env) != 0 {
+		t.Fatalf("unexpected home override: %#v", codex.Env)
 	}
 }
 

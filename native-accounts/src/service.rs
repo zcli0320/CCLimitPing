@@ -1352,6 +1352,12 @@ use std::os::fd::AsRawFd;
 /// Never terminate clients. A target change requires the user to close the
 /// affected client and CC Switch, whose locks are not shared with this helper.
 fn require_stopped(scope: &str, home: &Path) -> Result<()> {
+    require_stopped_for_writer(scope, home, false)
+}
+
+// The CC Switch route deliberately controls that same writer. All Codex
+// process checks remain identical; only this route may keep CC Switch open.
+fn require_stopped_for_writer(scope: &str, home: &Path, cc_switch_writer: bool) -> Result<()> {
     let output = Command::new("/bin/ps")
         .args(["-axo", "uid=,pid=,command="])
         .output()
@@ -1370,7 +1376,7 @@ fn require_stopped(scope: &str, home: &Path) -> Result<()> {
             continue;
         }
         let command = parts.collect::<Vec<_>>().join(" ");
-        if command.contains("/CC Switch.app/Contents/MacOS/cc-switch")
+        if !cc_switch_writer && command.contains("/CC Switch.app/Contents/MacOS/cc-switch")
             && running_cc_switch_targets(scope, home)?
         {
             return Err("CC Switch 也管理该端，请先退出它以避免同时写入".into());
@@ -1821,6 +1827,17 @@ impl AccountService {
                 }
                 self.apply_mode(field("account_id")?, field("scope")?, true)
                     .await
+            }
+            "handoff_orchestra_desktop_stopped" => {
+                if owner.is_none() || !self.shared_service || !self.flows.is_empty() {
+                    return Err("账号管理权不可确认".into());
+                }
+                let cc_switch_writer = field("route")? == "ccswitch";
+                if cc_switch_writer && !cc_switch_targets("desktop", &self.home)? {
+                    return Err("CC Switch 归属不可确认".into());
+                }
+                require_stopped_for_writer("desktop", &self.home, cc_switch_writer)?;
+                Ok(json!({"stopped":true}))
             }
             // This method exists only in the unit-test executable. It lets a
             // synthetic Desktop coordinator exercise the real transaction
@@ -2319,6 +2336,8 @@ mod tests {
             true
         );
         assert!(request(&mut second, 1, "handoff_acquire").await["error"].is_string());
+        assert!(request(&mut second, 3, "handoff_orchestra_desktop_stopped").await["error"].is_string());
+        assert_eq!(request(&mut first, 4, "handoff_orchestra_desktop_stopped").await["error"], "操作参数无效");
         {
             let mut locked = service.lock().await;
             assert!(locked.handle(json!({"method":"list"}), None).await.is_ok());

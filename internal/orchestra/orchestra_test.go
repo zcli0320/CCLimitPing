@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"syscall"
 	"testing"
@@ -172,6 +173,11 @@ func TestCodexTaskThenReworkResumesSession(t *testing.T) {
 	if !strings.Contains(lines[0], `sandbox_mode="workspace-write"`) {
 		t.Fatalf("sandbox flag missing: %q", lines[0])
 	}
+	for _, line := range []string{lines[0], last} {
+		if !strings.Contains(line, `model="gpt-6.1-terra"`) || !strings.Contains(line, `model_reasoning_effort="xhigh"`) {
+			t.Fatalf("model flags missing: %q", line)
+		}
+	}
 }
 
 func TestClaudeExecutor(t *testing.T) {
@@ -277,13 +283,103 @@ func TestSecondRunnerIsRefused(t *testing.T) {
 	}
 }
 
-func TestAntigravityIsReportedUnavailable(t *testing.T) {
+func TestAntigravityExecutor(t *testing.T) {
 	e := setup(t)
+	bin := filepath.Join(t.TempDir(), "agy")
+	script := `#!/bin/bash
+printf '%s\n' "$@" >> "$ARGS_LOG"
+[ -z "$(cat)" ] || exit 9
+printf '%s' '{"conversation_id":"agy-s1","status":"SUCCESS","response":"RECEIPT G1: done"}'
+`
+	if err := os.WriteFile(bin, []byte(script), 0700); err != nil {
+		t.Fatal(err)
+	}
+	agent := e.cfg.Agents["antigravity"]
+	agent.Bin = bin
+	e.cfg.Agents["antigravity"] = agent
 	runFor(t, e)
-	e.store.Dispatch(e.cfg, "claude", "antigravity", e.folder, "G1", "TASK G1")
+	if _, err := e.store.Dispatch(e.cfg, "claude", "antigravity", e.folder, "G1", "TASK G1"); err != nil {
+		t.Fatal(err)
+	}
 	task := waitDone(t, e, "G1")
-	if task.Status != Failed || !strings.Contains(task.LastReceipt(), "Antigravity") {
-		t.Fatalf("status=%s msg=%q", task.Status, task.LastReceipt())
+	if task.Status != Receipt || task.Session != "agy-s1" || task.LastReceipt() != "RECEIPT G1: done" {
+		t.Fatalf("task=%+v", task)
+	}
+	if _, err := e.store.RequestRework("G1", "again"); err != nil {
+		t.Fatal(err)
+	}
+	task = waitDone(t, e, "G1")
+	if task.Status != Receipt || len(task.Runs) != 2 {
+		t.Fatalf("rework=%+v", task)
+	}
+	log, err := os.ReadFile(e.args)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(log), "--conversation\nagy-s1\n") {
+		t.Fatalf("argv=%s", log)
+	}
+}
+
+func TestAntigravityPrepare(t *testing.T) {
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "agy")
+	if err := os.WriteFile(bin, []byte("#!/bin/sh\nexit 99\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	a := DefaultAgents(dir)["antigravity"]
+	prompt := "TASK G1: spaces 'quotes'\nand a newline --flag"
+	for _, session := range []string{"", "agy-s1"} {
+		t.Run("session="+session, func(t *testing.T) {
+			inv, err := a.prepare(dir, session, dir, prompt, "unused")
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := []string{bin, "--model", "gemini-4-argon-medium", "--mode", "accept-edits", "--settings", `{"permissions":{"allow":["command(*)"]}}`, "--output-format", "json"}
+			if session != "" {
+				want = append(want, "--conversation", session)
+			}
+			want = append(want, "-p", prompt)
+			if !reflect.DeepEqual(inv.Argv, want) || inv.Stdin != "" || inv.Dir != dir {
+				t.Fatalf("inv=%+v want argv=%q", inv, want)
+			}
+		})
+	}
+	if _, err := a.Resolve(t.TempDir()); err == nil {
+		t.Fatal("missing agy must fail resolution")
+	}
+}
+
+func TestAntigravityResult(t *testing.T) {
+	cases := []struct{ name, output, session, final, errorText string }{
+		{"success", `  {"conversation_id":"s1","status":"SUCCESS","response":"  done  "}  `, "s1", "done", ""},
+		{"leading noise", "startup\n" + `{"conversation_id":"s1","status":"SUCCESS","response":"done"}` + "\n", "s1", "done", ""},
+		{"last object", "noise\n{}\n" + `{"conversation_id":"s1","status":"SUCCESS","response":"done"}`, "s1", "done", ""},
+		{"failure", `{"conversation_id":"s1","status":"ERROR","response":"failed"}`, "s1", "", "Antigravity 报告错误：ERROR"},
+		{"denied", `{"conversation_id":"s1","status":"SUCCESS","response":"done","denied_actions":[{"action":"command","display_name":"RunCommand"},{"action":"edit"}]}`, "s1", "", "Antigravity 拒绝了操作：RunCommand、edit"},
+		{"empty", `{"conversation_id":"s1","status":"SUCCESS","response":"  "}`, "s1", "", "回复为空"},
+		{"missing response", `{"conversation_id":"s1","status":"SUCCESS"}`, "s1", "", "回复为空"},
+		{"garbage", "garbage", "", "", "不是预期的 JSON"},
+		{"malformed", "noise\n{broken", "", "", "不是预期的 JSON"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "stdout")
+			if err := os.WriteFile(path, []byte(c.output), 0600); err != nil {
+				t.Fatal(err)
+			}
+			session, final, err := (Agent{Name: "antigravity"}).result(path, "unused")
+			if session != c.session || final != c.final {
+				t.Fatalf("session=%q final=%q", session, final)
+			}
+			if c.errorText == "" {
+				if err != nil {
+					t.Fatal(err)
+				}
+			} else if err == nil || !strings.Contains(err.Error(), c.errorText) {
+				t.Fatalf("err=%v want=%q", err, c.errorText)
+			}
+		})
 	}
 }
 
