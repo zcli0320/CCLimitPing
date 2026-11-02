@@ -15,6 +15,13 @@ import (
 
 func checksFixture(t *testing.T, sandbox bool) env {
 	t.Helper()
+	if sandbox {
+		if _, err := os.Stat(bundledCodex); os.IsNotExist(err) {
+			t.Skip("bundled Codex sandbox unavailable on this host")
+		} else if err != nil {
+			t.Fatalf("cannot inspect bundled Codex sandbox: %v", err)
+		}
+	}
 	e := setup(t)
 	root, err := os.MkdirTemp(filepath.Dir(filepath.Dir(filepath.Dir(mustGetwd(t)))), "orc9-fixture-")
 	if err != nil {
