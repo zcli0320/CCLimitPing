@@ -1,5 +1,7 @@
 import Cocoa
 
+final class FlippedDocument: NSView { override var isFlipped: Bool { true } }
+
 // Shared visual building blocks. Semantic colors only, so both appearances
 // follow the system; drawing happens in draw(_:) and refreshes on change.
 enum Theme {
@@ -62,6 +64,141 @@ enum Theme {
         button.toolTip = label
         button.setAccessibilityLabel(label)
         return button
+    }
+
+    static func iconTextButton(_ title: String, symbol: String, primary: Bool = false, small: Bool = false,
+                               target: AnyObject?, action: Selector?) -> NSButton {
+        let btn = NSButton(title: title, target: target, action: action)
+        button(btn, small: small, primary: primary)
+        if let image = NSImage(systemSymbolName: symbol, accessibilityDescription: nil) {
+            btn.image = image
+            btn.imagePosition = .imageLeading
+        }
+        return btn
+    }
+
+    static func statusColor(for status: String) -> NSColor {
+        switch status {
+        case "accepted", "pass", "ready", "confirmed", "logged_in", "available":
+            return .systemGreen
+        case "running", "reviewing", "checking", "resuming", "watching", "window_running", "probe_verified":
+            return .systemBlue
+        case "queued", "receipt", "pending":
+            return .systemTeal
+        case "changes", "quota_exhausted", "uncertain", "unconfirmed", "needs_reapply":
+            return .systemOrange
+        case "failed", "error", "unavailable":
+            return .systemRed
+        default:
+            return .secondaryLabelColor
+        }
+    }
+}
+
+/// Interactive summary card used in the top overview bar for quick navigation and live status.
+final class QuickEntryCard: NSView {
+    private let iconView = NSImageView()
+    private let titleField = Theme.text("", size: 12, weight: .semibold, wraps: false)
+    private let badge = StatusChip("", tint: .secondaryLabelColor)
+    private let subtitleField = Theme.caption("")
+    private var tracking: NSTrackingArea?
+    private var hovered = false { didSet { needsDisplay = true } }
+    var isActiveCard = false { didSet { needsDisplay = true } }
+    var tint: NSColor { didSet { iconView.contentTintColor = tint; needsDisplay = true } }
+    var onClick: (() -> Void)?
+
+    init(title: String, symbol: String, tint: NSColor, subtitle: String, badgeText: String = "", onClick: (() -> Void)? = nil) {
+        self.tint = tint
+        self.onClick = onClick
+        super.init(frame: .zero)
+        iconView.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+        iconView.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 13, weight: .semibold)
+        iconView.contentTintColor = tint
+        iconView.setContentHuggingPriority(.required, for: .horizontal)
+        titleField.stringValue = title
+        titleField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        badge.text = badgeText
+        badge.tint = tint
+        subtitleField.stringValue = subtitle
+        subtitleField.maximumNumberOfLines = 1
+        subtitleField.lineBreakMode = .byTruncatingTail
+        let top = Theme.hstack([iconView, titleField, Theme.flexible(), badge], spacing: 6)
+        let stack = Theme.vstack([top, subtitleField], spacing: 4)
+        addSubview(stack); stack.translatesAutoresizingMaskIntoConstraints = false
+        top.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        subtitleField.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
+        NSLayoutConstraint.activate([
+            stack.topAnchor.constraint(equalTo: topAnchor, constant: 9),
+            stack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -9),
+            stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 11),
+            stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -11)
+        ])
+        setAccessibilityElement(true)
+        setAccessibilityRole(.button)
+        setAccessibilityLabel(title)
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
+
+    func update(subtitle: String, badgeText: String, tint: NSColor) {
+        self.tint = tint
+        subtitleField.stringValue = subtitle
+        subtitleField.toolTip = subtitle
+        badge.text = badgeText
+        badge.tint = tint
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking = tracking { removeTrackingArea(tracking) }
+        let area = NSTrackingArea(rect: bounds, options: [.mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect], owner: self, userInfo: nil)
+        addTrackingArea(area)
+        tracking = area
+    }
+    override var acceptsFirstResponder: Bool { true }
+    override var canBecomeKeyView: Bool { true }
+    override func becomeFirstResponder() -> Bool {
+        let ok = super.becomeFirstResponder()
+        needsDisplay = true
+        return ok
+    }
+    override func resignFirstResponder() -> Bool {
+        let ok = super.resignFirstResponder()
+        needsDisplay = true
+        return ok
+    }
+    override var focusRingMaskBounds: NSRect { bounds }
+    override func drawFocusRingMask() {
+        NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 8, yRadius: 8).fill()
+    }
+    override func mouseEntered(with event: NSEvent) { hovered = true }
+    override func mouseExited(with event: NSEvent) { hovered = false }
+    override func mouseDown(with event: NSEvent) {
+        window?.makeFirstResponder(self)
+        onClick?()
+    }
+    override func keyDown(with event: NSEvent) {
+        if event.keyCode == 49 || event.keyCode == 36 || event.keyCode == 76 || event.charactersIgnoringModifiers == " " || event.charactersIgnoringModifiers == "\r" || event.charactersIgnoringModifiers == "\u{03}" {
+            onClick?()
+        } else {
+            super.keyDown(with: event)
+        }
+    }
+    override func accessibilityPerformPress() -> Bool {
+        guard let onClick = onClick else { return false }
+        onClick()
+        return true
+    }
+
+    override func draw(_ dirtyRect: NSRect) {
+        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 0.5, dy: 0.5), xRadius: 8, yRadius: 8)
+        let bg: NSColor = isActiveCard
+            ? tint.withAlphaComponent(0.11)
+            : (hovered ? NSColor.controlBackgroundColor.blended(withFraction: 0.06, of: tint) ?? .controlBackgroundColor : .controlBackgroundColor)
+        bg.setFill(); path.fill()
+        let border: NSColor = isActiveCard ? tint.withAlphaComponent(0.65) : (hovered ? tint.withAlphaComponent(0.4) : NSColor.separatorColor.withAlphaComponent(0.5))
+        border.setStroke()
+        path.lineWidth = isActiveCard ? 1.0 : 0.5
+        path.stroke()
     }
 }
 

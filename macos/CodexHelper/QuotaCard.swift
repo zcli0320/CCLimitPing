@@ -59,7 +59,7 @@ final class QuotaCard: NSView {
         more.contentTintColor = .tertiaryLabelColor; more.toolTip = "额度查询时间、凭证来源与完整说明"
         more.setAccessibilityLabel("\(account.name) 额度详情")
         more.widthAnchor.constraint(equalToConstant: 18).isActive = true
-        let header = Theme.hstack([InitialAvatar(name: account.name, size: 22), name, badge, Theme.flexible(), more], spacing: 8)
+        let header = Theme.hstack([InitialAvatar(name: account.name, size: 26), name, badge, Theme.flexible(), more], spacing: 8)
         let body: NSView
         if let quota = account.quota, quota.status == "ready", !quota.windows.isEmpty {
             let windows = quota.windows.sorted { $0.seconds < $1.seconds }
@@ -67,9 +67,12 @@ final class QuotaCard: NSView {
             row.distribution = .fillEqually; row.alignment = .top; row.spacing = 20
             body = row
         } else {
-            let message = field(account.quota?.message ?? "正在读取剩余额度…", size: 11, color: .secondaryLabelColor)
+            let statusIcon = NSImageView(image: NSImage(systemSymbolName: "chart.bar.xaxis", accessibilityDescription: nil)!)
+            statusIcon.contentTintColor = .secondaryLabelColor
+            statusIcon.setContentHuggingPriority(.required, for: .horizontal)
+            let message = field(account.quota?.message ?? "正在读取剩余额度…", size: 11.5, color: .secondaryLabelColor)
             message.maximumNumberOfLines = 2; message.toolTip = message.stringValue
-            body = message
+            body = Theme.hstack([statusIcon, message], spacing: 6)
         }
         func scopeChip(_ scope: String, _ title: String) -> StatusChip {
             guard metadata != nil else {
@@ -94,24 +97,25 @@ final class QuotaCard: NSView {
                 button.setAccessibilityLabel("\(account.name) \(button.title)")
             }
             if desktopOwner != .native { desktop.toolTip = desktopOwner.blockedMessage }
-            actions = Theme.hstack([desktop, cli, Theme.flexible()], spacing: 8)
+            actions = Theme.hstack([scopes, desktop, cli], spacing: 8)
         } else {
             let authorize = Theme.button(NSButton(title: "前往授权管理", target: target, action: authorizeAction), small: true)
             authorize.isEnabled = metadata != nil
             authorize.setAccessibilityLabel("\(account.name) 前往授权管理")
-            actions = Theme.hstack([authorize, Theme.flexible()], spacing: 8)
+            actions = Theme.hstack([scopes, authorize], spacing: 8)
         }
-        let stack = NSStackView(views: [header, body, scopes, actions]); stack.orientation = .vertical
+        let divider = HairlineView()
+        let stack = NSStackView(views: [header, body, divider, actions]); stack.orientation = .vertical
         stack.alignment = .leading; stack.spacing = 10
         addSubview(stack); stack.translatesAutoresizingMaskIntoConstraints = false
-        for child in [header, body, scopes, actions] {
+        for child in [header, body, divider, actions] {
             child.translatesAutoresizingMaskIntoConstraints = false
             child.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true
         }
         NSLayoutConstraint.activate([
             stack.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14),
             stack.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14),
-            stack.topAnchor.constraint(equalTo: topAnchor, constant: 11),
+            stack.topAnchor.constraint(equalTo: topAnchor, constant: 12),
             stack.bottomAnchor.constraint(equalTo: bottomAnchor, constant: -12)
         ])
     }
@@ -143,7 +147,7 @@ final class QuotaCard: NSView {
         value.setAccessibilityLabel("\(window.title)剩余 \(window.remainingText)")
         let top = NSStackView(views: [title, Theme.flexible(), value]); top.orientation = .horizontal; top.alignment = .firstBaseline; top.spacing = 6
         let bar = RemainingQuotaBar(percent: percent, tint: tint)
-        bar.heightAnchor.constraint(equalToConstant: 4).isActive = true
+        bar.heightAnchor.constraint(equalToConstant: 6).isActive = true
         let reset = field(window.resetCaption, size: 10.5, color: .tertiaryLabelColor)
         reset.maximumNumberOfLines = 1; reset.lineBreakMode = .byTruncatingTail
         reset.toolTip = window.resetCaption

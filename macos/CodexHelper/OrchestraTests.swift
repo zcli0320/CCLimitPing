@@ -55,6 +55,14 @@ import Cocoa
         let instructions = orchestraConnectionInstructions(executable: URL(fileURLWithPath: "/tmp/a b/codex-helper"), stateDir: "/tmp/test state")
         precondition(instructions.contains("CODEX_HELPER_NATIVE_PREVIEW=1") && instructions.contains("CODEX_HELPER_NATIVE_PREVIEW = \"1\""))
         precondition(instructions.contains("CODEX_HELPER_ORCHESTRA_DIR='/tmp/test state'") && instructions.contains("CODEX_HELPER_ORCHESTRA_DIR = \"/tmp/test state\""), "Both clients must use the GUI's state root")
+        let fixedNow = Date(timeIntervalSince1970: 1_793_640_000)
+        precondition(resolveOrchestraTaskID(" custom-id ", project: "p1", now: fixedNow) == "custom-id")
+        let generated = resolveOrchestraTaskID("   ", project: "p1", now: fixedNow)
+        precondition(generated.hasPrefix("p1-") && generated.count <= 64, "Blank task ID must generate a valid project-prefixed ID")
+        let deduped = resolveOrchestraTaskID("", project: "p1", existingIDs: [generated], now: fixedNow)
+        precondition(deduped == generated + "-2", "Generated task ID must avoid collisions with existing tasks")
+        let noProjectID = resolveOrchestraTaskID("", project: nil, now: fixedNow)
+        precondition(noProjectID.hasPrefix("task-"), "Blank task ID without project must generate a valid task-prefixed ID")
         print("Orchestra JSON decoding and task action rules passed")
     }
 }

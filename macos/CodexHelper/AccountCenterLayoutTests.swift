@@ -1,7 +1,5 @@
 import Cocoa
 
-final class FlippedDocument: NSView { override var isFlipped: Bool { true } }
-
 @main
 enum AccountCenterLayoutTests {
     static func main() {

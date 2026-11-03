@@ -129,6 +129,51 @@ enum Tests {
         } catch BridgeError.outputLimit { }
         let output = try BridgeClient.read(executable: URL(fileURLWithPath: "/usr/bin/printf"), arguments: ["ok"])
         precondition(String(data: output, encoding: .utf8) == "ok")
+        var launchState = SelectionState()
+        launchState.addRecentLaunchFolder("/tmp/ask-each-time-a")
+        launchState.addRecentLaunchFolder("/tmp/ask-each-time-b")
+        precondition(launchState.launchFolder == nil && launchState.recentLaunchFolders == ["/tmp/ask-each-time-b", "/tmp/ask-each-time-a"],
+                     "Choosing a folder in ask-every-time mode must not pin a fixed launchFolder")
+        launchState.recordLaunchFolder("/tmp/project-a")
+        launchState.recordLaunchFolder("/tmp/project-b")
+        launchState.recordLaunchFolder("/tmp/project-a")
+        precondition(launchState.launchFolder == "/tmp/project-a" && launchState.recentLaunchFolders.prefix(2) == ["/tmp/project-a", "/tmp/project-b"])
+        try store.save(launchState)
+        precondition(store.load().launchFolder == "/tmp/project-a" && store.load().recentLaunchFolders.prefix(2) == ["/tmp/project-a", "/tmp/project-b"])
+        let codexScript = quickLaunchCommandScript(tool: .codex, folder: "/tmp/work dir")
+        precondition(codexScript.contains("codex-cli") && codexScript.contains("CODEX_HOME=\"$HOME/.codex-cli\""),
+                     "Quick launch for Codex CLI must use the isolated ~/.codex-cli identity")
+        precondition(codexScript.contains("--dangerously-bypass-approvals-and-sandbox") && codexScript.contains("-C '/tmp/work dir'"),
+                     "Codex quick launch must pass bypass approvals flag and quoted -C folder")
+        precondition(codexScript.contains("yolo 模式：已跳过权限确认") && codexScript.contains("exit_code=$?") && codexScript.contains("read -r _"),
+                     "Quick launch script must print header, exit code, and wait for Enter when missing")
+        let agyScript = quickLaunchCommandScript(tool: .agy, folder: "/tmp/work dir")
+        precondition(agyScript.contains("command -v agy") && agyScript.contains("cd '/tmp/work dir'"))
+        precondition(agyScript.contains("--dangerously-skip-permissions") && agyScript.contains("--add-dir '/tmp/work dir'"),
+                     "AGY quick launch must pass --dangerously-skip-permissions and quoted --add-dir")
+        precondition(!agyScript.contains(" --yolo"), "AGY CLI rejects literal --yolo flag")
+        let quotedFolder = "/tmp/it's dir"
+        for tool in [QuickLaunchTool.codex, QuickLaunchTool.agy] {
+            let script = quickLaunchCommandScript(tool: tool, folder: quotedFolder)
+            precondition(script.contains("cd '/tmp/it'\\''s dir' || exit 1"), "Folder with single quote must be shell-quoted")
+            let scriptFile = dir.appendingPathComponent("syntax-\(tool.id).command")
+            try Data(script.utf8).write(to: scriptFile)
+            _ = try BridgeClient.read(executable: URL(fileURLWithPath: "/bin/zsh"), arguments: ["-n", scriptFile.path])
+        }
+        let existingDir = dir.appendingPathComponent("existing-launch-folder")
+        try FileManager.default.createDirectory(at: existingDir, withIntermediateDirectories: true)
+        let missingDir = dir.appendingPathComponent("missing-launch-folder")
+        var pruneState = SelectionState()
+        pruneState.recordLaunchFolder(existingDir.path)
+        pruneState.recordLaunchFolder(missingDir.path)
+        let pruned = pruneState.pruneMissingLaunchFolders()
+        precondition(pruned == [missingDir.path] && pruneState.launchFolder == nil && pruneState.recentLaunchFolders == [existingDir.path],
+                     "Pruning must clear nonexistent pinned launchFolder and keep existing recent folders")
+        let defaultHome = URL(fileURLWithPath: "/Users/example")
+        precondition(resolveHelperStateDirectory(arguments: ["app", "--state-dir", "/tmp/explicit"], environment: ["CODEX_HELPER_TEST_HOME": "/tmp/test"], defaultHome: defaultHome).path == "/tmp/explicit")
+        precondition(resolveHelperStateDirectory(arguments: ["app"], environment: ["CODEX_HELPER_TEST_HOME": "/tmp/test-home"], defaultHome: defaultHome).path == "/tmp/test-home/Library/Application Support/CodexHelper-AccountPreview")
+        precondition(resolveHelperStateDirectory(arguments: ["app"], environment: ["CODEX_HELPER_NATIVE_ACCOUNTS_DIR": "/tmp/iso/accounts"], defaultHome: defaultHome).path == "/tmp/iso/ui-state")
+        precondition(resolveHelperStateDirectory(arguments: ["app"], environment: ["CODEX_HELPER_ORCHESTRA_DIR": "/tmp/iso/orchestra"], defaultHome: defaultHome).path == "/tmp/iso/ui-state")
         print("Selection, persistence and bridge checks passed")
     }
 }

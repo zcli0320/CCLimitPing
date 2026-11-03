@@ -7,7 +7,7 @@
 [English](README.md) | **中文**
 
 > 本 fork 的个人改造计划：[Codex 小助手：个人需求与实施计划](docs/personal-codex-assistant-plan.zh-CN.md)。
-> 当前个人版 **Codex 小助手 0.4.5 / build 37** 提供账号授权管理、额度与定时预热、Desktop／CLI 会话分区、按项目（工作群）组织的代理协作，以及为指定会话开启的续跑和切号。Desktop 切号前核验运行账号；由 CC Switch 管理 Desktop 时使用 CC Switch 切换。自然额度耗尽后的完整自动交接仍待实机验收。使用和构建方法见[小助手指南](docs/macos-helper.zh-CN.md)。
+> 当前个人版 **Codex 小助手 0.4.7 / build 39** 提供账号授权管理、额度与定时预热、Desktop／CLI 会话分区、按项目（工作群）组织的代理协作，以及为指定会话开启的续跑和切号。Desktop 切号前核验运行账号；由 CC Switch 管理 Desktop 时使用 CC Switch 切换。自然额度耗尽后的完整自动交接仍待实机验收。使用和构建方法见[小助手指南](docs/macos-helper.zh-CN.md)。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![CI](https://github.com/wavever/CCLimitPing/actions/workflows/ci.yml/badge.svg)](https://github.com/wavever/CCLimitPing/actions/workflows/ci.yml)

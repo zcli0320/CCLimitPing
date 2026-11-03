@@ -1,8 +1,6 @@
 import Cocoa
 import Foundation
 
-final class FlippedDocument: NSView { override var isFlipped: Bool { true } }
-
 @main
 enum AuthorizationFlowTests {
     static func wait(_ condition: () -> Bool) -> Bool {

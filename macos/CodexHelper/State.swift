@@ -315,9 +315,11 @@ struct SelectionState: Codable {
     var activeScope = "desktop"
     var selectedByScope: [String: String] = [:]
     var initializedScopes: [String] = []
+    var launchFolder: String?
+    var recentLaunchFolders: [String] = []
 
     init() {}
-    enum CodingKeys: String, CodingKey { case selectedKey, observing, expandedProjects, projectLayoutInitialized, activeScope, selectedByScope, initializedScopes }
+    enum CodingKeys: String, CodingKey { case selectedKey, observing, expandedProjects, projectLayoutInitialized, activeScope, selectedByScope, initializedScopes, launchFolder, recentLaunchFolders }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         selectedKey = try values.decodeIfPresent(String.self, forKey: .selectedKey)
@@ -328,6 +330,61 @@ struct SelectionState: Codable {
         activeScope = scope == "cli" ? "cli" : "desktop"
         selectedByScope = try values.decodeIfPresent([String: String].self, forKey: .selectedByScope) ?? [:]
         initializedScopes = try values.decodeIfPresent([String].self, forKey: .initializedScopes) ?? []
+        launchFolder = try values.decodeIfPresent(String.self, forKey: .launchFolder)
+        recentLaunchFolders = try values.decodeIfPresent([String].self, forKey: .recentLaunchFolders) ?? []
+    }
+
+    mutating func addRecentLaunchFolder(_ folder: String?) {
+        guard let raw = folder?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return }
+        let path = (raw as NSString).standardizingPath
+        recentLaunchFolders.removeAll { $0 == path }
+        recentLaunchFolders.insert(path, at: 0)
+        if recentLaunchFolders.count > 8 {
+            recentLaunchFolders = Array(recentLaunchFolders.prefix(8))
+        }
+    }
+
+    mutating func recordLaunchFolder(_ folder: String?) {
+        guard let raw = folder?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else {
+            launchFolder = nil
+            return
+        }
+        let path = (raw as NSString).standardizingPath
+        launchFolder = path
+        addRecentLaunchFolder(path)
+    }
+
+    mutating func removeLaunchFolder(_ folder: String) {
+        let path = (folder as NSString).standardizingPath
+        if let current = launchFolder, (current as NSString).standardizingPath == path || current == folder {
+            launchFolder = nil
+        }
+        recentLaunchFolders.removeAll { ($0 as NSString).standardizingPath == path || $0 == folder }
+    }
+
+    @discardableResult
+    mutating func pruneMissingLaunchFolders(exists: (String) -> Bool = isExistingDirectory) -> [String] {
+        var removed: [String] = []
+        if let current = launchFolder {
+            let path = (current as NSString).standardizingPath
+            if !exists(path) {
+                launchFolder = nil
+                removed.append(path)
+            } else {
+                launchFolder = path
+            }
+        }
+        var kept: [String] = []
+        for item in recentLaunchFolders {
+            let path = (item as NSString).standardizingPath
+            if exists(path) {
+                if !kept.contains(path) { kept.append(path) }
+            } else if !removed.contains(path) {
+                removed.append(path)
+            }
+        }
+        recentLaunchFolders = kept
+        return removed
     }
 
     mutating func select(_ key: String?) {
@@ -432,4 +489,168 @@ struct ResumeReport: Decodable {
     let key: String
     let status: String
     let message: String
+}
+
+func isExistingDirectory(_ path: String) -> Bool {
+    var isDir: ObjCBool = false
+    return FileManager.default.fileExists(atPath: path, isDirectory: &isDir) && isDir.boolValue
+}
+
+func shellSingleQuote(_ value: String) -> String {
+    "'" + value.replacingOccurrences(of: "'", with: "'\\''") + "'"
+}
+
+struct QuickLaunchCandidate {
+    enum Executable {
+        case command(String)
+        case absolutePath(String)
+    }
+    let executable: Executable
+    let envPrefix: String?
+    let baseArgs: [String]
+
+    init(command: String, envPrefix: String? = nil, baseArgs: [String] = []) {
+        self.executable = .command(command)
+        self.envPrefix = envPrefix
+        self.baseArgs = baseArgs
+    }
+
+    init(absolutePath: String, envPrefix: String? = nil, baseArgs: [String] = []) {
+        self.executable = .absolutePath(absolutePath)
+        self.envPrefix = envPrefix
+        self.baseArgs = baseArgs
+    }
+
+    var conditionShell: String {
+        switch executable {
+        case .command(let cmd):
+            return "command -v \(cmd) >/dev/null 2>&1"
+        case .absolutePath(let path):
+            return "[ -x \"\(path)\" ]"
+        }
+    }
+
+    var executableShell: String {
+        switch executable {
+        case .command(let cmd):
+            return cmd
+        case .absolutePath(let path):
+            return "\"\(path)\""
+        }
+    }
+
+    var displayName: String {
+        switch executable {
+        case .command(let cmd):
+            return cmd
+        case .absolutePath(let path):
+            return path
+        }
+    }
+}
+
+struct QuickLaunchTool {
+    let id: String
+    let label: String
+    let symbolName: String
+    let candidates: [QuickLaunchCandidate]
+    let yoloArgs: [String]
+    let folderArgs: (String) -> [String]
+
+    var buttonTitle: String { "启动 \(label)" }
+    var buttonToolTip: String { "在终端以 yolo 模式（跳过权限确认）启动 \(label)" }
+
+    static let codex = QuickLaunchTool(
+        id: "codex",
+        label: "Codex CLI",
+        symbolName: "terminal.fill",
+        candidates: [
+            QuickLaunchCandidate(command: "codex-cli"),
+            QuickLaunchCandidate(
+                command: "codex",
+                envPrefix: "CODEX_HOME=\"$HOME/.codex-cli\"",
+                baseArgs: ["-c", "'cli_auth_credentials_store=\"file\"'"]
+            ),
+            QuickLaunchCandidate(
+                absolutePath: "/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex",
+                envPrefix: "CODEX_HOME=\"$HOME/.codex-cli\"",
+                baseArgs: ["-c", "'cli_auth_credentials_store=\"file\"'"]
+            )
+        ],
+        yoloArgs: ["--dangerously-bypass-approvals-and-sandbox"],
+        folderArgs: { folder in ["-C", shellSingleQuote(folder)] }
+    )
+
+    static let agy = QuickLaunchTool(
+        id: "agy",
+        label: "AGY CLI",
+        symbolName: "sparkles",
+        candidates: [
+            QuickLaunchCandidate(command: "agy")
+        ],
+        yoloArgs: ["--dangerously-skip-permissions"],
+        folderArgs: { folder in ["--add-dir", shellSingleQuote(folder)] }
+    )
+}
+
+func quickLaunchCommandScript(tool: QuickLaunchTool, folder: String) -> String {
+    let quotedFolder = shellSingleQuote(folder)
+    let header = shellSingleQuote("[\(tool.label)] 工作目录：\(folder)（yolo 模式：已跳过权限确认）")
+    var branches: [String] = []
+    for (index, candidate) in tool.candidates.enumerated() {
+        let keyword = index == 0 ? "if" : "elif"
+        var parts: [String] = []
+        if let env = candidate.envPrefix, !env.isEmpty {
+            parts.append(env)
+        }
+        parts.append(candidate.executableShell)
+        parts.append(contentsOf: candidate.baseArgs)
+        parts.append(contentsOf: tool.yoloArgs)
+        parts.append(contentsOf: tool.folderArgs(folder))
+        let invocation = parts.joined(separator: " ")
+        branches.append("""
+        \(keyword) \(candidate.conditionShell); then
+          \(invocation)
+          exit_code=$?
+          printf '%s\\n' "[\(tool.label)] 已退出（退出码：$exit_code）"
+        """)
+    }
+    let checkedList = tool.candidates.map(\.displayName).joined(separator: ", ")
+    let missingMessage = shellSingleQuote("未找到 \(tool.label) 可执行文件（已检查：\(checkedList)），请检查安装或 PATH 配置。")
+    branches.append("""
+    else
+      printf '%s\\n' \(missingMessage)
+      printf '当前搜索 PATH：%s\\n' "$PATH"
+      printf '%s' '按回车键进入交互终端…'
+      read -r _
+    fi
+    """)
+    let runBlock = branches.joined(separator: "\n")
+    return """
+    #!/bin/zsh -l
+    export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/.antigravity/bin:$PATH"
+    cd \(quotedFolder) || exit 1
+    printf '%s\\n' \(header)
+    \(runBlock)
+    exec /bin/zsh -i
+    """ + "\n"
+}
+
+func resolveHelperStateDirectory(arguments: [String], environment: [String: String], defaultHome: URL = FileManager.default.homeDirectoryForCurrentUser) -> URL {
+    if let index = arguments.firstIndex(of: "--state-dir"), index + 1 < arguments.count, !arguments[index + 1].isEmpty {
+        return URL(fileURLWithPath: arguments[index + 1])
+    }
+    if let explicit = environment["CODEX_HELPER_STATE_DIR"], !explicit.isEmpty {
+        return URL(fileURLWithPath: explicit)
+    }
+    if let testHome = environment["CODEX_HELPER_TEST_HOME"], !testHome.isEmpty {
+        return URL(fileURLWithPath: testHome).appendingPathComponent("Library/Application Support/CodexHelper-AccountPreview")
+    }
+    if let accountsDir = environment["CODEX_HELPER_NATIVE_ACCOUNTS_DIR"], !accountsDir.isEmpty {
+        return URL(fileURLWithPath: accountsDir).deletingLastPathComponent().appendingPathComponent("ui-state")
+    }
+    if let orchestraDir = environment["CODEX_HELPER_ORCHESTRA_DIR"], !orchestraDir.isEmpty {
+        return URL(fileURLWithPath: orchestraDir).deletingLastPathComponent().appendingPathComponent("ui-state")
+    }
+    return defaultHome.appendingPathComponent("Library/Application Support/CodexHelper-AccountPreview")
 }

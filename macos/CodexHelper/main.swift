@@ -2,7 +2,6 @@ import Cocoa
 import ServiceManagement
 import Darwin
 
-final class FlippedDocument: NSView { override var isFlipped: Bool { true } }
 final class ProjectItem: NSObject {
     var group: SessionProject
     var children: [SessionItem] = []
@@ -28,6 +27,23 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
     var orchestraCenter: OrchestraWindowController?
     var accountClient: AccountCenterClient?
     let accountStack = NSStackView()
+    let accountCountChip = StatusChip("", tint: .secondaryLabelColor)
+    let warmupStatusChip = StatusChip("未开启", tint: .secondaryLabelColor)
+    let handoffStatusChip = StatusChip("待命", tint: .secondaryLabelColor)
+    var accountOverviewCard: QuickEntryCard!
+    var warmupOverviewCard: QuickEntryCard!
+    var sessionOverviewCard: QuickEntryCard!
+    var orchestraOverviewCard: QuickEntryCard!
+    var accountsSectionAnchor: NSView!
+    var warmupSectionAnchor: NSView!
+    var sessionsSectionAnchor: NSView!
+    var handoffSectionAnchor: NSView!
+    let quickLaunchFolderPopup = NSPopUpButton(frame: .zero, pullsDown: false)
+    let quickLaunchChooseButton = NSButton(title: "选择文件夹…", target: nil, action: nil)
+    let quickLaunchCodexButton = NSButton(title: QuickLaunchTool.codex.buttonTitle, target: nil, action: nil)
+    let quickLaunchAgyButton = NSButton(title: QuickLaunchTool.agy.buttonTitle, target: nil, action: nil)
+    let quickLaunchStatus = NSTextField(wrappingLabelWithString: "选择文件夹后可在终端直接进入该目录以 yolo 模式启动 \(QuickLaunchTool.codex.label) 或 \(QuickLaunchTool.agy.label)。")
+    var quickLaunchFolders: [String] = []
     let accountActionNotice = NSTextField(wrappingLabelWithString: "")
     var accountMetadata: [String: [String: Any]] = [:]
     var accountMetadataReadable = false
@@ -187,11 +203,11 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editItem.submenu = editMenu; mainMenu.addItem(editItem); NSApp.mainMenu = mainMenu
 
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 680, height: 760),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 740, height: 820),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "Codex 小助手"
         window.titleVisibility = .hidden
-        window.minSize = NSSize(width: 580, height: 520)
+        window.minSize = NSSize(width: 620, height: 560)
         window.delegate = self
         window.isReleasedWhenClosed = false
         window.titlebarAppearsTransparent = true
@@ -213,49 +229,101 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
                                      stack.trailingAnchor.constraint(equalTo: document.trailingAnchor, constant: -Theme.pagePadding)])
         func gap(after view: NSView) { stack.setCustomSpacing(Theme.sectionSpacing, after: view) }
 
-        // Header: identity, data freshness and the two global actions.
+        // Header: identity, data freshness and the global actions.
         let appIcon = Bundle.main.url(forResource: "CodexHelper", withExtension: "icns").flatMap { NSImage(contentsOf: $0) }
             ?? NSImage(systemSymbolName: "person.2.badge.gearshape", accessibilityDescription: nil)!
         let icon = NSImageView(image: appIcon)
         icon.imageScaling = .scaleProportionallyUpOrDown
         icon.setAccessibilityLabel("Codex 小助手")
-        icon.widthAnchor.constraint(equalToConstant: 40).isActive = true
-        icon.heightAnchor.constraint(equalToConstant: 40).isActive = true
+        icon.widthAnchor.constraint(equalToConstant: 42).isActive = true
+        icon.heightAnchor.constraint(equalToConstant: 42).isActive = true
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "开发版"
         let versionLabel = cliHandoffAvailable ? version : version + " · 验收中"
-        let title = Theme.text("账号与会话", size: 20, weight: .bold, wraps: false)
-        let titleRow = Theme.hstack([title, StatusChip("v" + versionLabel, tint: .secondaryLabelColor)], spacing: 8)
+        let title = Theme.text("Codex 小助手", size: 20, weight: .bold, wraps: false)
+        let subtitleTag = StatusChip("账号 · 会话 · 协作", tint: .systemBlue)
+        let titleRow = Theme.hstack([title, StatusChip("v" + versionLabel, tint: .secondaryLabelColor), subtitleTag], spacing: 6)
         status.font = .systemFont(ofSize: 11); status.textColor = .secondaryLabelColor
         status.maximumNumberOfLines = 2
-        let heading = Theme.vstack([titleRow, status], spacing: 2)
+        let heading = Theme.vstack([titleRow, status], spacing: 3)
         status.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         heading.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
-        let openSwitch = Theme.button(NSButton(title: "授权管理", target: self, action: #selector(openNativeAccountCenter)), primary: true)
-        openSwitch.image = NSImage(systemSymbolName: "person.crop.circle.badge.plus", accessibilityDescription: nil)
-        openSwitch.imagePosition = .imageLeading
+        let openSwitch = Theme.iconTextButton("授权管理", symbol: "person.crop.circle.badge.plus", primary: true, target: self, action: #selector(openNativeAccountCenter))
         refresh.target = self; refresh.action = #selector(refreshNow); refresh.bezelStyle = .rounded
-        let collaboration = Theme.button(NSButton(title: "协作", target: self, action: #selector(openOrchestra)))
-        let header = Theme.hstack([icon, heading, Theme.flexible(), collaboration, openSwitch, refresh], spacing: 12)
-        add(header, to: stack); gap(after: header)
+        refresh.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)
+        refresh.imagePosition = .imageLeading
+        let collaboration = Theme.iconTextButton("代理协作", symbol: "person.3.sequence.fill", target: self, action: #selector(openOrchestra))
+        let header = Theme.hstack([icon, heading, Theme.flexible(), collaboration, openSwitch, refresh], spacing: 10)
+        add(header, to: stack)
+
+        // Overview Dashboard Bar: quick status and one-click navigation.
+        accountOverviewCard = QuickEntryCard(title: "账号额度", symbol: "person.2.fill", tint: .systemBlue, subtitle: "正在读取账号…", badgeText: "待读取") { [weak self] in
+            self?.scrollToSection(self?.accountsSectionAnchor)
+        }
+        warmupOverviewCard = QuickEntryCard(title: "自动预热", symbol: "flame.fill", tint: .secondaryLabelColor, subtitle: "等待读取预热策略", badgeText: "未开启") { [weak self] in
+            self?.scrollToSection(self?.warmupSectionAnchor)
+        }
+        sessionOverviewCard = QuickEntryCard(title: "会话与切号", symbol: "arrow.triangle.2.circlepath.circle.fill", tint: .systemTeal, subtitle: "选择会话可观察或续跑", badgeText: "待命") { [weak self] in
+            self?.scrollToSection(self?.sessionsSectionAnchor)
+        }
+        orchestraOverviewCard = QuickEntryCard(title: "多代理协作", symbol: "cpu.fill", tint: .systemIndigo, subtitle: "工作群派活与自动审查", badgeText: "打开") { [weak self] in
+            self?.openOrchestra()
+        }
+        let overviewGrid = NSStackView(views: [accountOverviewCard, warmupOverviewCard, sessionOverviewCard, orchestraOverviewCard])
+        overviewGrid.orientation = .horizontal
+        overviewGrid.distribution = .fillEqually
+        overviewGrid.alignment = .centerY
+        overviewGrid.spacing = 10
+        for card in [accountOverviewCard!, warmupOverviewCard!, sessionOverviewCard!, orchestraOverviewCard!] {
+            card.heightAnchor.constraint(equalToConstant: 56).isActive = true
+        }
+        add(overviewGrid, to: stack); gap(after: overviewGrid)
+
+        // Quick Terminal CLI Launcher (Codex CLI & AGY CLI).
+        let quickLaunchTitle = Theme.sectionTitle("终端快捷启动", accessories: [StatusChip("\(QuickLaunchTool.codex.label) · \(QuickLaunchTool.agy.label)", tint: .systemIndigo)])
+        add(quickLaunchTitle, to: stack)
+        let quickLaunchBox = SectionBox(spacing: 8)
+        let quickFolderIcon = NSImageView(image: NSImage(systemSymbolName: "folder.fill", accessibilityDescription: "工作目录")!)
+        quickFolderIcon.contentTintColor = .systemBlue
+        quickFolderIcon.setContentHuggingPriority(.required, for: .horizontal)
+        quickLaunchFolderPopup.target = self; quickLaunchFolderPopup.action = #selector(quickLaunchFolderChanged)
+        quickLaunchFolderPopup.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        quickLaunchFolderPopup.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        quickLaunchChooseButton.target = self; quickLaunchChooseButton.action = #selector(chooseQuickLaunchFolder)
+        Theme.button(quickLaunchChooseButton, small: true)
+        quickLaunchChooseButton.image = NSImage(systemSymbolName: "folder.badge.plus", accessibilityDescription: nil)
+        quickLaunchChooseButton.imagePosition = .imageLeading
+        configureQuickLaunchButton(quickLaunchCodexButton, tool: .codex, primary: true, action: #selector(launchQuickCodexCLI))
+        configureQuickLaunchButton(quickLaunchAgyButton, tool: .agy, primary: false, action: #selector(launchQuickAgyCLI))
+        quickLaunchBox.add(Theme.hstack([quickFolderIcon, quickLaunchFolderPopup, quickLaunchChooseButton, quickLaunchCodexButton, quickLaunchAgyButton], spacing: 8))
+        quickLaunchStatus.font = .systemFont(ofSize: 11); quickLaunchStatus.textColor = .secondaryLabelColor
+        quickLaunchStatus.maximumNumberOfLines = 2
+        quickLaunchBox.add(quickLaunchStatus)
+        add(quickLaunchBox, to: stack); gap(after: quickLaunchBox)
+        updateQuickLaunchFolders()
 
         // Accounts, per-client state, and explicit manual switching.
-        let accountsTitle = Theme.sectionTitle("账号管理")
+        let manageLink = Theme.iconTextButton("添加 / 管理授权", symbol: "key.fill", small: true, target: self, action: #selector(openNativeAccountCenter))
+        let accountsTitle = Theme.sectionTitle("账号与额度管理", accessories: [accountCountChip, manageLink])
+        accountsSectionAnchor = accountsTitle
         add(accountsTitle, to: stack)
         let accountHint = Theme.caption("Desktop 由 CC Switch 管理时请在 CC Switch 中切换；其他切换前请退出目标客户端及其后端。")
         accountHint.maximumNumberOfLines = 3
         add(accountHint, to: stack)
-        accountActionNotice.font = .systemFont(ofSize: 11)
+        accountActionNotice.font = .systemFont(ofSize: 11, weight: .medium)
         accountActionNotice.textColor = .systemOrange
         accountActionNotice.maximumNumberOfLines = 4
         accountActionNotice.isHidden = true
         add(accountActionNotice, to: stack)
-        accountStack.orientation = .vertical; accountStack.alignment = .leading; accountStack.spacing = 8
+        accountStack.orientation = .vertical; accountStack.alignment = .leading; accountStack.spacing = 10
         add(accountStack, to: stack); gap(after: accountStack)
 
         // Warmup.
-        add(Theme.sectionTitle("自动预热"), to: stack)
+        let warmupTitle = Theme.sectionTitle("自动预热", accessories: [warmupStatusChip])
+        warmupSectionAnchor = warmupTitle
+        add(warmupTitle, to: stack)
         let warmupBox = SectionBox()
         warmup = NSButton(checkboxWithTitle: "自动预热五小时窗口", target: self, action: #selector(toggleWarmup))
+        warmup.font = .systemFont(ofSize: 12.5, weight: .medium)
         warmup.isEnabled = false
         warmupCheck.target = self; warmupCheck.action = #selector(checkWarmupNow)
         Theme.button(warmupCheck, small: true)
@@ -280,13 +348,17 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         scheduleLabel.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
         scheduleButton.target = self; scheduleButton.action = #selector(editWarmupSchedule)
         Theme.button(scheduleButton, small: true)
+        scheduleButton.image = NSImage(systemSymbolName: "calendar.badge.clock", accessibilityDescription: nil)
+        scheduleButton.imagePosition = .imageLeading
         let clock = NSImageView(image: NSImage(systemSymbolName: "clock", accessibilityDescription: nil)!)
         clock.contentTintColor = .secondaryLabelColor
         warmupBox.add(Theme.hstack([clock, scheduleLabel, Theme.flexible(), scheduleButton], spacing: 6))
         add(warmupBox, to: stack); gap(after: warmupBox)
 
         // Session browser.
-        add(Theme.sectionTitle("会话", accessories: [countLabel]), to: stack)
+        let sessionsTitle = Theme.sectionTitle("本机会话浏览", accessories: [countLabel])
+        sessionsSectionAnchor = sessionsTitle
+        add(sessionsTitle, to: stack)
         countLabel.font = .systemFont(ofSize: 11); countLabel.textColor = .secondaryLabelColor
         let sessionBox = SectionBox(spacing: 8)
         sourceTabs.target = self; sourceTabs.action = #selector(changeSource)
@@ -309,7 +381,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         table.autoresizesOutlineColumn = false
         table.delegate = self; table.dataSource = self; table.rowHeight = 28
         table.style = .plain; table.intercellSpacing = NSSize(width: 6, height: 2)
-        table.usesAlternatingRowBackgroundColors = false; table.allowsEmptySelection = true
+        table.usesAlternatingRowBackgroundColors = true; table.allowsEmptySelection = true
         table.backgroundColor = .controlBackgroundColor
         table.headerView = nil; table.floatsGroupRows = false
         table.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
@@ -326,7 +398,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         add(sessionBox, to: stack); gap(after: sessionBox)
 
         // The selected session: observation and same-account resume.
-        add(Theme.sectionTitle("所选会话"), to: stack)
+        add(Theme.sectionTitle("所选会话 · 观察与同号续跑"), to: stack)
         let selectedBox = SectionBox()
         selection.font = .systemFont(ofSize: 13, weight: .semibold); selection.maximumNumberOfLines = 2
         detail.font = .systemFont(ofSize: 11); detail.textColor = .secondaryLabelColor; detail.maximumNumberOfLines = 3
@@ -335,26 +407,35 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         selectionHint.font = .systemFont(ofSize: 11); selectionHint.textColor = .systemOrange
         selectedBox.add(selectionHint); selectionHint.isHidden = true
         observe.target = self; observe.action = #selector(toggleObservation); Theme.button(observe, small: true)
+        observe.image = NSImage(systemSymbolName: "eye", accessibilityDescription: nil); observe.imagePosition = .imageLeading
         observe.isEnabled = false
         clearSelection.target = self; clearSelection.action = #selector(clearTarget); Theme.button(clearSelection, small: true)
+        clearSelection.image = NSImage(systemSymbolName: "xmark.circle", accessibilityDescription: nil); clearSelection.imagePosition = .imageLeading
         clearSelection.isEnabled = false
         selectedBox.add(Theme.hstack([label("仅观察本机记录，不会切号或发送消息", size: 11), Theme.flexible(), clearSelection, observe]))
         selectedBox.addDivider()
         resumeToggle.target = self; resumeToggle.action = #selector(toggleResume)
+        resumeToggle.font = .systemFont(ofSize: 12, weight: .medium)
         cliResume.target = self; cliResume.action = #selector(openManagedCLI); Theme.button(cliResume, small: true)
+        cliResume.image = NSImage(systemSymbolName: "terminal", accessibilityDescription: nil); cliResume.imagePosition = .imageLeading
         selectedBox.add(Theme.hstack([resumeToggle, Theme.flexible(), cliResume]))
         resumeStatus.font = .systemFont(ofSize: 11); resumeStatus.textColor = .secondaryLabelColor
         selectedBox.add(resumeStatus)
         add(selectedBox, to: stack); gap(after: selectedBox)
 
         // Automatic account handoff for the selected session.
-        add(Theme.sectionTitle("自动切号"), to: stack)
+        let handoffTitle = Theme.sectionTitle("自动切号交接", accessories: [handoffStatusChip])
+        handoffSectionAnchor = handoffTitle
+        add(handoffTitle, to: stack)
         let handoffBox = SectionBox()
         handoffThreshold.alignment = .right
         handoffThreshold.widthAnchor.constraint(equalToConstant: 44).isActive = true
         handoffPreflight.target = self; handoffPreflight.action = #selector(checkHandoffPreflight); Theme.button(handoffPreflight, small: true)
+        handoffPreflight.image = NSImage(systemSymbolName: "checkmark.shield", accessibilityDescription: nil); handoffPreflight.imagePosition = .imageLeading
         handoffStart.target = self; handoffStart.action = #selector(startCLIHandoff); Theme.button(handoffStart, primary: true)
+        handoffStart.image = NSImage(systemSymbolName: "arrow.triangle.2.circlepath", accessibilityDescription: nil); handoffStart.imagePosition = .imageLeading
         handoffStop.target = self; handoffStop.action = #selector(stopHandoff); Theme.button(handoffStop)
+        handoffStop.image = NSImage(systemSymbolName: "stop.circle", accessibilityDescription: nil); handoffStop.imagePosition = .imageLeading
         handoffAcknowledge.target = self; handoffAcknowledge.action = #selector(acknowledgeHandoff); Theme.button(handoffAcknowledge)
         handoffBox.add(Theme.hstack([label("五小时剩余额度低于", size: 12, color: .labelColor), handoffThreshold, label("% 时切换", size: 12, color: .labelColor), Theme.flexible(), handoffPreflight], spacing: 6))
         handoffStatus.font = .systemFont(ofSize: 11); handoffStatus.textColor = .secondaryLabelColor
@@ -372,6 +453,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         handoffBox.add(handoffDetails)
         handoffBox.addDivider()
         runtimeLaunch.target = self; runtimeLaunch.action = #selector(openDesktopWithRuntimeBridge); Theme.button(runtimeLaunch)
+        runtimeLaunch.image = NSImage(systemSymbolName: "desktopcomputer", accessibilityDescription: nil); runtimeLaunch.imagePosition = .imageLeading
         runtimeLaunch.toolTip = "请先正常退出 Desktop；打开后可独立核对运行账号。"
         handoffBox.add(Theme.hstack([handoffStart, handoffStop, handoffAcknowledge, Theme.flexible(), runtimeLaunch]))
         handoffRunStatus.font = .systemFont(ofSize: 11); handoffRunStatus.textColor = .secondaryLabelColor
@@ -399,7 +481,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         feedback.font = .systemFont(ofSize: 11); feedback.textColor = .secondaryLabelColor
         feedback.maximumNumberOfLines = 2
         if let visible = NSScreen.main?.visibleFrame {
-            window.setContentSize(NSSize(width: min(680, visible.width - 40), height: min(800, visible.height - 60)))
+            window.setContentSize(NSSize(width: min(740, visible.width - 40), height: min(860, visible.height - 60)))
         }
         loginItem.target = self; loginItem.action = #selector(toggleLoginItem)
         loginStatus.font = .systemFont(ofSize: 11); loginStatus.textColor = .secondaryLabelColor
@@ -462,6 +544,18 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         document.layoutSubtreeIfNeeded()
         let height = max(outerScroll.contentSize.height, contentStack.fittingSize.height + 36)
         document.setFrameSize(NSSize(width: outerScroll.contentSize.width, height: height))
+    }
+
+    func scrollToSection(_ targetView: NSView?) {
+        guard let targetView = targetView, let clip = outerScroll.contentView as NSClipView? else { return }
+        document.layoutSubtreeIfNeeded()
+        let point = document.convert(NSPoint(x: 0, y: max(0, targetView.frame.minY - 12)), from: contentStack)
+        let constrained = clip.constrainBoundsRect(NSRect(origin: point, size: clip.bounds.size)).origin
+        NSAnimationContext.runAnimationGroup { context in
+            context.duration = 0.2
+            clip.animator().setBoundsOrigin(constrained)
+        }
+        outerScroll.reflectScrolledClipView(clip)
     }
 
     @objc func toggleAutomationDetails() {
@@ -745,6 +839,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         status.stringValue = "\(prefix) · \(captured.map { DateFormatter.localizedString(from: $0, dateStyle: .none, timeStyle: .short) } ?? "刚刚") 更新\(warnings.first.map { "\n" + $0 } ?? " · 额度每 2 分钟自动更新")"
         warmup.toolTip = snapshot.capabilities["account_warmup"]?.reason
         handoff.toolTip = snapshot.capabilities["desktop_handoff"]?.reason
+        updateQuickLaunchFolders()
         applyFilter(preserveScroll: preserveScroll)
         feedback.stringValue = warnings.isEmpty ? backgroundStatusCaption() : "\(warnings.count) 条读取提示，可在「接入说明」中查看。"
         layoutDocument()
@@ -752,7 +847,20 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
 
     func renderAccountCards() {
         for view in accountStack.arrangedSubviews { accountStack.removeArrangedSubview(view); view.removeFromSuperview() }
-        guard let snapshot = snapshot else { layoutDocument(); return }
+        guard let snapshot = snapshot else {
+            accountCountChip.text = ""
+            accountOverviewCard?.update(subtitle: readError ?? "正在读取本机账号…", badgeText: "读取中", tint: .secondaryLabelColor)
+            layoutDocument(); return
+        }
+        let total = snapshot.accounts.count
+        accountCountChip.text = total == 0 ? "未添加" : "\(total) 个账号"
+        accountCountChip.tint = total == 0 ? .systemOrange : .systemBlue
+        let readyCount = snapshot.accounts.filter { $0.quota?.status == "ready" }.count
+        accountOverviewCard?.update(
+            subtitle: total == 0 ? "点击前往授权管理添加账号" : "已同步 \(total) 个账号 · \(readyCount) 个额度可读",
+            badgeText: total == 0 ? "未配置" : "\(total) 个",
+            tint: total == 0 ? .systemOrange : .systemBlue
+        )
         for (index, account) in snapshot.accounts.enumerated() {
             let metadata = accountMetadataReadable ? accountMetadata[account.id] : nil
             add(QuotaCard(account: account, index: index, metadata: metadata,
@@ -761,7 +869,17 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
                           target: self, detailAction: #selector(showAccountQuotaDetails(_:)),
                           applyAction: #selector(applyAccountFromMain(_:)), authorizeAction: #selector(openNativeAccountCenter)), to: accountStack)
         }
-        if snapshot.accounts.isEmpty { add(label("尚未添加账号，请前往“授权管理”登录。"), to: accountStack) }
+        if snapshot.accounts.isEmpty {
+            let emptyBox = SectionBox(spacing: 8)
+            let emptyIcon = NSImageView(image: NSImage(systemSymbolName: "person.crop.circle.badge.plus", accessibilityDescription: nil)!)
+            emptyIcon.contentTintColor = .secondaryLabelColor
+            emptyIcon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 22, weight: .regular)
+            let emptyTitle = Theme.text("尚未添加账号", size: 13, weight: .semibold, wraps: false)
+            let emptyDesc = Theme.caption("在「授权管理」中登录账号后，即可查看 5 小时与周额度、绑定客户端或开启自动预热。")
+            let openAuth = Theme.iconTextButton("前往授权管理", symbol: "person.crop.circle.badge.plus", primary: true, small: true, target: self, action: #selector(openNativeAccountCenter))
+            emptyBox.add(Theme.hstack([emptyIcon, Theme.vstack([emptyTitle, emptyDesc], spacing: 2), Theme.flexible(), openAuth], spacing: 10))
+            add(emptyBox, to: accountStack)
+        }
         layoutDocument()
     }
 
@@ -776,6 +894,14 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         let stateColor: NSColor = !enabled ? .secondaryLabelColor : ((needsAttention || report?.schedule_allowed == false) ? .systemOrange : (allWindowsVerified ? .systemGreen : .systemBlue))
         warmupStateIcon.contentTintColor = stateColor
         warmupHeadline.textColor = stateColor
+        warmupStatusChip.text = !enabled ? "已关闭" : (needsAttention ? "需关注" : (allWindowsVerified ? "窗口运行中" : (report?.schedule_allowed == false ? "时段外" : "监控中")))
+        warmupStatusChip.tint = stateColor
+        warmupOverviewCard?.isActiveCard = enabled
+        warmupOverviewCard?.update(
+            subtitle: headline,
+            badgeText: warmupStatusChip.text,
+            tint: enabled ? stateColor : .secondaryLabelColor
+        )
         warmupStatus.stringValue = report?.details ?? "正在读取自动预热策略与账号状态。"
         warmup.state = enabled ? .on : .off
         warmup.isEnabled = !warmupControlBusy && (enabled || warmupReport?.available == true) && fixture == nil
@@ -1316,6 +1442,14 @@ extension Assistant {
         else if !cliHandoffAvailable { handoffRunStatus.stringValue = "CLI 切号的真实服务验收尚未通过，暂不可开启。可先检查账号和额度。" }
         else { handoffRunStatus.stringValue = "先退出其他终端中的同一会话，再托管并开启切号。" }
         handoffRunStatus.toolTip = handoffRunStatus.stringValue
+        let resumeActive = resumeReport?.enabled == true
+        let chipText = active ? "切号监控中" : (needsReview ? "需核查" : (resumeActive ? "同号续跑中" : (state.observing ? "观察中" : "待命")))
+        let chipColor: NSColor = active ? .systemGreen : (needsReview ? .systemOrange : ((resumeActive || state.observing) ? .systemBlue : .secondaryLabelColor))
+        handoffStatusChip.text = chipText
+        handoffStatusChip.tint = chipColor
+        sessionOverviewCard?.isActiveCard = active || resumeActive || state.observing
+        let sessionSub = selected.map { "已选：\($0.title)" } ?? "未选择会话 · 点击浏览"
+        sessionOverviewCard?.update(subtitle: sessionSub, badgeText: chipText, tint: chipColor == .secondaryLabelColor ? .systemTeal : chipColor)
         updateResumeUI()
     }
     @objc func startCLIHandoff() {
@@ -1451,6 +1585,167 @@ extension Assistant {
             else { resumeStatus.stringValue = "终端未打开，请重试。" }
         } catch { resumeStatus.stringValue = "无法创建托管终端入口，请重试。" }
     }
+
+    private func configureQuickLaunchButton(_ button: NSButton, tool: QuickLaunchTool, primary: Bool, action: Selector) {
+        button.title = tool.buttonTitle
+        button.target = self
+        button.action = action
+        Theme.button(button, small: true, primary: primary)
+        button.image = NSImage(systemSymbolName: tool.symbolName, accessibilityDescription: tool.label)
+        button.imagePosition = .imageLeading
+        button.toolTip = tool.buttonToolTip
+    }
+
+    func updateQuickLaunchFolders() {
+        let previousPinned = state.launchFolder.map { ($0 as NSString).standardizingPath }
+        let pruned = state.pruneMissingLaunchFolders()
+        if !pruned.isEmpty {
+            save()
+            if let previousPinned = previousPinned, state.launchFolder == nil {
+                let display = (previousPinned as NSString).abbreviatingWithTildeInPath
+                quickLaunchStatus.stringValue = "固定目录已不存在（\(display)），已从列表移除，请重新选择文件夹。"
+            }
+        }
+        var candidates: [String] = []
+        func appendFolder(_ raw: String?) {
+            guard let raw = raw?.trimmingCharacters(in: .whitespacesAndNewlines), !raw.isEmpty else { return }
+            let path = (raw as NSString).standardizingPath
+            guard isExistingDirectory(path) else { return }
+            if !candidates.contains(path) { candidates.append(path) }
+        }
+        appendFolder(state.launchFolder)
+        for path in state.recentLaunchFolders { appendFolder(path) }
+        if let sessions = snapshot?.sessions {
+            for session in sessions.sorted(by: { $0.updated_at > $1.updated_at }) {
+                appendFolder(session.project)
+            }
+        }
+        quickLaunchFolders = candidates
+        quickLaunchFolderPopup.removeAllItems()
+        quickLaunchFolderPopup.addItem(withTitle: "每次启动时选择文件夹…")
+        for path in quickLaunchFolders {
+            let name = path == "/" ? "根目录" : (path as NSString).lastPathComponent
+            let display = (path as NSString).abbreviatingWithTildeInPath
+            quickLaunchFolderPopup.addItem(withTitle: "\(name) — \(display)")
+        }
+        if let current = state.launchFolder.map({ ($0 as NSString).standardizingPath }),
+           let idx = quickLaunchFolders.firstIndex(of: current) {
+            quickLaunchFolderPopup.selectItem(at: idx + 1)
+            quickLaunchFolderPopup.toolTip = current
+        } else {
+            quickLaunchFolderPopup.selectItem(at: 0)
+            quickLaunchFolderPopup.toolTip = "点击启动按钮时弹出文件夹选择框"
+        }
+    }
+
+    private var selectedQuickLaunchFolder: String? {
+        let index = quickLaunchFolderPopup.indexOfSelectedItem - 1
+        guard quickLaunchFolders.indices.contains(index) else { return nil }
+        return quickLaunchFolders[index]
+    }
+
+    @objc func quickLaunchFolderChanged() {
+        let chosen = selectedQuickLaunchFolder
+        state.launchFolder = chosen
+        if let chosen = chosen {
+            state.recordLaunchFolder(chosen)
+            quickLaunchFolderPopup.toolTip = chosen
+            quickLaunchStatus.stringValue = "当前目录：\((chosen as NSString).abbreviatingWithTildeInPath) · 点击右侧按钮直接启动 CLI"
+        } else {
+            quickLaunchFolderPopup.toolTip = "点击启动按钮时弹出文件夹选择框"
+            quickLaunchStatus.stringValue = "未固定目录；点击「\(QuickLaunchTool.codex.buttonTitle)」或「\(QuickLaunchTool.agy.buttonTitle)」时将直接弹出文件夹选择。"
+        }
+        save()
+    }
+
+    @objc func chooseQuickLaunchFolder() {
+        promptForLaunchFolder(prompt: "选择文件夹") { [weak self] folder in
+            guard let self = self else { return }
+            self.state.recordLaunchFolder(folder)
+            self.save()
+            self.updateQuickLaunchFolders()
+            self.quickLaunchStatus.stringValue = "已选目录：\((folder as NSString).abbreviatingWithTildeInPath) · 点击右侧按钮即可启动 CLI"
+        }
+    }
+
+    @objc func launchQuickCodexCLI() {
+        launchQuickCLI(.codex)
+    }
+
+    @objc func launchQuickAgyCLI() {
+        launchQuickCLI(.agy)
+    }
+
+    private func launchQuickCLI(_ tool: QuickLaunchTool) {
+        if let folder = selectedQuickLaunchFolder ?? state.launchFolder {
+            if isExistingDirectory(folder) {
+                openTerminalCLI(tool: tool, folder: folder)
+                return
+            }
+            let display = (folder as NSString).abbreviatingWithTildeInPath
+            state.removeLaunchFolder(folder)
+            _ = state.pruneMissingLaunchFolders()
+            save()
+            updateQuickLaunchFolders()
+            quickLaunchStatus.stringValue = "固定目录已不存在（\(display)），已从列表移除，请重新选择文件夹。"
+        }
+        promptForLaunchFolder(prompt: "在此启动 \(tool.label)") { [weak self] folder in
+            guard let self = self else { return }
+            self.state.addRecentLaunchFolder(folder)
+            self.save()
+            self.updateQuickLaunchFolders()
+            self.openTerminalCLI(tool: tool, folder: folder)
+        }
+    }
+
+    private func promptForLaunchFolder(prompt: String, onPick: @escaping (String) -> Void) {
+        let panel = NSOpenPanel()
+        panel.canChooseDirectories = true
+        panel.canChooseFiles = false
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = true
+        panel.prompt = prompt
+        panel.message = "选择要进入的工作目录"
+        if let current = (selectedQuickLaunchFolder ?? state.recentLaunchFolders.first), isExistingDirectory(current) {
+            panel.directoryURL = URL(fileURLWithPath: current)
+        }
+        if let window = window {
+            panel.beginSheetModal(for: window) { response in
+                if response == .OK, let url = panel.url {
+                    onPick(url.path)
+                }
+            }
+        } else if panel.runModal() == .OK, let url = panel.url {
+            onPick(url.path)
+        }
+    }
+
+    private func openTerminalCLI(tool: QuickLaunchTool, folder: String) {
+        state.addRecentLaunchFolder(folder)
+        save()
+        updateQuickLaunchFolders()
+        guard ProcessInfo.processInfo.environment["CODEX_HELPER_TEST_HOME"] == nil else {
+            quickLaunchStatus.stringValue = "隔离测试不打开真实终端。"
+            return
+        }
+        do {
+            let directory = FileManager.default.temporaryDirectory.appendingPathComponent("codex-helper-cli-" + UUID().uuidString)
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
+            let folderName = (folder as NSString).lastPathComponent
+            let safeName = folderName.isEmpty || folderName == "/" ? "Workspace" : folderName.replacingOccurrences(of: "/", with: "-")
+            let file = directory.appendingPathComponent("\(tool.label) - \(safeName).command")
+            let script = quickLaunchCommandScript(tool: tool, folder: folder)
+            try script.write(to: file, atomically: true, encoding: .utf8)
+            try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: file.path)
+            if NSWorkspace.shared.open(file) {
+                quickLaunchStatus.stringValue = "已在终端启动 \(tool.label)（yolo 模式）：\((folder as NSString).abbreviatingWithTildeInPath)"
+            } else {
+                quickLaunchStatus.stringValue = "终端未打开，请重试。"
+            }
+        } catch {
+            quickLaunchStatus.stringValue = "无法创建终端启动脚本，请重试。"
+        }
+    }
     @objc func toggleResume() {
         guard handoffReport?.hasAuthorization != true, handoffPendingKey == nil, !handoffBusy, !resumeBusy, let target = selected, fixture == nil else { return }
         let args = resumeReport?.enabled == true && resumeReport?.key == target.key ? ["resume","disable"] : ["resume","enable",target.sessionScope,target.id]
@@ -1514,8 +1809,7 @@ func argument(_ name: String) -> String? {
     return args[index + 1]
 }
 let fixture = (argument("--fixture") ?? ProcessInfo.processInfo.environment["CODEX_HELPER_FIXTURE"]).map { URL(fileURLWithPath: $0) }
-let directory = (argument("--state-dir") ?? ProcessInfo.processInfo.environment["CODEX_HELPER_STATE_DIR"]).map { URL(fileURLWithPath: $0) }
-    ?? FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Library/Application Support/CodexHelper-AccountPreview")
+let directory = resolveHelperStateDirectory(arguments: args, environment: ProcessInfo.processInfo.environment)
 let app = NSApplication.shared
 if fixture != nil, ProcessInfo.processInfo.environment["CODEX_HELPER_TEST_APPEARANCE"] == "dark" { app.appearance = NSAppearance(named: .darkAqua) }
 app.setActivationPolicy(.regular)

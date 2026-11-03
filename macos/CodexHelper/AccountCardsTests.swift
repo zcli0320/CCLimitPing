@@ -1,7 +1,5 @@
 import Cocoa
 
-final class FlippedDocument: NSView { override var isFlipped: Bool { true } }
-
 final class AccountActionReceiver: NSObject {
     var applied: [(String, String)] = []
     var authorizationOpened = 0
@@ -14,6 +12,13 @@ final class AccountActionReceiver: NSObject {
 enum AccountCardsTests {
     static func buttons(in view: NSView) -> [NSButton] {
         (view as? NSButton).map { [$0] } ?? view.subviews.flatMap { buttons(in: $0) }
+    }
+    static func texts(in view: NSView) -> [String] {
+        var out: [String] = []
+        if let field = view as? NSTextField { out.append(field.stringValue) }
+        if let chip = view as? StatusChip { out.append(chip.text) }
+        for sub in view.subviews { out.append(contentsOf: texts(in: sub)) }
+        return out
     }
     static func hitTestable(_ button: NSButton, in root: NSView) -> Bool {
         var view: NSView = button
@@ -82,6 +87,29 @@ enum AccountCardsTests {
         precondition(externalButtons.compactMap { $0 as? AccountScopeButton }.isEmpty,
                      "CC Switch-only accounts must not acquire helper switch permissions")
         precondition(externalButtons.contains { $0.title == "前往授权管理" && $0.isEnabled })
+        let ambiguous = QuotaCard(account: account, index: 0,
+                                  metadata: ["managed": true, "sources": ["helper"], "bindings": [["scope": "desktop", "state": "needs_reapply"]], "current_scopes": ["desktop", "cli"], "expired_scopes": ["cli"]],
+                                  actionsEnabled: true, desktopOwner: .unknown, target: receiver,
+                                  detailAction: #selector(AccountActionReceiver.detail(_:)),
+                                  applyAction: #selector(AccountActionReceiver.apply(_:)),
+                                  authorizeAction: #selector(AccountActionReceiver.authorize(_:)))
+        precondition(!texts(in: ambiguous).contains { $0.contains("当前生效") },
+                     "File matching in current_scopes must never be presented as an active running identity")
+        var cardClicks = 0
+        let entryCard = QuickEntryCard(title: "账号额度", symbol: "person.2.fill", tint: .systemBlue, subtitle: "测试", badgeText: "1") {
+            cardClicks += 1
+        }
+        let testWindow = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 100), styleMask: [.titled], backing: .buffered, defer: false)
+        testWindow.contentView?.addSubview(entryCard)
+        precondition(entryCard.acceptsFirstResponder && testWindow.makeFirstResponder(entryCard),
+                     "QuickEntryCard must accept keyboard focus")
+        precondition(entryCard.accessibilityPerformPress() && cardClicks == 1,
+                     "QuickEntryCard must support accessibilityPerformPress")
+        if let spaceEvent = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: [], timestamp: 0, windowNumber: 0, context: nil, characters: " ", charactersIgnoringModifiers: " ", isARepeat: false, keyCode: 49) {
+            entryCard.keyDown(with: spaceEvent)
+        }
+        precondition(cardClicks == 2, "QuickEntryCard must activate on Space keyDown")
+        testWindow.close()
         print("Main account card routing, guards, and layout passed")
     }
 }

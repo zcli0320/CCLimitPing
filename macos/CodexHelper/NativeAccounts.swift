@@ -180,10 +180,13 @@ final class AccountCenterController: NSObject, NSWindowDelegate {
         self.onChanged = onChanged
         self.client = sharedClient ?? AccountCenterClient(executable: executable)
         self.ownsClient = sharedClient == nil
-        self.window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 620, height: 540),
+        self.window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 640, height: 560),
             styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         super.init()
         window.title = "授权管理"
+        window.titleVisibility = .hidden
+        window.titlebarAppearsTransparent = true
+        window.backgroundColor = .windowBackgroundColor
         window.minSize = NSSize(width: 540, height: 380)
         window.isReleasedWhenClosed = false
         window.delegate = self
@@ -203,9 +206,13 @@ final class AccountCenterController: NSObject, NSWindowDelegate {
         ])
         func add(_ view: NSView) { stack.addArrangedSubview(view); view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true }
 
-        let title = Theme.text("授权管理", size: 18, weight: .bold, wraps: false)
+        let headerIcon = NSImageView(image: NSImage(systemSymbolName: "person.badge.key.fill", accessibilityDescription: "授权管理")!)
+        headerIcon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 22, weight: .semibold)
+        headerIcon.contentTintColor = .systemBlue
+        headerIcon.setContentHuggingPriority(.required, for: .horizontal)
+        let title = Theme.text("账号授权中心", size: 19, weight: .bold, wraps: false)
         let subtitle = Theme.caption("添加、重新登录或移除小助手的账号授权；Desktop 由 CC Switch 管理时请在 CC Switch 中切换。")
-        add(Theme.vstack([title, subtitle], spacing: 3))
+        add(Theme.hstack([headerIcon, Theme.vstack([title, subtitle], spacing: 3)], spacing: 10))
 
         browserButton.target = self; browserButton.action = #selector(startBrowser)
         Theme.button(browserButton, primary: true)
@@ -215,6 +222,7 @@ final class AccountCenterController: NSObject, NSWindowDelegate {
         deviceButton.image = NSImage(systemSymbolName: "number.square", accessibilityDescription: nil); deviceButton.imagePosition = .imageLeading
         cancelButton.target = self; cancelButton.action = #selector(cancelLogin); cancelButton.isEnabled = false; cancelButton.isHidden = true
         Theme.button(cancelButton)
+        cancelButton.image = NSImage(systemSymbolName: "xmark.circle", accessibilityDescription: nil); cancelButton.imagePosition = .imageLeading
         recoverButton.target = self; recoverButton.action = #selector(resolvePending); recoverButton.isHidden = true
         Theme.button(recoverButton)
         recoverButton.image = NSImage(systemSymbolName: "exclamationmark.triangle", accessibilityDescription: nil); recoverButton.imagePosition = .imageLeading
@@ -227,6 +235,7 @@ final class AccountCenterController: NSObject, NSWindowDelegate {
         add(status)
         clearDesktopButton.target = self; clearDesktopButton.action = #selector(clearDesktopBinding)
         Theme.button(clearDesktopButton, small: true)
+        clearDesktopButton.image = NSImage(systemSymbolName: "trash.slash", accessibilityDescription: nil); clearDesktopButton.imagePosition = .imageLeading
         clearDesktopButton.toolTip = "只清除小助手保存的 Desktop 绑定，不修改账号或两端登录文件。"
         clearDesktopRow = Theme.hstack([clearDesktopButton, Theme.flexible()], spacing: 8)
         clearDesktopRow.isHidden = true
