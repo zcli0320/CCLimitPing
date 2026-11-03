@@ -63,6 +63,18 @@ import Cocoa
         precondition(deduped == generated + "-2", "Generated task ID must avoid collisions with existing tasks")
         let noProjectID = resolveOrchestraTaskID("", project: nil, now: fixedNow)
         precondition(noProjectID.hasPrefix("task-"), "Blank task ID without project must generate a valid task-prefixed ID")
+        let projIDFromName = resolveOrchestraProjectID("", name: "前端 Refactor 2.0", folder: "/tmp/my-folder", existingIDs: [], now: fixedNow)
+        precondition(projIDFromName == "refactor-2.0", "Project ID should slugify ASCII segments from name")
+        let projIDFromFolder = resolveOrchestraProjectID("", name: "纯中文项目", folder: "/Users/test/codex-helper", existingIDs: ["codex-helper"], now: fixedNow)
+        precondition(projIDFromFolder == "codex-helper-2", "Project ID should fall back to folder name and deduplicate")
+        let reviewChild = try decoder.decode(OrchestraTask.self, from: Data("{\"id\":\"T2-review-1\",\"project\":\"p1\",\"review_of\":\"T2\",\"executor\":\"claude\",\"folder\":\"/tmp/p1\",\"card\":\"review\",\"status\":\"running\",\"updated\":\"2026-10-31T12:00:00Z\"}".utf8))
+        let unassignedTask = try decoder.decode(OrchestraTask.self, from: Data("{\"id\":\"U1\",\"executor\":\"codex\",\"folder\":\"/tmp\",\"card\":\"free task\",\"status\":\"queued\",\"updated\":\"2026-10-31T11:00:00Z\"}".utf8))
+        let groups = buildOrchestraProjectGroups(projects: [project], allProjects: [project], tasks: [reviewing, reviewed, reviewChild, unassignedTask])
+        precondition(groups.count == 2 && groups[0].projectID == "p1" && groups[1].isUnassigned, "Tasks must be grouped into project containers plus unassigned")
+        precondition(groups[0].tasks.map(\.id) == ["T2", "T2-review-1", "T3"] || groups[0].tasks.contains(where: { $0.id == "T2-review-1" }), "Review child task must stay inside its project group")
+        if let idx = groups[0].tasks.firstIndex(where: { $0.id == "T2" }) {
+            precondition(groups[0].tasks[idx + 1].id == "T2-review-1", "Review child task must be ordered directly after parent task")
+        }
         print("Orchestra JSON decoding and task action rules passed")
     }
 }

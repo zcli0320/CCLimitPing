@@ -21,6 +21,7 @@ const orchestraUsage = `Usage: codex-helper orchestra <command>
   project create --id <id> --name <n> --folder <dir> --to <agent> [--reviewer <r>] [--lead <l>] [--check <c>]... [--scope <s>]...
   project list [--all] | project get <id> | project archive <id>
   dispatch [--project <id>] [--to <agent>] [--folder <dir>] --id <id> [--lead <agent>]   card on stdin
+  assign --id <task-id> [--project <project-id>]
   list [--project <id>] | get <id>
   wait <id> [--timeout 540s]               until the task needs the lead again
   rework <id>                              rework text on stdin
@@ -310,6 +311,15 @@ func orchestraCommand() {
 		fs.Var(&scope, "scope", "allowed path prefix (repeatable)")
 		fs.Parse(args)
 		task, err = store.DispatchInProject(cfg, *lead, *project, *to, *folder, *id, orchestraStdin(), checks, scope)
+	case "assign":
+		fs := flag.NewFlagSet("assign", flag.ExitOnError)
+		id := fs.String("id", "", "task id")
+		project := fs.String("project", "", "project id (empty to unassign)")
+		fs.Parse(args)
+		if *id == "" && fs.NArg() == 1 {
+			*id = fs.Arg(0)
+		}
+		task, err = store.AssignProject(*id, *project)
 	case "list":
 		fs := flag.NewFlagSet("list", flag.ExitOnError)
 		project := fs.String("project", "", "filter by project id")

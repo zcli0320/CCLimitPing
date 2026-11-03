@@ -189,3 +189,72 @@ func (s Store) DispatchInProject(cfg Config, lead, project, executor, folder, id
 	}
 	return s.dispatch(cfg, lead, p.ID, executor, folder, id, card, checks, scope, "")
 }
+
+func (s Store) AssignProject(taskIDStr, projectID string) (*Task, error) {
+	if !taskID.MatchString(taskIDStr) {
+		return nil, fmt.Errorf("任务编号无效：%q", taskIDStr)
+	}
+	if projectID != "" && !taskID.MatchString(projectID) {
+		return nil, fmt.Errorf("项目编号无效：%q", projectID)
+	}
+	unlock, err := s.lock()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	var p *Project
+	if projectID != "" {
+		p, err = s.readProject(projectID)
+		if err != nil {
+			return nil, err
+		}
+		if p.Archived {
+			return nil, fmt.Errorf("项目 %s 已归档", projectID)
+		}
+	}
+	t, err := s.read(taskIDStr)
+	if err != nil {
+		return nil, err
+	}
+	targetID := t.ID
+	if t.ReviewOf != "" {
+		if parent, perr := s.read(t.ReviewOf); perr == nil {
+			t = parent
+			targetID = parent.ID
+		}
+	}
+	t.Project = projectID
+	if p != nil {
+		if t.Lead == "" && p.Lead != "" {
+			t.Lead = p.Lead
+		}
+		if t.Status == Queued {
+			if len(t.Checks) == 0 && len(p.Checks) > 0 {
+				t.Checks = append([]string(nil), p.Checks...)
+			}
+			if len(t.Scope) == 0 && len(p.Scope) > 0 {
+				t.Scope = append([]string(nil), p.Scope...)
+			}
+		}
+	}
+	if err := s.write(t); err != nil {
+		return nil, err
+	}
+	if entries, err := os.ReadDir(filepath.Join(s.Dir, "tasks")); err == nil {
+		for _, e := range entries {
+			name := e.Name()
+			if !strings.HasSuffix(name, ".json") {
+				continue
+			}
+			id := strings.TrimSuffix(name, ".json")
+			if id == targetID {
+				continue
+			}
+			if child, cerr := s.read(id); cerr == nil && child.ReviewOf == targetID {
+				child.Project = projectID
+				_ = s.write(child)
+			}
+		}
+	}
+	return t, nil
+}

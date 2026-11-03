@@ -290,12 +290,25 @@ final class AccountCenterController: NSObject, NSWindowDelegate {
     }
     func windowDidResize(_ notification: Notification) { layoutContent() }
     private func layoutContent() {
+        let clip = scroll.contentView
+        let savedOrigin = clip.bounds.origin
         scroll.layoutSubtreeIfNeeded()
         let width = max(scroll.contentSize.width, 1)
-        document.setFrameSize(NSSize(width: width, height: max(scroll.contentSize.height, 1)))
+        let initialHeight = max(document.frame.height, scroll.contentSize.height, 1)
+        if abs(document.frame.width - width) > 0.5 || document.frame.height < 1 {
+            document.setFrameSize(NSSize(width: width, height: initialHeight))
+        }
         document.layoutSubtreeIfNeeded()
-        let height = max(scroll.contentSize.height, contentStack.fittingSize.height + 40)
-        document.setFrameSize(NSSize(width: width, height: height))
+        let stackHeight = max(contentStack.frame.maxY, ceil(contentStack.fittingSize.height) + 18)
+        let height = max(scroll.contentSize.height, ceil(stackHeight) + 22)
+        if abs(document.frame.width - width) > 0.5 || abs(document.frame.height - height) > 0.5 {
+            document.setFrameSize(NSSize(width: width, height: height))
+        }
+        let target = clip.constrainBoundsRect(NSRect(origin: savedOrigin, size: clip.bounds.size)).origin
+        if abs(clip.bounds.origin.x - target.x) > 0.5 || abs(clip.bounds.origin.y - target.y) > 0.5 {
+            clip.setBoundsOrigin(target)
+            scroll.reflectScrolledClipView(clip)
+        }
     }
     #if ACCOUNT_UI_TEST
     func testLoginButtonBounds() -> Bool {

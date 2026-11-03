@@ -386,7 +386,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         table.headerView = nil; table.floatsGroupRows = false
         table.columnAutoresizingStyle = .firstColumnOnlyAutoresizingStyle
         table.setAccessibilityLabel("按项目分组的 Codex 会话")
-        let scroll = NSScrollView(); scroll.documentView = table; scroll.hasVerticalScroller = true; scroll.borderType = .noBorder
+        let scroll = NestedScrollView(); scroll.documentView = table; scroll.hasVerticalScroller = true; scroll.borderType = .noBorder
         scroll.autohidesScrollers = true; scroll.drawsBackground = true; scroll.backgroundColor = .controlBackgroundColor
         tableHeight = scroll.heightAnchor.constraint(equalToConstant: 220); tableHeight.isActive = true
         scroll.setContentHuggingPriority(.defaultLow, for: .vertical)
@@ -538,12 +538,29 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
 
     func layoutDocument() {
         guard tableHeight != nil else { return }
+        let clip = outerScroll.contentView
+        let savedOrigin = clip.bounds.origin
         outerScroll.superview?.layoutSubtreeIfNeeded()
-        document.setFrameSize(NSSize(width: outerScroll.contentSize.width, height: max(document.frame.height, 1)))
-        tableHeight.constant = max(180, min(360, outerScroll.contentSize.height * 0.32))
+        let width = max(outerScroll.contentSize.width, 1)
+        let newTableHeight = round(max(180, min(360, outerScroll.contentSize.height * 0.32)))
+        if abs(tableHeight.constant - newTableHeight) > 0.5 {
+            tableHeight.constant = newTableHeight
+        }
+        let initialHeight = max(document.frame.height, outerScroll.contentSize.height, 1)
+        if abs(document.frame.width - width) > 0.5 || document.frame.height < 1 {
+            document.setFrameSize(NSSize(width: width, height: initialHeight))
+        }
         document.layoutSubtreeIfNeeded()
-        let height = max(outerScroll.contentSize.height, contentStack.fittingSize.height + 36)
-        document.setFrameSize(NSSize(width: outerScroll.contentSize.width, height: height))
+        let stackHeight = max(contentStack.frame.maxY, ceil(contentStack.fittingSize.height) + 14)
+        let height = max(outerScroll.contentSize.height, ceil(stackHeight) + 22)
+        if abs(document.frame.width - width) > 0.5 || abs(document.frame.height - height) > 0.5 {
+            document.setFrameSize(NSSize(width: width, height: height))
+        }
+        let target = clip.constrainBoundsRect(NSRect(origin: savedOrigin, size: clip.bounds.size)).origin
+        if abs(clip.bounds.origin.x - target.x) > 0.5 || abs(clip.bounds.origin.y - target.y) > 0.5 {
+            clip.setBoundsOrigin(target)
+            outerScroll.reflectScrolledClipView(clip)
+        }
     }
 
     func scrollToSection(_ targetView: NSView?) {
@@ -816,6 +833,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
     }
 
     func render(preserveScroll: Bool = true) {
+        let savedOuterOrigin = outerScroll.contentView.bounds.origin
         renderAccountCards()
         guard let snapshot = snapshot else {
             sourceHint.stringValue = "\(state.activeScope == "cli" ? "CLI · ~/.codex-cli" : "Desktop · ~/.codex") · 数据暂不可用"
@@ -843,9 +861,16 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         applyFilter(preserveScroll: preserveScroll)
         feedback.stringValue = warnings.isEmpty ? backgroundStatusCaption() : "\(warnings.count) 条读取提示，可在「接入说明」中查看。"
         layoutDocument()
+        let clip = outerScroll.contentView
+        let target = clip.constrainBoundsRect(NSRect(origin: savedOuterOrigin, size: clip.bounds.size)).origin
+        if abs(clip.bounds.origin.x - target.x) > 0.5 || abs(clip.bounds.origin.y - target.y) > 0.5 {
+            clip.setBoundsOrigin(target)
+            outerScroll.reflectScrolledClipView(clip)
+        }
     }
 
     func renderAccountCards() {
+        let savedOuterOrigin = outerScroll.contentView.bounds.origin
         for view in accountStack.arrangedSubviews { accountStack.removeArrangedSubview(view); view.removeFromSuperview() }
         guard let snapshot = snapshot else {
             accountCountChip.text = ""
@@ -881,6 +906,12 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
             add(emptyBox, to: accountStack)
         }
         layoutDocument()
+        let clip = outerScroll.contentView
+        let target = clip.constrainBoundsRect(NSRect(origin: savedOuterOrigin, size: clip.bounds.size)).origin
+        if abs(clip.bounds.origin.x - target.x) > 0.5 || abs(clip.bounds.origin.y - target.y) > 0.5 {
+            clip.setBoundsOrigin(target)
+            outerScroll.reflectScrolledClipView(clip)
+        }
     }
 
     func updateWarmupUI() {

@@ -152,6 +152,40 @@ func TestDispatchInProject(t *testing.T) {
 	}
 }
 
+func TestAssignProject(t *testing.T) {
+	e := setup(t)
+	if _, err := e.store.CreateProject(e.cfg, Project{
+		ID: "P1", Name: "Proj 1", Folder: e.folder, Lead: "claude",
+		Executor: "codex", Checks: []string{"true"}, Scope: []string{"src/"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	t1, err := e.store.Dispatch(e.cfg, "", "codex", e.folder, "T-UNASSIGNED", "TASK 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if t1.Project != "" {
+		t.Fatalf("expected unassigned task, got %+v", t1)
+	}
+	assigned, err := e.store.AssignProject("T-UNASSIGNED", "P1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if assigned.Project != "P1" || assigned.Lead != "claude" || !reflect.DeepEqual(assigned.Checks, []string{"true"}) || !reflect.DeepEqual(assigned.Scope, []string{"src/"}) {
+		t.Fatalf("assigned=%+v", assigned)
+	}
+	unassigned, err := e.store.AssignProject("T-UNASSIGNED", "")
+	if err != nil || unassigned.Project != "" {
+		t.Fatalf("unassign=%+v err=%v", unassigned, err)
+	}
+	if _, err := e.store.ArchiveProject("P1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.store.AssignProject("T-UNASSIGNED", "P1"); err == nil || !strings.Contains(err.Error(), "已归档") {
+		t.Fatalf("assign to archived project should fail: %v", err)
+	}
+}
+
 func realFolder(t *testing.T, p string) string {
 	t.Helper()
 	r, err := filepath.EvalSymlinks(p)

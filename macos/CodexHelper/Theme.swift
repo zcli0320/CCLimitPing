@@ -314,3 +314,77 @@ final class InitialAvatar: NSView {
         NSBezierPath(ovalIn: bounds).fill()
     }
 }
+
+/// Scroll view that forwards vertical wheel events to its enclosing scroll view
+/// when it has no vertical overflow, has reached its scroll boundary in that direction,
+/// or slides under the cursor during an in-flight outer scroll gesture.
+final class NestedScrollView: NSScrollView {
+    private var ownsCurrentGesture = false
+    private var forwardingGesture = false
+
+    private var parentScrollView: NSScrollView? {
+        superview?.enclosingScrollView
+    }
+
+    private func forwardToParent(_ event: NSEvent) {
+        if let parent = parentScrollView {
+            parent.scrollWheel(with: event)
+        } else {
+            nextResponder?.scrollWheel(with: event)
+        }
+    }
+
+    override func scrollWheel(with event: NSEvent) {
+        guard let doc = documentView else {
+            super.scrollWheel(with: event)
+            return
+        }
+        let clipBounds = contentView.bounds
+        let maxOffset = max(0, doc.frame.height - clipBounds.height)
+        if maxOffset <= 0.5 {
+            ownsCurrentGesture = false
+            forwardingGesture = true
+            forwardToParent(event)
+            return
+        }
+
+        let phase = event.phase
+        let momentum = event.momentumPhase
+        if phase == .mayBegin || phase == .began {
+            ownsCurrentGesture = true
+            forwardingGesture = false
+        } else if (phase != [] || momentum != []) && !ownsCurrentGesture {
+            // Gesture began on the outer scroll view and this view slid under the cursor.
+            forwardToParent(event)
+            return
+        }
+
+        if forwardingGesture && (phase != [] || momentum != []) {
+            forwardToParent(event)
+            if phase == .ended || phase == .cancelled || momentum == .ended {
+                ownsCurrentGesture = false
+                forwardingGesture = false
+            }
+            return
+        }
+
+        let dy = event.scrollingDeltaY
+        let dx = event.scrollingDeltaX
+        if abs(dy) >= abs(dx) && abs(dy) > 0.01 {
+            let y = clipBounds.origin.y
+            let atTop = doc.isFlipped ? (y <= 0.5) : (y >= maxOffset - 0.5)
+            let atBottom = doc.isFlipped ? (y >= maxOffset - 0.5) : (y <= 0.5)
+            if (dy > 0 && atTop) || (dy < 0 && atBottom) {
+                forwardingGesture = true
+                forwardToParent(event)
+                return
+            }
+        }
+
+        super.scrollWheel(with: event)
+        if phase == .ended || phase == .cancelled || momentum == .ended {
+            ownsCurrentGesture = false
+            forwardingGesture = false
+        }
+    }
+}
