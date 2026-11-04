@@ -372,7 +372,7 @@ func TestAntigravityResult(t *testing.T) {
 			if err := os.WriteFile(path, []byte(c.output), 0600); err != nil {
 				t.Fatal(err)
 			}
-			session, final, err := (Agent{Name: "antigravity"}).result(path, "unused", time.Time{})
+			session, final, err := (Agent{Name: "antigravity"}).result(path, "unused", -1)
 			if session != c.session || final != c.final {
 				t.Fatalf("session=%q final=%q", session, final)
 			}
@@ -394,50 +394,93 @@ func TestAntigravityResultFallsBackToFinishedTranscript(t *testing.T) {
 	old := AGYBrainRoot
 	AGYBrainRoot = func() string { return root }
 	t.Cleanup(func() { AGYBrainRoot = old })
-	since := time.Date(2026, 11, 4, 2, 35, 0, 0, time.UTC)
-	input := func(at string) string {
-		return `{"step_index":0,"type":"USER_INPUT","status":"DONE","created_at":"` + at + `","content":"TASK"}`
+	step := func(i int, typ, extra string) string {
+		return fmt.Sprintf(`{"step_index":%d,"type":%q,"status":"DONE"%s}`, i, typ, extra)
 	}
-	const tool = `{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-04T02:35:38Z","tool_calls":[{"name":"run_command"}]}`
-	const result = `{"step_index":2,"type":"GENERIC","status":"DONE","created_at":"2026-11-04T02:36:08Z","content":"Command exited with code 0."}`
-	const eof = `{"step_index":3,"type":"ERROR_MESSAGE","status":"DONE","created_at":"2026-11-04T02:40:33Z","error":"EOF"}`
-	const reply = `{"step_index":4,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-04T02:40:37Z","content":"  all 9 tests pass  "}`
-	cases := []struct{ name, transcript, final, errorText string }{
-		{"retried reply after EOF", strings.Join([]string{input("2026-11-04T02:35:38Z"), tool, result, eof, reply}, "\n"), "all 9 tests pass", ""},
-		{"stalled on EOF", strings.Join([]string{input("2026-11-04T02:35:38Z"), tool, result, eof}, "\n"), "", "报告错误"},
-		{"tool still requested", strings.Join([]string{input("2026-11-04T02:35:38Z"), tool}, "\n"), "", "报告错误"},
-		{"answer from an earlier run", strings.Join([]string{input("2026-11-04T01:00:00Z"), reply}, "\n"), "", "报告错误"},
-		{"torn last line", strings.Join([]string{input("2026-11-04T02:35:38Z"), reply, `{"step_index":5,"ty`}, "\n"), "", "报告错误"},
-		{"no transcript", "", "", "报告错误"},
+	reply := func(i int) string { return step(i, "PLANNER_RESPONSE", `,"content":"  all 9 tests pass  "`) }
+	tool := func(i int) string { return step(i, "PLANNER_RESPONSE", `,"tool_calls":[{"name":"run_command"}]`) }
+	result := func(i int) string { return step(i, "GENERIC", `,"content":"Command exited with code 0."`) }
+	eof := func(i int) string { return step(i, "ERROR_MESSAGE", `,"error":"EOF"`) }
+	input := func(i int) string { return step(i, "USER_INPUT", `,"content":"TASK"`) }
+	const ok = "all 9 tests pass"
+	cases := []struct {
+		name       string
+		steps      []string
+		afterStep  int
+		denied     bool
+		final, err string
+	}{
+		{"retried reply after EOF", []string{input(0), tool(1), result(2), eof(3), reply(4)}, -1, false, ok, ""},
+		{"resumed run's own turn", []string{input(0), reply(1), input(2), tool(3), result(4), reply(5)}, 1, false, ok, ""},
+		{"stalled on EOF", []string{input(0), tool(1), result(2), eof(3)}, -1, false, "", "报告错误"},
+		{"tool still requested", []string{input(0), tool(1)}, -1, false, "", "报告错误"},
+		{"earlier tool call never answered", []string{input(0), tool(1), reply(2)}, -1, false, "", "报告错误"},
+		{"answer from an earlier run", []string{input(0), reply(1)}, 1, false, "", "报告错误"},
+		{"unmeasured conversation", []string{input(0), reply(1)}, AGYNoFallback, false, "", "报告错误"},
+		{"torn last line", []string{input(0), reply(1), `{"step_index":2,"ty`}, -1, false, "", "报告错误"},
+		{"denied action wins", []string{input(0), reply(1)}, -1, true, "", "拒绝了操作"},
+		{"no transcript", nil, -1, false, "", "报告错误"},
 	}
 	for i, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
 			conv := fmt.Sprintf("conv-%d", i)
-			if c.transcript != "" {
+			if c.steps != nil {
 				dir := filepath.Join(root, conv, ".system_generated", "logs")
 				if err := os.MkdirAll(dir, 0700); err != nil {
 					t.Fatal(err)
 				}
-				if err := os.WriteFile(filepath.Join(dir, "transcript.jsonl"), []byte(c.transcript+"\n"), 0600); err != nil {
+				if err := os.WriteFile(filepath.Join(dir, "transcript.jsonl"), []byte(strings.Join(c.steps, "\n")+"\n"), 0600); err != nil {
 					t.Fatal(err)
 				}
 			}
+			out := `{"conversation_id":"` + conv + `","status":"ERROR"`
+			if c.denied {
+				out += `,"denied_actions":[{"action":"command"}]`
+			}
 			path := filepath.Join(t.TempDir(), "stdout")
-			out := `{"conversation_id":"` + conv + `","status":"ERROR","error":"EOF"}`
-			if err := os.WriteFile(path, []byte(out), 0600); err != nil {
+			if err := os.WriteFile(path, []byte(out+"}"), 0600); err != nil {
 				t.Fatal(err)
 			}
-			session, final, err := (Agent{Name: "antigravity"}).result(path, "unused", since)
+			session, final, err := (Agent{Name: "antigravity"}).result(path, "unused", c.afterStep)
 			if session != conv || final != c.final {
 				t.Fatalf("session=%q final=%q", session, final)
 			}
-			if c.errorText == "" && err != nil || c.errorText != "" && (err == nil || !strings.Contains(err.Error(), c.errorText)) {
-				t.Fatalf("err=%v want=%q", err, c.errorText)
+			if c.err == "" && err != nil || c.err != "" && (err == nil || !strings.Contains(err.Error(), c.err)) {
+				t.Fatalf("err=%v want=%q", err, c.err)
 			}
 		})
 	}
-	if agyTranscriptFinal("../escape", since) != "" {
+	if agyTranscriptFinal("../escape", -1) != "" {
 		t.Fatal("conversation id must not escape the brain root")
+	}
+}
+
+func TestAGYTranscriptLastStep(t *testing.T) {
+	root := t.TempDir()
+	old := AGYBrainRoot
+	AGYBrainRoot = func() string { return root }
+	t.Cleanup(func() { AGYBrainRoot = old })
+	dir := filepath.Join(root, "c1", ".system_generated", "logs")
+	if err := os.MkdirAll(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "transcript.jsonl"), []byte(`{"step_index":0,"type":"USER_INPUT"}`+"\n"+`{"step_index":3,"type":"PLANNER_RESPONSE"}`+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := AGYTranscriptLastStep("c1"); got != 3 {
+		t.Fatalf("last step = %d", got)
+	}
+	if got := AGYTranscriptLastStep("missing"); got != -1 {
+		t.Fatalf("new conversation = %d", got)
+	}
+	if got := AGYTranscriptLastStep(""); got != -1 {
+		t.Fatalf("no session = %d", got)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "c2"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if got := AGYTranscriptLastStep("c2"); got != AGYNoFallback {
+		t.Fatalf("unreadable conversation = %d", got)
 	}
 }
 

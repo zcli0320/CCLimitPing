@@ -269,14 +269,22 @@ func (r Reader) RunManagedAGYSession(ctx context.Context, folder string, extraAr
 		}
 	}
 
-	// Finalize session state on exit: never claim task completion merely from exitCode == 0.
+	r.finalizeExitedAGYSession(&session, logFile, exitCode)
+	_ = r.writeAGYSession(session)
+	return exitCode, nil
+}
+
+// finalizeExitedAGYSession sets the final state after the AGY child exited.
+// Never claim task completion merely from exitCode == 0.
+func (r Reader) finalizeExitedAGYSession(session *AGYGuardSession, logFile string, exitCode int) {
 	finalLog, logErr := ParseAGYDedicatedLog(logFile)
 	session.Exited = true
 	session.ExitCode = exitCode
 	if logErr == nil && finalLog.ActiveConversationID != "" {
 		session.ConversationID = finalLog.ActiveConversationID
 	}
-	if logErr == nil && finalLog.LastTurnStartedLine > 0 && finalLog.LastTurnCompletedLine < finalLog.LastTurnStartedLine {
+	if logErr == nil && finalLog.LastTurnStartedLine > 0 && finalLog.LastTurnCompletedLine < finalLog.LastTurnStartedLine &&
+		!r.agyTurnFinishedAtExit(session.ConversationID) {
 		session.State = AGYGuardStateWaitingUserAction
 		session.LastReason = fmt.Sprintf("进程已退出（退出码 %d），但最后一轮生成未见完成信号，不凭退出码宣告任务完成", exitCode)
 		session.Message = session.LastReason
@@ -284,8 +292,18 @@ func (r Reader) RunManagedAGYSession(ctx context.Context, folder string, extraAr
 		session.State = AGYGuardStateIdle
 		session.Message = fmt.Sprintf("AGY CLI 已退出（退出码 %d）", exitCode)
 	}
-	_ = r.writeAGYSession(session)
-	return exitCode, nil
+}
+
+// agyTurnFinishedAtExit reads AGY's DB row and transcript for the bound
+// conversation; see agyTurnFinishedInStore.
+func (r Reader) agyTurnFinishedAtExit(conversationID string) bool {
+	if conversationID == "" {
+		return false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	db, dbOK := r.readAGYConversationSummary(ctx, conversationID)
+	return agyTurnFinishedInStore(dbOK, db, r.readAGYTranscriptSummary(conversationID))
 }
 
 func (r Reader) monitorManagedAGYLoop(ctx context.Context, session *AGYGuardSession, tracker *agyTerminalInputTracker) {

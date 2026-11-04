@@ -165,6 +165,7 @@ type active struct {
 	cmd          *exec.Cmd
 	done         chan error
 	start        time.Time
+	agyAfterStep int // Antigravity transcript step before this run; see agyTranscriptFinal
 	files        runFiles
 	agent        Agent
 	term         time.Time // when SIGTERM was sent
@@ -464,6 +465,10 @@ func (r *Runner) start(snap *Task) *active {
 		if len(t.Checks) > 0 || len(t.Scope) > 0 {
 			baseline = snapshotGit(inv.Dir)
 		}
+		agyAfterStep := -1
+		if agent.Name == "antigravity" {
+			agyAfterStep = AGYTranscriptLastStep(t.Session)
+		}
 		cmd, err := launch(inv, files)
 		if err != nil {
 			run.Ended, run.Exit, run.Error = time.Now(), -1, "无法启动："+err.Error()
@@ -472,7 +477,7 @@ func (r *Runner) start(snap *Task) *active {
 			return nil
 		}
 		run.PID = cmd.Process.Pid
-		a = &active{id: t.ID, cmd: cmd, done: make(chan error, 1), start: run.Started, files: files, agent: agent, baseline: baseline, folder: inv.Dir, env: inv.Env, checks: append([]string(nil), t.Checks...)}
+		a = &active{id: t.ID, cmd: cmd, done: make(chan error, 1), start: run.Started, files: files, agent: agent, agyAfterStep: agyAfterStep, baseline: baseline, folder: inv.Dir, env: inv.Env, checks: append([]string(nil), t.Checks...)}
 		return nil
 	})
 	if a == nil {
@@ -577,7 +582,7 @@ func descendants(pid int) []int {
 
 func (r *Runner) finish(a *active, why string) {
 	exit := a.cmd.ProcessState.ExitCode()
-	session, final, perr := a.agent.result(a.files.out, a.files.last, a.start)
+	session, final, perr := a.agent.result(a.files.out, a.files.last, a.agyAfterStep)
 	limited := why == "" && a.agent.Name == "codex" && (final == "" || exit != 0) && usageLimit(a.files.out, a.files.err)
 	var changes *ChangeEvidence
 	if a.baseline.status != "" {

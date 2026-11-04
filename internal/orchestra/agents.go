@@ -8,10 +8,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strings"
-	"time"
 )
 
 // Agent describes how to start one kind of executor headless.
@@ -139,7 +139,8 @@ func (a Agent) prepare(path, session, folder, prompt, lastFile string) (Invocati
 }
 
 // result reads the executor's session id and final message from its output.
-func (a Agent) result(stdoutPath, lastFile string, since time.Time) (session, final string, err error) {
+// afterStep only matters for Antigravity; see agyTranscriptFinal.
+func (a Agent) result(stdoutPath, lastFile string, afterStep int) (session, final string, err error) {
 	data, _ := os.ReadFile(stdoutPath)
 	switch a.Name {
 	case "codex":
@@ -181,14 +182,6 @@ func (a Agent) result(stdoutPath, lastFile string, since time.Time) (session, fi
 		if e := json.Unmarshal(payload, &out); e != nil {
 			return out.ConversationID, "", errors.New("Antigravity 输出不是预期的 JSON")
 		}
-		if out.Status != "SUCCESS" {
-			// A stream that dies after the turn already finished (agy's
-			// post-reply EOF) still left the answer in the transcript.
-			if final := agyTranscriptFinal(out.ConversationID, since); final != "" {
-				return out.ConversationID, final, nil
-			}
-			return out.ConversationID, "", fmt.Errorf("Antigravity 报告错误：%s", out.Status)
-		}
 		if len(out.DeniedActions) > 0 {
 			names := make([]string, 0, len(out.DeniedActions))
 			for _, action := range out.DeniedActions {
@@ -199,6 +192,14 @@ func (a Agent) result(stdoutPath, lastFile string, since time.Time) (session, fi
 				names = append(names, name)
 			}
 			return out.ConversationID, "", fmt.Errorf("Antigravity 拒绝了操作：%s", strings.Join(names, "、"))
+		}
+		if out.Status != "SUCCESS" {
+			// A stream that dies after the turn already finished (agy's
+			// post-reply EOF) still left the answer in the transcript.
+			if final := agyTranscriptFinal(out.ConversationID, afterStep); final != "" {
+				return out.ConversationID, final, nil
+			}
+			return out.ConversationID, "", fmt.Errorf("Antigravity 报告错误：%s", out.Status)
 		}
 		if strings.TrimSpace(out.Response) == "" {
 			return out.ConversationID, "", errors.New("Antigravity 返回的回复为空")
@@ -227,49 +228,103 @@ var AGYBrainRoot = func() string {
 	return filepath.Join(home, ".gemini", "antigravity-cli", "brain")
 }
 
+// AGYNoFallback disables the transcript fallback for a run whose conversation
+// could not be measured before launch.
+const AGYNoFallback = math.MaxInt
+
 type agyStep struct {
+	StepIndex int               `json:"step_index"`
 	Type      string            `json:"type"`
 	Status    string            `json:"status"`
 	Content   string            `json:"content"`
 	ToolCalls []json.RawMessage `json:"tool_calls"`
-	CreatedAt time.Time         `json:"created_at"`
 }
 
-// agyTranscriptFinal returns the conversation's final answer only when the
-// last transcript step is a finished model reply with no tool calls, i.e. the
-// turn completed and nothing was left running, and that turn's user input was
-// sent by this run (a resumed conversation also holds earlier answers).
-func agyTranscriptFinal(conversation string, since time.Time) string {
+func agyTranscript(conversation string) ([]agyStep, bool) {
 	if conversation == "" || strings.ContainsAny(conversation, "/\\") || strings.HasPrefix(conversation, ".") {
-		return ""
+		return nil, false
 	}
 	data, err := os.ReadFile(filepath.Join(AGYBrainRoot(), conversation, ".system_generated", "logs", "transcript.jsonl"))
 	if err != nil {
-		return ""
+		return nil, false
 	}
-	var last agyStep
-	var turnStart time.Time
-	found := false
+	var steps []agyStep
 	for _, line := range strings.Split(string(data), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
 			continue
 		}
 		var step agyStep
-		// A torn last line means the transcript is still being written.
+		// A torn line means the transcript is still being written.
 		if json.Unmarshal([]byte(line), &step) != nil {
-			return ""
+			return nil, false
 		}
-		if step.Type == "USER_INPUT" {
-			turnStart = step.CreatedAt
-		}
-		last, found = step, true
+		steps = append(steps, step)
 	}
-	// Allow for clock rounding between the runner and agy.
-	if turnStart.Before(since.Add(-2 * time.Second)) {
+	return steps, true
+}
+
+// AGYTranscriptLastStep is the highest step index already in a conversation,
+// recorded before a resumed run so only its own turn can count; -1 when the
+// conversation has no transcript yet, AGYNoFallback when it is unreadable.
+func AGYTranscriptLastStep(conversation string) int {
+	if conversation == "" {
+		return -1
+	}
+	if _, err := os.Stat(filepath.Join(AGYBrainRoot(), conversation)); os.IsNotExist(err) {
+		return -1
+	}
+	steps, ok := agyTranscript(conversation)
+	if !ok {
+		return AGYNoFallback
+	}
+	last := -1
+	for _, s := range steps {
+		if s.StepIndex > last {
+			last = s.StepIndex
+		}
+	}
+	return last
+}
+
+// agyTranscriptFinal returns the conversation's final answer only when the
+// newest turn started after step afterStep (so it belongs to this run), every
+// tool call in that turn got a result, and the turn ended with a finished
+// model reply without tool calls.
+func agyTranscriptFinal(conversation string, afterStep int) string {
+	if afterStep == AGYNoFallback {
 		return ""
 	}
-	if !found || last.Type != "PLANNER_RESPONSE" || last.Status != "DONE" || len(last.ToolCalls) > 0 {
+	steps, ok := agyTranscript(conversation)
+	if !ok {
+		return ""
+	}
+	turn := -1
+	for i, s := range steps {
+		if s.Type == "USER_INPUT" {
+			turn = i
+		}
+	}
+	if turn < 0 || steps[turn].StepIndex <= afterStep {
+		return ""
+	}
+	pending := 0
+	for _, s := range steps[turn+1:] {
+		switch s.Type {
+		case "PLANNER_RESPONSE":
+			if pending > 0 {
+				return ""
+			}
+			pending = len(s.ToolCalls)
+		case "ERROR_MESSAGE":
+		default:
+			if pending > 0 && s.Status == "DONE" {
+				pending--
+			}
+		}
+	}
+	last := steps[len(steps)-1]
+	if pending > 0 || last.Type != "PLANNER_RESPONSE" || last.Status != "DONE" || len(last.ToolCalls) > 0 {
 		return ""
 	}
 	return strings.TrimSpace(last.Content)

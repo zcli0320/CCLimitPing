@@ -948,3 +948,53 @@ func TestAGYTranscriptMultiToolCallsPartialCompletionAndInvalidJSON(t *testing.T
 		}
 	}
 }
+
+// Runner finalization, not just the evaluator, must accept AGY 1.5.0's normal
+// exit: no "Stream completed" line, but an idle DB row and a finished reply.
+func TestFinalizeExitedAGYSessionUsesStoresWhenLogHasNoCompletionLine(t *testing.T) {
+	convID := "2599015c-cf8e-4f33-9864-e801e37380c6"
+	cases := []struct {
+		name, status, lastStep string
+		notFullyIdle           int
+		want                   AGYGuardState
+	}{
+		{"finished reply", "CASCADE_RUN_STATUS_IDLE", `{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","content":"OK"}`, 0, AGYGuardStateIdle},
+		{"db still running", "CASCADE_RUN_STATUS_RUNNING", `{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","content":"OK"}`, 1, AGYGuardStateWaitingUserAction},
+		{"tool call unanswered", "CASCADE_RUN_STATUS_IDLE", `{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","tool_calls":[{"name":"run_command"}]}`, 0, AGYGuardStateWaitingUserAction},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			home := t.TempDir()
+			agyRoot := filepath.Join(home, ".gemini", "antigravity-cli")
+			dir := filepath.Join(agyRoot, "brain", convID, ".system_generated", "logs")
+			if err := os.MkdirAll(dir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			transcript := `{"step_index":0,"type":"USER_INPUT","status":"DONE","content":"请只回复 OK"}` + "\n" + c.lastStep + "\n"
+			if err := os.WriteFile(filepath.Join(dir, "transcript.jsonl"), []byte(transcript), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			sql := fmt.Sprintf("CREATE TABLE conversation_summaries (conversation_id TEXT PRIMARY KEY, status TEXT, step_count INTEGER, not_fully_idle INTEGER, killed INTEGER, last_user_input_step_index INTEGER, workspace_uris TEXT); "+
+				"INSERT INTO conversation_summaries VALUES ('%s', '%s', 2, %d, 0, 0, 'file:///tmp');", convID, c.status, c.notFullyIdle)
+			if out, err := exec.Command("/usr/bin/sqlite3", filepath.Join(agyRoot, "conversation_summaries.db"), sql).CombinedOutput(); err != nil {
+				t.Fatalf("sqlite3: %v %s", err, out)
+			}
+			logFile := filepath.Join(home, "agy.log")
+			log := strings.Join([]string{
+				"I1104 15:33:55.403679    1373 conversation_manager.go:1064] Streaming conversation " + convID,
+				"I1104 15:33:55.405615    1373 conversation_manager.go:874] Forwarding user message to conversation " + convID + " (items=1, media=0)",
+				"I1104 15:34:18.477713       1 common.go:548] CLI program exited, shutting down",
+				"I1104 15:34:18.480347    1709 server.go:1308] Stream goroutine exited for " + convID + ", sending completion signal",
+			}, "\n") + "\n"
+			if err := os.WriteFile(logFile, []byte(log), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			r := Reader{Home: home, SQLite: "/usr/bin/sqlite3"}
+			session := AGYGuardSession{ConversationID: convID}
+			r.finalizeExitedAGYSession(&session, logFile, 0)
+			if session.State != c.want || !session.Exited {
+				t.Fatalf("state=%s exited=%v msg=%s", session.State, session.Exited, session.Message)
+			}
+		})
+	}
+}
