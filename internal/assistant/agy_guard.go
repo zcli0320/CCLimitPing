@@ -1391,7 +1391,13 @@ func EvaluateAGYGuardState(in AGYEvaluationInput) AGYEvaluationDecision {
 	var signals []AGYSignalEvidence
 
 	if !in.ChildAlive {
-		if in.Log.LastTurnStartedLine > 0 && in.Log.LastTurnCompletedLine < in.Log.LastTurnStartedLine {
+		// AGY 1.5.0 logs no "Stream completed" line for a normally finished turn;
+		// an idle DB row plus a finished final reply in the transcript proves it.
+		dbIdleAtExit := in.DBReadable && in.DB.Status == "CASCADE_RUN_STATUS_IDLE" && !in.DB.NotFullyIdle &&
+			in.Transcript.Readable && !in.Transcript.ParseError && !in.Transcript.PendingToolCall &&
+			in.Transcript.RunningStepCount == 0 &&
+			in.Transcript.LastStepType == "PLANNER_RESPONSE" && in.Transcript.LastStepStatus == "DONE"
+		if in.Log.LastTurnStartedLine > 0 && in.Log.LastTurnCompletedLine < in.Log.LastTurnStartedLine && !dbIdleAtExit {
 			reason := "AGY 进程已退出，但最后一轮任务未见完成信号（不凭退出码宣告完成）"
 			signals = append(signals, AGYSignalEvidence{Source: "process_exit", Confidence: "high", Detail: reason})
 			return AGYEvaluationDecision{

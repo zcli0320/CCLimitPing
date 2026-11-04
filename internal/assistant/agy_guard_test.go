@@ -391,6 +391,37 @@ func TestEvaluateAGYGuardStateAllVerificationScenarios(t *testing.T) {
 			t.Fatalf("expected incomplete turn on exit to enter WaitingUserAction, got state=%s msg=%s", dec.State, dec.Message)
 		}
 	})
+
+	// AGY 1.5.0: a normally finished turn leaves no "Stream completed" log line;
+	// the DB row and the transcript's final reply are what prove completion.
+	t.Run("14_ExitAfterTurnFinishedWithoutLogCompletionLine_IsIdle", func(t *testing.T) {
+		in := baseInput()
+		in.ChildAlive = false
+		in.Log.LastTurnStartedLine = 20
+		in.Log.LastTurnCompletedLine = 0
+		in.DB.Status = "CASCADE_RUN_STATUS_IDLE"
+		in.DB.NotFullyIdle = false
+		in.Transcript.LastStepType = "PLANNER_RESPONSE"
+		in.Transcript.LastStepStatus = "DONE"
+		in.Transcript.RunningStepCount = 0
+		in.Transcript.PendingToolCall = false
+		dec := EvaluateAGYGuardState(in)
+		if dec.State != AGYGuardStateIdle || dec.ShouldTrigger {
+			t.Fatalf("expected finished turn on exit to be idle, got state=%s msg=%s", dec.State, dec.Message)
+		}
+
+		pending := in
+		pending.Transcript.PendingToolCall = true
+		if dec := EvaluateAGYGuardState(pending); dec.State != AGYGuardStateWaitingUserAction {
+			t.Fatalf("pending tool call on exit must not be idle, got state=%s", dec.State)
+		}
+		running := in
+		running.DB.Status = "CASCADE_RUN_STATUS_RUNNING"
+		running.DB.NotFullyIdle = true
+		if dec := EvaluateAGYGuardState(running); dec.State != AGYGuardStateWaitingUserAction {
+			t.Fatalf("running DB row on exit must not be idle, got state=%s", dec.State)
+		}
+	})
 }
 
 func TestAGYMultiSessionIsolationAndAbnormalRunnerExitCleanup(t *testing.T) {
