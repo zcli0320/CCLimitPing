@@ -995,6 +995,17 @@ func TestFinalizeExitedAGYSessionUsesStoresWhenLogHasNoCompletionLine(t *testing
 			if session.State != c.want || !session.Exited {
 				t.Fatalf("state=%s exited=%v msg=%s", session.State, session.Exited, session.Message)
 			}
+			// Without a readable log only AGY's own stores may prove completion.
+			missing := AGYGuardSession{ConversationID: convID}
+			r.finalizeExitedAGYSession(&missing, filepath.Join(home, "missing.log"), 0)
+			if missing.State != c.want {
+				t.Fatalf("unreadable log: state=%s msg=%s", missing.State, missing.Message)
+			}
+			unbound := AGYGuardSession{}
+			r.finalizeExitedAGYSession(&unbound, filepath.Join(home, "missing.log"), 0)
+			if unbound.State != AGYGuardStateWaitingUserAction {
+				t.Fatalf("unreadable log without conversation must not be idle, got %s", unbound.State)
+			}
 		})
 	}
 }

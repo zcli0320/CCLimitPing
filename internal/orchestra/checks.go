@@ -94,7 +94,7 @@ func (r *Runner) beginChecks(a *active) (bool, bool) {
 		return false, false
 	}
 	exit := a.cmd.ProcessState.ExitCode()
-	session, final, _ := a.agent.result(a.files.out, a.files.last, a.agyAfterStep)
+	session, final, _ := a.agent.result(a.files.out, a.files.last, a.agyRun)
 	if final == "" || (a.agent.Name == "codex" && exit != 0 && usageLimit(a.files.out, a.files.err)) {
 		return false, false
 	}

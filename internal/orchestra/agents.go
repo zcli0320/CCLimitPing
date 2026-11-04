@@ -139,8 +139,8 @@ func (a Agent) prepare(path, session, folder, prompt, lastFile string) (Invocati
 }
 
 // result reads the executor's session id and final message from its output.
-// afterStep only matters for Antigravity; see agyTranscriptFinal.
-func (a Agent) result(stdoutPath, lastFile string, afterStep int) (session, final string, err error) {
+// run only matters for Antigravity; see agyTranscriptFinal.
+func (a Agent) result(stdoutPath, lastFile string, run AGYRunIdentity) (session, final string, err error) {
 	data, _ := os.ReadFile(stdoutPath)
 	switch a.Name {
 	case "codex":
@@ -196,7 +196,7 @@ func (a Agent) result(stdoutPath, lastFile string, afterStep int) (session, fina
 		if out.Status != "SUCCESS" {
 			// A stream that dies after the turn already finished (agy's
 			// post-reply EOF) still left the answer in the transcript.
-			if final := agyTranscriptFinal(out.ConversationID, afterStep); final != "" {
+			if final := agyTranscriptFinal(out.ConversationID, run); final != "" {
 				return out.ConversationID, final, nil
 			}
 			return out.ConversationID, "", fmt.Errorf("Antigravity 报告错误：%s", out.Status)
@@ -287,12 +287,20 @@ func AGYTranscriptLastStep(conversation string) int {
 	return last
 }
 
+// AGYRunIdentity ties a transcript turn to one run: the turn must start after
+// AfterStep (the conversation's last step before launch) and its input must
+// carry Marker, which the runner appends to the prompt.
+type AGYRunIdentity struct {
+	AfterStep int
+	Marker    string
+}
+
 // agyTranscriptFinal returns the conversation's final answer only when the
-// newest turn started after step afterStep (so it belongs to this run), every
-// tool call in that turn got a result, and the turn ended with a finished
-// model reply without tool calls.
-func agyTranscriptFinal(conversation string, afterStep int) string {
-	if afterStep == AGYNoFallback {
+// newest turn is this run's (see AGYRunIdentity), its steps are contiguous and
+// all finished, every tool call got a result, and it ended with a finished
+// model reply without tool calls. Anything it cannot vouch for fails closed.
+func agyTranscriptFinal(conversation string, run AGYRunIdentity) string {
+	if run.AfterStep == AGYNoFallback || strings.TrimSpace(run.Marker) == "" {
 		return ""
 	}
 	steps, ok := agyTranscript(conversation)
@@ -305,26 +313,32 @@ func agyTranscriptFinal(conversation string, afterStep int) string {
 			turn = i
 		}
 	}
-	if turn < 0 || steps[turn].StepIndex <= afterStep {
+	if turn < 0 || steps[turn].StepIndex <= run.AfterStep || !strings.Contains(steps[turn].Content, run.Marker) {
 		return ""
 	}
 	pending := 0
-	for _, s := range steps[turn+1:] {
+	for i, s := range steps[turn:] {
+		if s.StepIndex != steps[turn].StepIndex+i || s.Status != "DONE" {
+			return ""
+		}
 		switch s.Type {
+		case "USER_INPUT", "ERROR_MESSAGE":
 		case "PLANNER_RESPONSE":
 			if pending > 0 {
 				return ""
 			}
 			pending = len(s.ToolCalls)
-		case "ERROR_MESSAGE":
-		default:
-			if pending > 0 && s.Status == "DONE" {
-				pending--
+		case "GENERIC":
+			if pending == 0 {
+				return ""
 			}
+			pending--
+		default:
+			return ""
 		}
 	}
 	last := steps[len(steps)-1]
-	if pending > 0 || last.Type != "PLANNER_RESPONSE" || last.Status != "DONE" || len(last.ToolCalls) > 0 {
+	if pending > 0 || last.Type != "PLANNER_RESPONSE" || len(last.ToolCalls) > 0 {
 		return ""
 	}
 	return strings.TrimSpace(last.Content)

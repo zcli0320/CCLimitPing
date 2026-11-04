@@ -165,7 +165,7 @@ type active struct {
 	cmd          *exec.Cmd
 	done         chan error
 	start        time.Time
-	agyAfterStep int // Antigravity transcript step before this run; see agyTranscriptFinal
+	agyRun       AGYRunIdentity // binds an Antigravity transcript turn to this run
 	files        runFiles
 	agent        Agent
 	term         time.Time // when SIGTERM was sent
@@ -417,6 +417,10 @@ func (r *Runner) start(snap *Task) *active {
 			}
 		}
 		prompt += "\nEnd with RECEIPT <id>: <done|blocked> / Changed: / Verified: (commands and results) / Doubts:.\n"
+		if t.Executor == "antigravity" {
+			// Ties this run's turn in the agy transcript to this run; see agyTranscriptFinal.
+			prompt += "Run marker: " + marker + "\n"
+		}
 		var dir string
 		err := error(nil)
 		if !ok {
@@ -465,9 +469,9 @@ func (r *Runner) start(snap *Task) *active {
 		if len(t.Checks) > 0 || len(t.Scope) > 0 {
 			baseline = snapshotGit(inv.Dir)
 		}
-		agyAfterStep := -1
+		agyRun := AGYRunIdentity{AfterStep: -1, Marker: marker}
 		if agent.Name == "antigravity" {
-			agyAfterStep = AGYTranscriptLastStep(t.Session)
+			agyRun.AfterStep = AGYTranscriptLastStep(t.Session)
 		}
 		cmd, err := launch(inv, files)
 		if err != nil {
@@ -477,7 +481,7 @@ func (r *Runner) start(snap *Task) *active {
 			return nil
 		}
 		run.PID = cmd.Process.Pid
-		a = &active{id: t.ID, cmd: cmd, done: make(chan error, 1), start: run.Started, files: files, agent: agent, agyAfterStep: agyAfterStep, baseline: baseline, folder: inv.Dir, env: inv.Env, checks: append([]string(nil), t.Checks...)}
+		a = &active{id: t.ID, cmd: cmd, done: make(chan error, 1), start: run.Started, files: files, agent: agent, agyRun: agyRun, baseline: baseline, folder: inv.Dir, env: inv.Env, checks: append([]string(nil), t.Checks...)}
 		return nil
 	})
 	if a == nil {
@@ -582,7 +586,7 @@ func descendants(pid int) []int {
 
 func (r *Runner) finish(a *active, why string) {
 	exit := a.cmd.ProcessState.ExitCode()
-	session, final, perr := a.agent.result(a.files.out, a.files.last, a.agyAfterStep)
+	session, final, perr := a.agent.result(a.files.out, a.files.last, a.agyRun)
 	limited := why == "" && a.agent.Name == "codex" && (final == "" || exit != 0) && usageLimit(a.files.out, a.files.err)
 	var changes *ChangeEvidence
 	if a.baseline.status != "" {

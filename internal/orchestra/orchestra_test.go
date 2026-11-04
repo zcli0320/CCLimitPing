@@ -319,6 +319,11 @@ printf '%s' '{"conversation_id":"agy-s1","status":"SUCCESS","response":"RECEIPT 
 	if !strings.Contains(string(log), "--conversation\nagy-s1\n") {
 		t.Fatalf("argv=%s", log)
 	}
+	for _, run := range task.Runs {
+		if run.Marker == "" || !strings.Contains(string(log), "Run marker: "+run.Marker+"\n") {
+			t.Fatalf("prompt lacks run marker %q: %s", run.Marker, log)
+		}
+	}
 }
 
 func TestAntigravityPrepare(t *testing.T) {
@@ -372,7 +377,7 @@ func TestAntigravityResult(t *testing.T) {
 			if err := os.WriteFile(path, []byte(c.output), 0600); err != nil {
 				t.Fatal(err)
 			}
-			session, final, err := (Agent{Name: "antigravity"}).result(path, "unused", -1)
+			session, final, err := (Agent{Name: "antigravity"}).result(path, "unused", AGYRunIdentity{AfterStep: -1})
 			if session != c.session || final != c.final {
 				t.Fatalf("session=%q final=%q", session, final)
 			}
@@ -401,7 +406,8 @@ func TestAntigravityResultFallsBackToFinishedTranscript(t *testing.T) {
 	tool := func(i int) string { return step(i, "PLANNER_RESPONSE", `,"tool_calls":[{"name":"run_command"}]`) }
 	result := func(i int) string { return step(i, "GENERIC", `,"content":"Command exited with code 0."`) }
 	eof := func(i int) string { return step(i, "ERROR_MESSAGE", `,"error":"EOF"`) }
-	input := func(i int) string { return step(i, "USER_INPUT", `,"content":"TASK"`) }
+	input := func(i int) string { return step(i, "USER_INPUT", `,"content":"TASK\\nRun marker: m1"`) }
+	other := func(i int) string { return step(i, "USER_INPUT", `,"content":"someone else"`) }
 	const ok = "all 9 tests pass"
 	cases := []struct {
 		name       string
@@ -420,6 +426,10 @@ func TestAntigravityResultFallsBackToFinishedTranscript(t *testing.T) {
 		{"torn last line", []string{input(0), reply(1), `{"step_index":2,"ty`}, -1, false, "", "报告错误"},
 		{"denied action wins", []string{input(0), reply(1)}, -1, true, "", "拒绝了操作"},
 		{"no transcript", nil, -1, false, "", "报告错误"},
+		{"concurrent turn by someone else", []string{input(0), reply(1), other(2), reply(3)}, -1, false, "", "报告错误"},
+		{"unfinished step before final", []string{input(0), tool(1), strings.Replace(step(2, "GENERIC", ""), "DONE", "RUNNING", 1), reply(3)}, -1, false, "", "报告错误"},
+		{"missing step indices", []string{input(0), reply(3)}, -1, false, "", "报告错误"},
+		{"unknown record as tool result", []string{input(0), tool(1), step(2, "SOMETHING_NEW", ""), reply(3)}, -1, false, "", "报告错误"},
 	}
 	for i, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -441,7 +451,7 @@ func TestAntigravityResultFallsBackToFinishedTranscript(t *testing.T) {
 			if err := os.WriteFile(path, []byte(out+"}"), 0600); err != nil {
 				t.Fatal(err)
 			}
-			session, final, err := (Agent{Name: "antigravity"}).result(path, "unused", c.afterStep)
+			session, final, err := (Agent{Name: "antigravity"}).result(path, "unused", AGYRunIdentity{AfterStep: c.afterStep, Marker: "m1"})
 			if session != conv || final != c.final {
 				t.Fatalf("session=%q final=%q", session, final)
 			}
@@ -450,7 +460,7 @@ func TestAntigravityResultFallsBackToFinishedTranscript(t *testing.T) {
 			}
 		})
 	}
-	if agyTranscriptFinal("../escape", -1) != "" {
+	if agyTranscriptFinal("../escape", AGYRunIdentity{AfterStep: -1, Marker: "m1"}) != "" {
 		t.Fatal("conversation id must not escape the brain root")
 	}
 }
