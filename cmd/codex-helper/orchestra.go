@@ -198,9 +198,10 @@ func orchestraCommand() {
 		if *lead == "" || fs.NArg() != 0 {
 			orchestraFail(fmt.Errorf("mcp requires --lead <name>"))
 		}
+		cwd, _ := os.Getwd()
 		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 		defer stop()
-		if err := orchestra.ServeMCP(ctx, os.Stdin, os.Stdout, cfg, store, *lead); err != nil {
+		if err := orchestra.ServeMCP(ctx, os.Stdin, os.Stdout, cfg, store, *lead, cwd); err != nil {
 			orchestraFail(err)
 		}
 		return

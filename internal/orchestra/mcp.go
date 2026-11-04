@@ -57,10 +57,56 @@ func mcpTools() []mcpTool {
 		{"rework_task", "请求返工 / Request rework", schema([]string{"id", "text"}, map[string]any{"id": str, "text": str})},
 		{"cancel_task", "取消任务 / Cancel a task", id()},
 		{"accept_task", "验收任务 / Accept a task", id()},
-		{"list_projects", "列出项目 / List projects", schema(nil, map[string]any{"include_archived": map[string]any{"type": "boolean", "default": false}})},
+		{"list_projects", "列出项目 / List projects", schema(nil, map[string]any{"include_archived": map[string]any{"type": "boolean", "default": false}, "mine": map[string]any{"type": "boolean", "default": false}})},
 		{"get_project", "读取项目 / Get a project", id()},
 		{"create_project", "创建项目 / Create a project", schema([]string{"id", "name", "folder", "executor"}, map[string]any{"id": str, "name": str, "folder": str, "executor": str, "lead": str, "reviewer": str, "checks": checks, "scope": scope})},
 	}
+}
+
+type projectView struct {
+	Project
+	ContainsCWD bool `json:"contains_cwd"`
+}
+
+func leadInstructions(lead string, projects []*Project, cwd string, runnerActive bool) string {
+	lines := []string{
+		"本服务向执行代理派发任务卡：通过 dispatch_task 派发，wait_task 等待回执，accept_task 验收或 rework_task 返工。",
+	}
+	var mine []*Project
+	for _, p := range projects {
+		if p != nil && !p.Archived && lead != "" && (p.Lead == lead || p.Reviewer == lead) {
+			mine = append(mine, p)
+		}
+	}
+	const maxProjects = 15
+	for i, p := range mine {
+		if i >= maxProjects {
+			break
+		}
+		role := "lead"
+		if p.Lead == lead && p.Reviewer == lead {
+			role = "lead/reviewer"
+		} else if p.Reviewer == lead {
+			role = "reviewer"
+		}
+		rev := p.Reviewer
+		if rev == "" {
+			rev = "-"
+		}
+		lines = append(lines, fmt.Sprintf("- %s (%s) role=%s folder=%s executor=%s reviewer=%s", p.ID, p.Name, role, p.Folder, p.Executor, rev))
+	}
+	if len(mine) > maxProjects {
+		lines = append(lines, fmt.Sprintf("…另有 %d 个项目未列出", len(mine)-maxProjects))
+	}
+	if cur, err := pickProject(projectsForFolder(projects, cwd), lead); cur != nil {
+		lines = append(lines, fmt.Sprintf("当前目录属于项目 %s，dispatch_task 可省略 project 和 folder", cur.ID))
+	} else if err != nil {
+		lines = append(lines, err.Error()+"；派发时须指定 project")
+	}
+	if !runnerActive {
+		lines = append(lines, "执行器未运行：任务只会排队，需在小助手『协作』窗口启动执行器")
+	}
+	return strings.Join(lines, "\n")
 }
 
 type taskView struct {
@@ -75,6 +121,7 @@ type taskView struct {
 	ReviewOf      string        `json:"review_of,omitempty"`
 	ReviewTask    string        `json:"review_task,omitempty"`
 	ReviewVerdict string        `json:"review_verdict,omitempty"`
+	RunnerActive  *bool         `json:"runner_active,omitempty"`
 	Note          string        `json:"note,omitempty"`
 	Evidence      *EvidenceView `json:"evidence,omitempty"`
 }
@@ -121,13 +168,14 @@ func waitTimeout(seconds *int) (time.Duration, error) {
 	return time.Duration(*seconds) * time.Second, nil
 }
 
-func callMCPTool(ctx context.Context, cfg Config, store Store, lead, name string, raw json.RawMessage) (any, error) {
+func callMCPTool(ctx context.Context, cfg Config, store Store, lead, cwd, name string, raw json.RawMessage) (any, error) {
 	var args struct {
 		Project         string   `json:"project"`
 		Name            string   `json:"name"`
 		Lead            string   `json:"lead"`
 		Reviewer        string   `json:"reviewer"`
 		IncludeArchived bool     `json:"include_archived"`
+		Mine            bool     `json:"mine"`
 		Executor        string   `json:"executor"`
 		Folder          string   `json:"folder"`
 		ID              string   `json:"id"`
@@ -182,15 +230,28 @@ func callMCPTool(ctx context.Context, cfg Config, store Store, lead, name string
 		if e != nil {
 			return nil, e
 		}
-		out := []*Project{}
+		out := []projectView{}
 		for _, p := range ps {
-			if args.IncludeArchived || !p.Archived {
-				out = append(out, p)
+			if !args.IncludeArchived && p.Archived {
+				continue
 			}
+			if args.Mine && (lead == "" || (p.Lead != lead && p.Reviewer != lead)) {
+				continue
+			}
+			out = append(out, projectView{Project: *p, ContainsCWD: folderContains(p.Folder, cwd)})
 		}
 		return out, nil
 	case "dispatch_task":
-		if args.Project == "" && (args.Executor == "" || args.Folder == "") {
+		if args.Project == "" && args.Folder == "" && args.Executor == "" {
+			p, e := store.ProjectForFolder(lead, cwd)
+			if e != nil {
+				return nil, e
+			}
+			if p == nil {
+				return nil, fmt.Errorf("未指定 project 或 executor/folder，且当前目录 %s 不属于任何项目", cwd)
+			}
+			args.Project = p.ID
+		} else if args.Project == "" && (args.Executor == "" || args.Folder == "") {
 			return nil, errors.New("缺少 executor 或 folder（或指定 project）")
 		}
 		t, e := store.DispatchInProject(cfg, lead, args.Project, args.Executor, args.Folder, args.ID, args.Card, args.Checks, args.Scope)
@@ -199,6 +260,8 @@ func callMCPTool(ctx context.Context, cfg Config, store Store, lead, name string
 		}
 		v := view(t)
 		if !RunnerActive(cfg.Dir) {
+			active := false
+			v.RunnerActive = &active
 			v.Note = "执行器未运行，请启动 codex-helper orchestra run / Start the runner"
 		}
 		return v, nil
@@ -271,7 +334,7 @@ func callMCPTool(ctx context.Context, cfg Config, store Store, lead, name string
 // ServeMCP serves newline-delimited JSON-RPC over stdio. Tool calls run
 // concurrently, so a long wait_task doesn't hold up other calls, and
 // notifications/cancelled stops the matching call.
-func ServeMCP(ctx context.Context, in io.Reader, out io.Writer, cfg Config, store Store, lead string) error {
+func ServeMCP(ctx context.Context, in io.Reader, out io.Writer, cfg Config, store Store, lead, cwd string) error {
 	scanner := bufio.NewScanner(in)
 	scanner.Buffer(make([]byte, 4096), 4<<20)
 	enc := json.NewEncoder(out)
@@ -343,7 +406,13 @@ func ServeMCP(ctx context.Context, in io.Reader, out io.Writer, cfg Config, stor
 			if json.Unmarshal(req.Params, &p) != nil || p.ProtocolVersion == "" {
 				rpcErr = &mcpError{-32602, "Invalid params"}
 			} else {
-				result = map[string]any{"protocolVersion": p.ProtocolVersion, "capabilities": map[string]any{"tools": map[string]any{}}, "serverInfo": map[string]string{"name": "codex-helper-orchestra", "version": "0.1.0"}}
+				ps, _ := store.ListProjects()
+				result = map[string]any{
+					"protocolVersion": p.ProtocolVersion,
+					"capabilities":    map[string]any{"tools": map[string]any{}},
+					"serverInfo":      map[string]string{"name": "codex-helper-orchestra", "version": "0.1.0"},
+					"instructions":    leadInstructions(lead, ps, cwd, RunnerActive(cfg.Dir)),
+				}
 			}
 		case "ping":
 			result = map[string]any{}
@@ -366,7 +435,7 @@ func ServeMCP(ctx context.Context, in io.Reader, out io.Writer, cfg Config, stor
 			calls.Add(1)
 			go func(id json.RawMessage) {
 				defer calls.Done()
-				v, e := callMCPTool(callCtx, cfg, store, lead, p.Name, p.Arguments)
+				v, e := callMCPTool(callCtx, cfg, store, lead, cwd, p.Name, p.Arguments)
 				mu.Lock()
 				delete(inflight, key)
 				mu.Unlock()

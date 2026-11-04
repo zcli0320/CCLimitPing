@@ -22,7 +22,7 @@ func startMCP(t *testing.T, e env) mcpFixture {
 	reader, out := io.Pipe()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- ServeMCP(ctx, in, out, e.cfg, e.store, "claude"); out.Close() }()
+	go func() { done <- ServeMCP(ctx, in, out, e.cfg, e.store, "claude", ""); out.Close() }()
 	t.Cleanup(func() {
 		writer.Close()
 		cancel()
@@ -119,15 +119,15 @@ func TestMCPProtocolAndTools(t *testing.T) {
 func TestMCPDispatchEvidenceValidationAndGet(t *testing.T) {
 	e := setup(t)
 	bad, _ := json.Marshal(map[string]any{"executor": "codex", "folder": e.folder, "id": "X1", "card": "test", "checks": []string{"ok"}, "scope": []string{"../escape"}})
-	if _, err := callMCPTool(context.Background(), e.cfg, e.store, "lead", "dispatch_task", bad); err == nil {
+	if _, err := callMCPTool(context.Background(), e.cfg, e.store, "lead", "", "dispatch_task", bad); err == nil {
 		t.Fatal("unsafe scope accepted")
 	}
 	tooLong, _ := json.Marshal(map[string]any{"executor": "codex", "folder": e.folder, "id": "X1", "card": "test", "checks": []string{strings.Repeat("x", 501)}})
-	if _, err := callMCPTool(context.Background(), e.cfg, e.store, "lead", "dispatch_task", tooLong); err == nil {
+	if _, err := callMCPTool(context.Background(), e.cfg, e.store, "lead", "", "dispatch_task", tooLong); err == nil {
 		t.Fatal("oversized check accepted")
 	}
 	good, _ := json.Marshal(map[string]any{"executor": "codex", "folder": e.folder, "id": "X1", "card": "test", "checks": []string{"true"}, "scope": []string{"src/"}})
-	if _, err := callMCPTool(context.Background(), e.cfg, e.store, "lead", "dispatch_task", good); err != nil {
+	if _, err := callMCPTool(context.Background(), e.cfg, e.store, "lead", "", "dispatch_task", good); err != nil {
 		t.Fatal(err)
 	}
 	_, err := e.store.Update("X1", func(t *Task) error {
@@ -138,7 +138,7 @@ func TestMCPDispatchEvidenceValidationAndGet(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := callMCPTool(context.Background(), e.cfg, e.store, "lead", "get_task", json.RawMessage(`{"id":"X1"}`))
+	got, err := callMCPTool(context.Background(), e.cfg, e.store, "lead", "", "get_task", json.RawMessage(`{"id":"X1"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -275,7 +275,7 @@ func TestMCPProjectsAndTaskFilter(t *testing.T) {
 	}
 
 	// list_tasks with project filter.
-	raw, err := callMCPTool(context.Background(), e.cfg, e.store, "claude", "list_tasks", json.RawMessage(`{"project":"P1"}`))
+	raw, err := callMCPTool(context.Background(), e.cfg, e.store, "claude", "", "list_tasks", json.RawMessage(`{"project":"P1"}`))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -288,12 +288,12 @@ func TestMCPProjectsAndTaskFilter(t *testing.T) {
 	if _, err := e.store.ArchiveProject("P1"); err != nil {
 		t.Fatal(err)
 	}
-	raw, err = callMCPTool(context.Background(), e.cfg, e.store, "claude", "list_projects", json.RawMessage(`{}`))
-	if err != nil || len(raw.([]*Project)) != 0 {
+	raw, err = callMCPTool(context.Background(), e.cfg, e.store, "claude", "", "list_projects", json.RawMessage(`{}`))
+	if err != nil || len(raw.([]projectView)) != 0 {
 		t.Fatalf("list_projects active: %v %v", raw, err)
 	}
-	raw, err = callMCPTool(context.Background(), e.cfg, e.store, "claude", "list_projects", json.RawMessage(`{"include_archived":true}`))
-	if err != nil || len(raw.([]*Project)) != 1 {
+	raw, err = callMCPTool(context.Background(), e.cfg, e.store, "claude", "", "list_projects", json.RawMessage(`{"include_archived":true}`))
+	if err != nil || len(raw.([]projectView)) != 1 {
 		t.Fatalf("list_projects all: %v %v", raw, err)
 	}
 }

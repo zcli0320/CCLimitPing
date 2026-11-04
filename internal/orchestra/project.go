@@ -258,3 +258,92 @@ func (s Store) AssignProject(taskIDStr, projectID string) (*Task, error) {
 	}
 	return t, nil
 }
+
+func resolveDir(dir string) string {
+	dir = strings.TrimSpace(dir)
+	if dir == "" {
+		return ""
+	}
+	if r, err := filepath.EvalSymlinks(dir); err == nil {
+		return filepath.Clean(r)
+	}
+	if filepath.IsAbs(dir) {
+		return filepath.Clean(dir)
+	}
+	return ""
+}
+
+func folderContains(folder, dir string) bool {
+	folder, dir = resolveDir(folder), resolveDir(dir)
+	if folder == "" || dir == "" {
+		return false
+	}
+	if dir == folder {
+		return true
+	}
+	prefix := strings.TrimRight(folder, string(os.PathSeparator)) + string(os.PathSeparator)
+	return strings.HasPrefix(dir, prefix)
+}
+
+// projectsForFolder returns the non-archived projects with the deepest folder
+// containing dir; several projects may share one folder.
+func projectsForFolder(projects []*Project, dir string) []*Project {
+	dir = resolveDir(dir)
+	if dir == "" {
+		return nil
+	}
+	var best []*Project
+	bestLen := -1
+	for _, p := range projects {
+		if p == nil || p.Archived {
+			continue
+		}
+		f := resolveDir(p.Folder)
+		if !folderContains(f, dir) {
+			continue
+		}
+		switch {
+		case len(f) > bestLen:
+			best, bestLen = []*Project{p}, len(f)
+		case len(f) == bestLen:
+			best = append(best, p)
+		}
+	}
+	return best
+}
+
+// ProjectForFolder picks the project dir belongs to for lead: the deepest
+// matching folder, preferring projects lead leads when a folder is shared.
+// nil, nil means dir is in no project; several equal candidates is an error.
+func (s Store) ProjectForFolder(lead, dir string) (*Project, error) {
+	ps, err := s.ListProjects()
+	if err != nil {
+		return nil, err
+	}
+	return pickProject(projectsForFolder(ps, dir), lead)
+}
+
+func pickProject(candidates []*Project, lead string) (*Project, error) {
+	if len(candidates) > 1 && lead != "" {
+		var led []*Project
+		for _, p := range candidates {
+			if p.Lead == lead {
+				led = append(led, p)
+			}
+		}
+		if len(led) > 0 {
+			candidates = led
+		}
+	}
+	switch len(candidates) {
+	case 0:
+		return nil, nil
+	case 1:
+		return candidates[0], nil
+	}
+	ids := make([]string, len(candidates))
+	for i, p := range candidates {
+		ids[i] = p.ID
+	}
+	return nil, fmt.Errorf("当前目录同时属于多个项目（%s），请指定 project", strings.Join(ids, "、"))
+}
