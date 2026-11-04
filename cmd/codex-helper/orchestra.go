@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 
@@ -18,8 +19,9 @@ import (
 
 const orchestraUsage = `Usage: codex-helper orchestra <command>
   agents                                   executors and whether each can run
-  project create --id <id> --name <n> --folder <dir> --to <agent> [--reviewer <r>] [--lead <l>] [--check <c>]... [--scope <s>]...
-  project list [--all] | project get <id> | project archive <id>
+  project create --id <id> --name <n> --folder <dir> --to <agent> [--reviewer <r>] [--lead <l>] [--check <c>]... [--scope <s>]... [--sync-agents-md]
+  project update <id> [--name <n>] [--folder <dir>] [--to <agent>] [--lead <l>] [--reviewer <r>] [--check <c>]... [--clear-checks] [--scope <s>]... [--clear-scope] [--sync-agents-md=true|false]
+  project list [--all] | project get <id> | project path <id> | project archive <id>
   dispatch [--project <id>] [--to <agent>] [--folder <dir>] --id <id> [--lead <agent>]   card on stdin
   assign --id <task-id> [--project <project-id>]
   list [--project <id>] | get <id>
@@ -94,6 +96,80 @@ type repeatedString []string
 
 func (r *repeatedString) String() string     { return fmt.Sprint([]string(*r)) }
 func (r *repeatedString) Set(v string) error { *r = append(*r, v); return nil }
+
+func parseProjectUpdateFlags(pargs []string) (string, orchestra.ProjectPatch, error) {
+	var id string
+	if len(pargs) > 0 && !strings.HasPrefix(pargs[0], "-") {
+		id, pargs = pargs[0], pargs[1:]
+	}
+	fs := flag.NewFlagSet("project update", flag.ContinueOnError)
+	idFlag := fs.String("id", "", "project id")
+	name := fs.String("name", "", "project name")
+	folder := fs.String("folder", "", "working folder")
+	to := fs.String("to", "", "executor agent")
+	lead := fs.String("lead", "", "lead agent")
+	reviewer := fs.String("reviewer", "", "reviewer agent")
+	clearChecks := fs.Bool("clear-checks", false, "clear all checks")
+	clearScope := fs.Bool("clear-scope", false, "clear all scope prefixes")
+	syncAgents := fs.Bool("sync-agents-md", false, "sync managed block in AGENTS.md")
+	var checks, scope repeatedString
+	fs.Var(&checks, "check", "check command (repeatable)")
+	fs.Var(&scope, "scope", "allowed path prefix (repeatable)")
+	if err := fs.Parse(pargs); err != nil {
+		return "", orchestra.ProjectPatch{}, err
+	}
+	if id == "" && *idFlag != "" {
+		id = *idFlag
+	}
+	if id == "" && fs.NArg() == 1 {
+		id = fs.Arg(0)
+	} else if fs.NArg() != 0 {
+		return "", orchestra.ProjectPatch{}, fmt.Errorf("unexpected project update arguments")
+	}
+	if id == "" {
+		return "", orchestra.ProjectPatch{}, fmt.Errorf("project update requires <id>")
+	}
+	var patch orchestra.ProjectPatch
+	seen := map[string]bool{}
+	fs.Visit(func(f *flag.Flag) {
+		seen[f.Name] = true
+		switch f.Name {
+		case "name":
+			v := *name
+			patch.Name = &v
+		case "folder":
+			v := *folder
+			patch.Folder = &v
+		case "to":
+			v := *to
+			patch.Executor = &v
+		case "lead":
+			v := *lead
+			patch.Lead = &v
+		case "reviewer":
+			v := *reviewer
+			patch.Reviewer = &v
+		case "sync-agents-md":
+			v := *syncAgents
+			patch.SyncAgentsMD = &v
+		}
+	})
+	if seen["clear-checks"] && *clearChecks && !seen["check"] {
+		empty := []string{}
+		patch.Checks = &empty
+	} else if seen["check"] {
+		v := append([]string(nil), checks...)
+		patch.Checks = &v
+	}
+	if seen["clear-scope"] && *clearScope && !seen["scope"] {
+		empty := []string{}
+		patch.Scope = &empty
+	} else if seen["scope"] {
+		v := append([]string(nil), scope...)
+		patch.Scope = &v
+	}
+	return id, patch, nil
+}
 
 func orchestraCommand() {
 	if len(os.Args) < 3 {
@@ -252,18 +328,40 @@ func orchestraCommand() {
 			to := fs.String("to", "", "executor agent")
 			reviewer := fs.String("reviewer", "", "reviewer agent")
 			lead := fs.String("lead", "", "lead agent")
+			syncAgents := fs.Bool("sync-agents-md", false, "sync managed block in AGENTS.md")
 			var checks, scope repeatedString
 			fs.Var(&checks, "check", "check command (repeatable)")
 			fs.Var(&scope, "scope", "allowed path prefix (repeatable)")
 			fs.Parse(pargs)
 			p, e := store.CreateProject(cfg, orchestra.Project{
 				ID: *id, Name: *name, Folder: *folder, Executor: *to,
-				Reviewer: *reviewer, Lead: *lead, Checks: checks, Scope: scope,
+				Reviewer: *reviewer, Lead: *lead, Checks: checks, Scope: scope, SyncAgentsMD: *syncAgents,
 			})
 			if e != nil {
 				orchestraFail(e)
 			}
 			orchestraPrint(p)
+		case "update":
+			id, patch, e := parseProjectUpdateFlags(pargs)
+			if e != nil {
+				fmt.Fprintln(os.Stderr, orchestraUsage)
+				os.Exit(2)
+			}
+			p, e := store.UpdateProject(cfg, id, patch)
+			if e != nil {
+				orchestraFail(e)
+			}
+			orchestraPrint(p)
+		case "path":
+			if len(pargs) != 1 {
+				fmt.Fprintln(os.Stderr, orchestraUsage)
+				os.Exit(2)
+			}
+			p, e := store.GetProject(pargs[0])
+			if e != nil {
+				orchestraFail(e)
+			}
+			fmt.Println(orchestra.RulesPath(p))
 		case "list":
 			fs := flag.NewFlagSet("project list", flag.ExitOnError)
 			all := fs.Bool("all", false, "include archived projects")

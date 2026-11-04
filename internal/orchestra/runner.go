@@ -408,7 +408,13 @@ func (r *Runner) start(snap *Task) *active {
 		base := filepath.Join(r.Cfg.Dir, "logs", fmt.Sprintf("%s-%d", t.ID, n))
 		files = runFiles{out: base + ".out.jsonl", err: base + ".err.txt", last: base + ".last.txt"}
 		marker = fmt.Sprintf("%s-%d-%d", t.ID, n, time.Now().UnixNano())
-		kind, prompt, session := "task", Preamble+"\n--- card ---\n"+t.Card+"\n", ""
+		brief := ""
+		if t.Project != "" && t.ReviewOf == "" {
+			if p, e := r.Store.GetProject(t.Project); e == nil {
+				brief = ProjectBrief(p)
+			}
+		}
+		kind, prompt, session := "task", Preamble+"\n"+brief+"--- card ---\n"+t.Card+"\n", ""
 		if t.Rework != "" {
 			kind = "rework"
 			if t.AutoReworkPending {

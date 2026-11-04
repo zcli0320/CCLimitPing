@@ -12,19 +12,32 @@ import (
 )
 
 type Project struct {
-	ID        string    `json:"id"`
-	Name      string    `json:"name"`
-	Folder    string    `json:"folder"`
-	FolderDev uint64    `json:"folder_dev,omitempty"`
-	FolderIno uint64    `json:"folder_ino,omitempty"`
-	Lead      string    `json:"lead,omitempty"`
-	Executor  string    `json:"executor"`
-	Reviewer  string    `json:"reviewer,omitempty"` // stored only; no review flow yet
-	Checks    []string  `json:"checks,omitempty"`
-	Scope     []string  `json:"scope,omitempty"`
-	Archived  bool      `json:"archived,omitempty"`
-	Created   time.Time `json:"created"`
-	Updated   time.Time `json:"updated"`
+	ID           string    `json:"id"`
+	Name         string    `json:"name"`
+	Folder       string    `json:"folder"`
+	FolderDev    uint64    `json:"folder_dev,omitempty"`
+	FolderIno    uint64    `json:"folder_ino,omitempty"`
+	Lead         string    `json:"lead,omitempty"`
+	Executor     string    `json:"executor"`
+	Reviewer     string    `json:"reviewer,omitempty"` // stored only; no review flow yet
+	Checks       []string  `json:"checks,omitempty"`
+	Scope        []string  `json:"scope,omitempty"`
+	SyncAgentsMD bool      `json:"sync_agents_md,omitempty"`
+	Archived     bool      `json:"archived,omitempty"`
+	Created      time.Time `json:"created"`
+	Updated      time.Time `json:"updated"`
+	Warning      string    `json:"warning,omitempty"`
+}
+
+type ProjectPatch struct {
+	Name         *string
+	Folder       *string
+	Lead         *string
+	Executor     *string
+	Reviewer     *string
+	Checks       *[]string
+	Scope        *[]string
+	SyncAgentsMD *bool
 }
 
 func (s Store) projectPath(id string) string { return filepath.Join(s.Dir, "projects", id+".json") }
@@ -49,6 +62,7 @@ func (s Store) writeProject(p *Project) error {
 		return err
 	}
 	p.Updated = time.Now()
+	p.Warning = ""
 	data, err := json.MarshalIndent(p, "", "  ")
 	if err != nil {
 		return err
@@ -60,26 +74,30 @@ func (s Store) writeProject(p *Project) error {
 	return os.Rename(tmp, s.projectPath(p.ID))
 }
 
-func (s Store) CreateProject(cfg Config, p Project) (*Project, error) {
+func validateProject(cfg Config, p *Project) error {
 	if !taskID.MatchString(p.ID) {
-		return nil, fmt.Errorf("项目编号无效：%q", p.ID)
+		return fmt.Errorf("项目编号无效：%q", p.ID)
 	}
 	p.Name = strings.TrimSpace(p.Name)
 	if p.Name == "" || len([]rune(p.Name)) > 100 {
-		return nil, errors.New("项目名称无效")
+		return errors.New("项目名称无效")
 	}
 	if _, ok := cfg.Agents[p.Executor]; !ok {
-		return nil, fmt.Errorf("未知的执行代理：%s", p.Executor)
+		return fmt.Errorf("未知的执行代理：%s", p.Executor)
 	}
 	if p.Reviewer != "" {
 		if _, ok := cfg.Agents[p.Reviewer]; !ok && p.Reviewer != "claude" && p.Reviewer != "codex" {
-			return nil, fmt.Errorf("未知的审查代理：%s", p.Reviewer)
+			return fmt.Errorf("未知的审查代理：%s", p.Reviewer)
 		}
 	}
 	if p.Lead != "" && !taskID.MatchString(p.Lead) {
-		return nil, fmt.Errorf("负责代理无效：%q", p.Lead)
+		return fmt.Errorf("负责代理无效：%q", p.Lead)
 	}
-	if err := validateEvidence(p.Checks, p.Scope); err != nil {
+	return validateEvidence(p.Checks, p.Scope)
+}
+
+func (s Store) CreateProject(cfg Config, p Project) (*Project, error) {
+	if err := validateProject(cfg, &p); err != nil {
 		return nil, err
 	}
 	dir, err := cfg.allowedFolder(p.Folder)
@@ -100,7 +118,79 @@ func (s Store) CreateProject(cfg Config, p Project) (*Project, error) {
 	}
 	p.Folder, p.FolderDev, p.FolderIno = dir, dev, ino
 	p.Created = time.Now()
-	return &p, s.writeProject(&p)
+	if err := s.writeProject(&p); err != nil {
+		return nil, err
+	}
+	syncProjectFiles(&p, "")
+	return &p, nil
+}
+
+func (s Store) UpdateProject(cfg Config, id string, patch ProjectPatch) (*Project, error) {
+	if !taskID.MatchString(id) {
+		return nil, fmt.Errorf("项目编号无效：%q", id)
+	}
+	unlock, err := s.lock()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	p, err := s.readProject(id)
+	if err != nil {
+		return nil, err
+	}
+	if p.Archived {
+		return nil, fmt.Errorf("项目 %s 已归档", id)
+	}
+	oldFolder := p.Folder
+	if patch.Name != nil {
+		p.Name = *patch.Name
+	}
+	if patch.Lead != nil {
+		p.Lead = strings.TrimSpace(*patch.Lead)
+	}
+	if patch.Executor != nil {
+		p.Executor = strings.TrimSpace(*patch.Executor)
+	}
+	if patch.Reviewer != nil {
+		p.Reviewer = strings.TrimSpace(*patch.Reviewer)
+	}
+	if patch.Checks != nil {
+		p.Checks = append([]string(nil), (*patch.Checks)...)
+	}
+	if patch.Scope != nil {
+		p.Scope = append([]string(nil), (*patch.Scope)...)
+	}
+	if patch.SyncAgentsMD != nil {
+		p.SyncAgentsMD = *patch.SyncAgentsMD
+	}
+	if err := validateProject(cfg, p); err != nil {
+		return nil, err
+	}
+	if patch.Folder != nil {
+		dir, err := cfg.allowedFolder(*patch.Folder)
+		if err != nil {
+			return nil, err
+		}
+		dev, ino, err := folderID(dir)
+		if err != nil {
+			return nil, fmt.Errorf("无法读取工作目录：%v", err)
+		}
+		tasks, err := s.List()
+		if err != nil {
+			return nil, err
+		}
+		for _, t := range tasks {
+			if t.Project == p.ID && (t.Status == Queued || t.Status == Running || t.Status == Reviewing) {
+				return nil, fmt.Errorf("项目 %s 有未完成的任务（%s），不能修改工作目录", p.ID, t.ID)
+			}
+		}
+		p.Folder, p.FolderDev, p.FolderIno = dir, dev, ino
+	}
+	if err := s.writeProject(p); err != nil {
+		return nil, err
+	}
+	syncProjectFiles(p, oldFolder)
+	return p, nil
 }
 
 func (s Store) GetProject(id string) (*Project, error) {
@@ -146,7 +236,11 @@ func (s Store) ArchiveProject(id string) (*Project, error) {
 		return nil, err
 	}
 	p.Archived = true
-	return p, s.writeProject(p)
+	if err := s.writeProject(p); err != nil {
+		return nil, err
+	}
+	syncProjectFiles(p, "")
+	return p, nil
 }
 
 func (s Store) DispatchInProject(cfg Config, lead, project, executor, folder, id, card string, checks, scope []string) (*Task, error) {

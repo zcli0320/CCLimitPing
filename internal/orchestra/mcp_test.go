@@ -92,7 +92,7 @@ func TestMCPProtocolAndTools(t *testing.T) {
 		t.Fatalf("notification got a reply: %v", r)
 	}
 	tools := r["result"].(map[string]any)["tools"].([]any)
-	if len(tools) != 14 {
+	if len(tools) != 15 {
 		t.Fatalf("tools=%v", tools)
 	}
 	seen := map[string]bool{}
@@ -103,7 +103,7 @@ func TestMCPProtocolAndTools(t *testing.T) {
 			t.Fatal(tool)
 		}
 	}
-	for _, name := range []string{"list_agents", "runner_status", "dispatch_task", "get_task", "list_tasks", "wait_task", "rework_task", "cancel_task", "accept_task", "list_projects", "get_project", "create_project"} {
+	for _, name := range []string{"list_agents", "runner_status", "dispatch_task", "get_task", "list_tasks", "wait_task", "rework_task", "cancel_task", "accept_task", "list_projects", "get_project", "create_project", "update_project"} {
 		if !seen[name] {
 			t.Fatal(name)
 		}
@@ -258,6 +258,20 @@ func TestMCPProjectsAndTaskFilter(t *testing.T) {
 	v, bad = resultText(t, r)
 	if bad || v["name"] != "Project One" {
 		t.Fatalf("get_project: %v", r)
+	}
+
+	// update_project sets and clears reviewer and updates name/sync_agents_md.
+	r = mcpCall(t, f, 20, "update_project", map[string]any{
+		"id": "P1", "name": "Project One Renamed", "reviewer": "claude", "sync_agents_md": true,
+	})
+	v, bad = resultText(t, r)
+	if bad || v["name"] != "Project One Renamed" || v["reviewer"] != "claude" || v["sync_agents_md"] != true {
+		t.Fatalf("update_project set: %v", r)
+	}
+	r = mcpCall(t, f, 21, "update_project", map[string]any{"id": "P1", "reviewer": ""})
+	v, bad = resultText(t, r)
+	if bad || v["reviewer"] != nil || v["name"] != "Project One Renamed" {
+		t.Fatalf("update_project clear reviewer: %v", r)
 	}
 
 	// dispatch_task missing executor/folder without project fails.

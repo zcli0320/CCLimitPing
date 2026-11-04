@@ -37,9 +37,19 @@ func parseVerdict(text string) string {
 	return verdict
 }
 
-func reviewCard(t *Task) string {
+func reviewCard(t *Task, proj ...*Project) string {
+	var p *Project
+	if len(proj) > 0 {
+		p = proj[0]
+	} else if t.Project != "" && t.Folder != "" {
+		p = &Project{ID: t.Project, Name: t.Project, Folder: t.Folder, Lead: t.Lead, Executor: t.Executor}
+	}
 	var b strings.Builder
 	fmt.Fprintf(&b, "You are the reviewer for project %s. Review, do not modify files.\n\n", t.Project)
+	if brief := ProjectBrief(p); brief != "" {
+		b.WriteString(brief)
+		b.WriteString("\n")
+	}
 	fmt.Fprintf(&b, "--- original card (%s) ---\n%s\n\n", t.ID, t.Card)
 	fmt.Fprintf(&b, "--- executor receipt ---\n%s\n\n", t.LastReceipt())
 	fmt.Fprintf(&b, "Evidence: %s\n", Summary(t))
@@ -91,9 +101,10 @@ func (r *Runner) reviewTick(tasks []*Task) {
 			continue
 		}
 		childID := reviewID(t.ID, runs)
+		p, _ := r.Store.GetProject(t.Project)
 		child, err := r.Store.Get(childID)
 		if err != nil {
-			child, err = r.Store.dispatch(r.Cfg, "orchestra", t.Project, reviewer, t.Folder, childID, reviewCard(t), nil, nil, t.ID)
+			child, err = r.Store.dispatch(r.Cfg, "orchestra", t.Project, reviewer, t.Folder, childID, reviewCard(t, p), nil, nil, t.ID)
 			if err != nil {
 				r.skipReview(t.ID, runs, "无法派出审查任务："+err.Error())
 				continue

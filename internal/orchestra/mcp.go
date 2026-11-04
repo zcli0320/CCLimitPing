@@ -59,7 +59,8 @@ func mcpTools() []mcpTool {
 		{"accept_task", "验收任务 / Accept a task", id()},
 		{"list_projects", "列出项目 / List projects", schema(nil, map[string]any{"include_archived": map[string]any{"type": "boolean", "default": false}, "mine": map[string]any{"type": "boolean", "default": false}})},
 		{"get_project", "读取项目 / Get a project", id()},
-		{"create_project", "创建项目 / Create a project", schema([]string{"id", "name", "folder", "executor"}, map[string]any{"id": str, "name": str, "folder": str, "executor": str, "lead": str, "reviewer": str, "checks": checks, "scope": scope})},
+		{"create_project", "创建项目 / Create a project", schema([]string{"id", "name", "folder", "executor"}, map[string]any{"id": str, "name": str, "folder": str, "executor": str, "lead": str, "reviewer": str, "checks": checks, "scope": scope, "sync_agents_md": map[string]any{"type": "boolean"}})},
+		{"update_project", "更新项目 / Update a project", schema([]string{"id"}, map[string]any{"id": str, "name": str, "folder": str, "executor": str, "lead": map[string]any{"type": "string"}, "reviewer": map[string]any{"type": "string"}, "checks": checks, "scope": scope, "sync_agents_md": map[string]any{"type": "boolean"}})},
 	}
 }
 
@@ -100,6 +101,9 @@ func leadInstructions(lead string, projects []*Project, cwd string, runnerActive
 	}
 	if cur, err := pickProject(projectsForFolder(projects, cwd), lead); cur != nil {
 		lines = append(lines, fmt.Sprintf("当前目录属于项目 %s，dispatch_task 可省略 project 和 folder", cur.ID))
+		if brief := strings.TrimRight(projectBriefCap(cur, maxLeadRulesBytes), "\n"); brief != "" {
+			lines = append(lines, brief)
+		}
 	} else if err != nil {
 		lines = append(lines, err.Error()+"；派发时须指定 project")
 	}
@@ -185,6 +189,7 @@ func callMCPTool(ctx context.Context, cfg Config, store Store, lead, cwd, name s
 		Timeout         *int     `json:"timeout_seconds"`
 		Checks          []string `json:"checks"`
 		Scope           []string `json:"scope"`
+		SyncAgentsMD    bool     `json:"sync_agents_md"`
 	}
 	if len(raw) == 0 {
 		raw = []byte("{}")
@@ -222,6 +227,27 @@ func callMCPTool(ctx context.Context, cfg Config, store Store, lead, cwd, name s
 		return store.CreateProject(cfg, Project{
 			ID: args.ID, Name: args.Name, Folder: args.Folder, Lead: projLead,
 			Executor: args.Executor, Reviewer: args.Reviewer, Checks: args.Checks, Scope: args.Scope,
+			SyncAgentsMD: args.SyncAgentsMD,
+		})
+	case "update_project":
+		var patch struct {
+			ID           string    `json:"id"`
+			Name         *string   `json:"name"`
+			Folder       *string   `json:"folder"`
+			Lead         *string   `json:"lead"`
+			Executor     *string   `json:"executor"`
+			Reviewer     *string   `json:"reviewer"`
+			Checks       *[]string `json:"checks"`
+			Scope        *[]string `json:"scope"`
+			SyncAgentsMD *bool     `json:"sync_agents_md"`
+		}
+		if json.Unmarshal(raw, &patch) != nil {
+			return nil, errors.New("工具参数必须是有效对象")
+		}
+		return store.UpdateProject(cfg, patch.ID, ProjectPatch{
+			Name: patch.Name, Folder: patch.Folder, Lead: patch.Lead,
+			Executor: patch.Executor, Reviewer: patch.Reviewer,
+			Checks: patch.Checks, Scope: patch.Scope, SyncAgentsMD: patch.SyncAgentsMD,
 		})
 	case "get_project":
 		return store.GetProject(args.ID)
