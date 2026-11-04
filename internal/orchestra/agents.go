@@ -11,6 +11,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // Agent describes how to start one kind of executor headless.
@@ -138,7 +139,7 @@ func (a Agent) prepare(path, session, folder, prompt, lastFile string) (Invocati
 }
 
 // result reads the executor's session id and final message from its output.
-func (a Agent) result(stdoutPath, lastFile string) (session, final string, err error) {
+func (a Agent) result(stdoutPath, lastFile string, since time.Time) (session, final string, err error) {
 	data, _ := os.ReadFile(stdoutPath)
 	switch a.Name {
 	case "codex":
@@ -181,6 +182,11 @@ func (a Agent) result(stdoutPath, lastFile string) (session, final string, err e
 			return out.ConversationID, "", errors.New("Antigravity 输出不是预期的 JSON")
 		}
 		if out.Status != "SUCCESS" {
+			// A stream that dies after the turn already finished (agy's
+			// post-reply EOF) still left the answer in the transcript.
+			if final := agyTranscriptFinal(out.ConversationID, since); final != "" {
+				return out.ConversationID, final, nil
+			}
 			return out.ConversationID, "", fmt.Errorf("Antigravity 报告错误：%s", out.Status)
 		}
 		if len(out.DeniedActions) > 0 {
@@ -213,6 +219,60 @@ func (a Agent) result(stdoutPath, lastFile string) (session, final string, err e
 		return out.SessionID, strings.TrimSpace(out.Result), nil
 	}
 	return "", "", errNoCLI
+}
+
+// AGYBrainRoot is where agy keeps per-conversation transcripts.
+var AGYBrainRoot = func() string {
+	home, _ := os.UserHomeDir()
+	return filepath.Join(home, ".gemini", "antigravity-cli", "brain")
+}
+
+type agyStep struct {
+	Type      string            `json:"type"`
+	Status    string            `json:"status"`
+	Content   string            `json:"content"`
+	ToolCalls []json.RawMessage `json:"tool_calls"`
+	CreatedAt time.Time         `json:"created_at"`
+}
+
+// agyTranscriptFinal returns the conversation's final answer only when the
+// last transcript step is a finished model reply with no tool calls, i.e. the
+// turn completed and nothing was left running, and that turn's user input was
+// sent by this run (a resumed conversation also holds earlier answers).
+func agyTranscriptFinal(conversation string, since time.Time) string {
+	if conversation == "" || strings.ContainsAny(conversation, "/\\") || strings.HasPrefix(conversation, ".") {
+		return ""
+	}
+	data, err := os.ReadFile(filepath.Join(AGYBrainRoot(), conversation, ".system_generated", "logs", "transcript.jsonl"))
+	if err != nil {
+		return ""
+	}
+	var last agyStep
+	var turnStart time.Time
+	found := false
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		var step agyStep
+		// A torn last line means the transcript is still being written.
+		if json.Unmarshal([]byte(line), &step) != nil {
+			return ""
+		}
+		if step.Type == "USER_INPUT" {
+			turnStart = step.CreatedAt
+		}
+		last, found = step, true
+	}
+	// Allow for clock rounding between the runner and agy.
+	if turnStart.Before(since.Add(-2 * time.Second)) {
+		return ""
+	}
+	if !found || last.Type != "PLANNER_RESPONSE" || last.Status != "DONE" || len(last.ToolCalls) > 0 {
+		return ""
+	}
+	return strings.TrimSpace(last.Content)
 }
 
 func bytesTrim(b []byte) []byte { return []byte(strings.TrimSpace(string(b))) }

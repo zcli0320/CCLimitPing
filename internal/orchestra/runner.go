@@ -577,7 +577,7 @@ func descendants(pid int) []int {
 
 func (r *Runner) finish(a *active, why string) {
 	exit := a.cmd.ProcessState.ExitCode()
-	session, final, perr := a.agent.result(a.files.out, a.files.last)
+	session, final, perr := a.agent.result(a.files.out, a.files.last, a.start)
 	limited := why == "" && a.agent.Name == "codex" && (final == "" || exit != 0) && usageLimit(a.files.out, a.files.err)
 	var changes *ChangeEvidence
 	if a.baseline.status != "" {

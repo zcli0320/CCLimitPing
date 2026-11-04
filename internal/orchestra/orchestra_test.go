@@ -351,6 +351,10 @@ func TestAntigravityPrepare(t *testing.T) {
 }
 
 func TestAntigravityResult(t *testing.T) {
+	root := t.TempDir()
+	old := AGYBrainRoot
+	AGYBrainRoot = func() string { return root }
+	t.Cleanup(func() { AGYBrainRoot = old })
 	cases := []struct{ name, output, session, final, errorText string }{
 		{"success", `  {"conversation_id":"s1","status":"SUCCESS","response":"  done  "}  `, "s1", "done", ""},
 		{"leading noise", "startup\n" + `{"conversation_id":"s1","status":"SUCCESS","response":"done"}` + "\n", "s1", "done", ""},
@@ -368,7 +372,7 @@ func TestAntigravityResult(t *testing.T) {
 			if err := os.WriteFile(path, []byte(c.output), 0600); err != nil {
 				t.Fatal(err)
 			}
-			session, final, err := (Agent{Name: "antigravity"}).result(path, "unused")
+			session, final, err := (Agent{Name: "antigravity"}).result(path, "unused", time.Time{})
 			if session != c.session || final != c.final {
 				t.Fatalf("session=%q final=%q", session, final)
 			}
@@ -380,6 +384,60 @@ func TestAntigravityResult(t *testing.T) {
 				t.Fatalf("err=%v want=%q", err, c.errorText)
 			}
 		})
+	}
+}
+
+// agy can lose the stream after the turn already finished; the answer is then
+// taken from the transcript, but only for a completed reply of this run's turn.
+func TestAntigravityResultFallsBackToFinishedTranscript(t *testing.T) {
+	root := t.TempDir()
+	old := AGYBrainRoot
+	AGYBrainRoot = func() string { return root }
+	t.Cleanup(func() { AGYBrainRoot = old })
+	since := time.Date(2026, 11, 4, 2, 35, 0, 0, time.UTC)
+	input := func(at string) string {
+		return `{"step_index":0,"type":"USER_INPUT","status":"DONE","created_at":"` + at + `","content":"TASK"}`
+	}
+	const tool = `{"step_index":1,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-04T02:35:38Z","tool_calls":[{"name":"run_command"}]}`
+	const result = `{"step_index":2,"type":"GENERIC","status":"DONE","created_at":"2026-11-04T02:36:08Z","content":"Command exited with code 0."}`
+	const eof = `{"step_index":3,"type":"ERROR_MESSAGE","status":"DONE","created_at":"2026-11-04T02:40:33Z","error":"EOF"}`
+	const reply = `{"step_index":4,"type":"PLANNER_RESPONSE","status":"DONE","created_at":"2026-11-04T02:40:37Z","content":"  all 9 tests pass  "}`
+	cases := []struct{ name, transcript, final, errorText string }{
+		{"retried reply after EOF", strings.Join([]string{input("2026-11-04T02:35:38Z"), tool, result, eof, reply}, "\n"), "all 9 tests pass", ""},
+		{"stalled on EOF", strings.Join([]string{input("2026-11-04T02:35:38Z"), tool, result, eof}, "\n"), "", "报告错误"},
+		{"tool still requested", strings.Join([]string{input("2026-11-04T02:35:38Z"), tool}, "\n"), "", "报告错误"},
+		{"answer from an earlier run", strings.Join([]string{input("2026-11-04T01:00:00Z"), reply}, "\n"), "", "报告错误"},
+		{"torn last line", strings.Join([]string{input("2026-11-04T02:35:38Z"), reply, `{"step_index":5,"ty`}, "\n"), "", "报告错误"},
+		{"no transcript", "", "", "报告错误"},
+	}
+	for i, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			conv := fmt.Sprintf("conv-%d", i)
+			if c.transcript != "" {
+				dir := filepath.Join(root, conv, ".system_generated", "logs")
+				if err := os.MkdirAll(dir, 0700); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.WriteFile(filepath.Join(dir, "transcript.jsonl"), []byte(c.transcript+"\n"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			path := filepath.Join(t.TempDir(), "stdout")
+			out := `{"conversation_id":"` + conv + `","status":"ERROR","error":"EOF"}`
+			if err := os.WriteFile(path, []byte(out), 0600); err != nil {
+				t.Fatal(err)
+			}
+			session, final, err := (Agent{Name: "antigravity"}).result(path, "unused", since)
+			if session != conv || final != c.final {
+				t.Fatalf("session=%q final=%q", session, final)
+			}
+			if c.errorText == "" && err != nil || c.errorText != "" && (err == nil || !strings.Contains(err.Error(), c.errorText)) {
+				t.Fatalf("err=%v want=%q", err, c.errorText)
+			}
+		})
+	}
+	if agyTranscriptFinal("../escape", since) != "" {
+		t.Fatal("conversation id must not escape the brain root")
 	}
 }
 
