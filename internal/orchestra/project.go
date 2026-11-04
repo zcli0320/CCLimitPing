@@ -247,7 +247,15 @@ func (s Store) DispatchInProject(cfg Config, lead, project, executor, folder, id
 	if project == "" {
 		return s.DispatchWithEvidence(cfg, lead, executor, folder, id, card, checks, scope)
 	}
-	p, err := s.GetProject(project)
+	if !taskID.MatchString(project) {
+		return nil, fmt.Errorf("项目编号无效：%q", project)
+	}
+	unlock, err := s.lock()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	p, err := s.readProject(project)
 	if err != nil {
 		return nil, err
 	}
@@ -281,7 +289,7 @@ func (s Store) DispatchInProject(cfg Config, lead, project, executor, folder, id
 	if lead == "" {
 		lead = p.Lead
 	}
-	return s.dispatch(cfg, lead, p.ID, executor, folder, id, card, checks, scope, "")
+	return s.dispatchLocked(cfg, lead, p.ID, executor, folder, id, card, checks, scope, "")
 }
 
 func (s Store) AssignProject(taskIDStr, projectID string) (*Task, error) {

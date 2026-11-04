@@ -344,6 +344,7 @@ func orchestraCommand() {
 		case "update":
 			id, patch, e := parseProjectUpdateFlags(pargs)
 			if e != nil {
+				fmt.Fprintln(os.Stderr, e)
 				fmt.Fprintln(os.Stderr, orchestraUsage)
 				os.Exit(2)
 			}
@@ -361,7 +362,13 @@ func orchestraCommand() {
 			if e != nil {
 				orchestraFail(e)
 			}
-			fmt.Println(orchestra.RulesPath(p))
+			path := orchestra.RulesPath(p)
+			if path != "" {
+				if _, statErr := os.Stat(path); os.IsNotExist(statErr) && !p.Archived {
+					_ = orchestra.WriteProjectFile(p)
+				}
+			}
+			fmt.Println(path)
 		case "list":
 			fs := flag.NewFlagSet("project list", flag.ExitOnError)
 			all := fs.Bool("all", false, "include archived projects")

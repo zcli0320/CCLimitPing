@@ -1350,16 +1350,14 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
     }
     @objc private func editSelectedProject() {
         guard let p = activeProject else { return }
-        let leadIdx = (p.lead ?? "").isEmpty ? 0 : ((agents.firstIndex(where: { $0.name == p.lead }) ?? -1) + 1)
-        let revIdx = (p.reviewer ?? "").isEmpty ? 0 : ((agents.firstIndex(where: { $0.name == p.reviewer }) ?? -1) + 1)
         presentProjectForm(
             editing: p,
             initialName: p.name,
             initialID: p.id,
             initialFolder: p.folder,
             initialExecName: p.executor,
-            initialLeadIndex: max(0, leadIdx),
-            initialRevIndex: max(0, revIdx),
+            initialLeadName: p.lead ?? "",
+            initialRevName: p.reviewer ?? "",
             initialChecks: (p.checks ?? []).joined(separator: "\n"),
             initialScope: (p.scope ?? []).joined(separator: "\n"),
             initialSyncAgentsMD: p.sync_agents_md == true
@@ -1371,8 +1369,8 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
         initialID: String = "",
         initialFolder: String = "",
         initialExecName: String? = nil,
-        initialLeadIndex: Int = 0,
-        initialRevIndex: Int = 0,
+        initialLeadName: String = "",
+        initialRevName: String = "",
         initialChecks: String = "",
         initialScope: String = "",
         initialSyncAgentsMD: Bool = false,
@@ -1384,6 +1382,16 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
             execAgents.append(OrchestraAgent(name: currentExec, label: currentExec, available: true, reason: nil))
         }
         guard !execAgents.isEmpty else { return }
+        var leadAgents = agents
+        let currentLead = initialLeadName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !currentLead.isEmpty, !leadAgents.contains(where: { $0.name == currentLead }) {
+            leadAgents.append(OrchestraAgent(name: currentLead, label: currentLead, available: true, reason: nil))
+        }
+        var revAgents = agents
+        let currentRev = initialRevName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !currentRev.isEmpty, !revAgents.contains(where: { $0.name == currentRev }) {
+            revAgents.append(OrchestraAgent(name: currentRev, label: currentRev, available: true, reason: nil))
+        }
         let isEditing = editing != nil
         let alert = NSAlert()
         alert.messageText = isEditing ? "编辑项目（工作群）" : "新建项目（工作群）"
@@ -1403,10 +1411,10 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
         let folderRow = labeledRow("工作目录：", Theme.hstack([folder, choose], spacing: 6))
         let execPopup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 376, height: 26)); execPopup.addItems(withTitles: execAgents.map { $0.label })
         if let targetExec = initialExecName ?? editing?.executor, let idx = execAgents.firstIndex(where: { $0.name == targetExec }) { execPopup.selectItem(at: idx) }
-        let leadPopup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 376, height: 26)); leadPopup.addItems(withTitles: ["不指定（任意主控）"] + agents.map { $0.label })
-        if initialLeadIndex >= 0 && initialLeadIndex < leadPopup.numberOfItems { leadPopup.selectItem(at: initialLeadIndex) }
-        let revPopup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 376, height: 26)); revPopup.addItems(withTitles: ["无自动审查"] + agents.map { $0.label })
-        if initialRevIndex >= 0 && initialRevIndex < revPopup.numberOfItems { revPopup.selectItem(at: initialRevIndex) }
+        let leadPopup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 376, height: 26)); leadPopup.addItems(withTitles: ["不指定（任意主控）"] + leadAgents.map { $0.label })
+        if !currentLead.isEmpty, let idx = leadAgents.firstIndex(where: { $0.name == currentLead }) { leadPopup.selectItem(at: idx + 1) }
+        let revPopup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 376, height: 26)); revPopup.addItems(withTitles: ["无自动审查"] + revAgents.map { $0.label })
+        if !currentRev.isEmpty, let idx = revAgents.firstIndex(where: { $0.name == currentRev }) { revPopup.selectItem(at: idx + 1) }
         let checks = NSTextView(); checks.font = .monospacedSystemFont(ofSize: 11.5, weight: .regular); checks.string = initialChecks
         let checksScroll = NSScrollView(); checksScroll.documentView = checks; checksScroll.borderType = .bezelBorder; checksScroll.hasVerticalScroller = true; checksScroll.heightAnchor.constraint(equalToConstant: 50).isActive = true
         checks.isVerticallyResizable = true; checks.autoresizingMask = [.width]; checks.textContainer?.widthTracksTextView = true
@@ -1427,13 +1435,13 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
             let chosenExec = execAgents[execPopup.indexOfSelectedItem].name
             let leadIdx = leadPopup.indexOfSelectedItem
             let revIdx = revPopup.indexOfSelectedItem
-            let chosenLead = self.agents.indices.contains(leadIdx - 1) ? self.agents[leadIdx - 1].name : ""
-            let chosenRev = self.agents.indices.contains(revIdx - 1) ? self.agents[revIdx - 1].name : ""
+            let chosenLead = leadAgents.indices.contains(leadIdx - 1) ? leadAgents[leadIdx - 1].name : ""
+            let chosenRev = revAgents.indices.contains(revIdx - 1) ? revAgents[revIdx - 1].name : ""
             let draftChecks = checks.string
             let draftScope = scope.string
             let draftSync = syncBox.state == .on
             let reopen: (String) -> Void = { [weak self] msg in
-                self?.presentProjectForm(editing: editing, initialName: draftName, initialID: rawID, initialFolder: draftFolder, initialExecName: chosenExec, initialLeadIndex: leadIdx, initialRevIndex: revIdx, initialChecks: draftChecks, initialScope: draftScope, initialSyncAgentsMD: draftSync, errorMessage: msg)
+                self?.presentProjectForm(editing: editing, initialName: draftName, initialID: rawID, initialFolder: draftFolder, initialExecName: chosenExec, initialLeadName: chosenLead, initialRevName: chosenRev, initialChecks: draftChecks, initialScope: draftScope, initialSyncAgentsMD: draftSync, errorMessage: msg)
             }
             if draftName.isEmpty { reopen("请填写项目名称。"); return }
             if draftFolder.isEmpty { reopen("请选择或填写工作目录。"); return }

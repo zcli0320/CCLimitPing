@@ -230,6 +230,15 @@ func (s Store) DispatchWithEvidence(cfg Config, lead, executor, folder, id, card
 }
 
 func (s Store) dispatch(cfg Config, lead, project, executor, folder, id, card string, checks, scope []string, reviewOf string) (*Task, error) {
+	unlock, err := s.lock()
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+	return s.dispatchLocked(cfg, lead, project, executor, folder, id, card, checks, scope, reviewOf)
+}
+
+func (s Store) dispatchLocked(cfg Config, lead, project, executor, folder, id, card string, checks, scope []string, reviewOf string) (*Task, error) {
 	if err := validateEvidence(checks, scope); err != nil {
 		return nil, err
 	}
@@ -246,11 +255,6 @@ func (s Store) dispatch(cfg Config, lead, project, executor, folder, id, card st
 	if strings.TrimSpace(card) == "" {
 		return nil, errors.New("任务卡内容为空")
 	}
-	unlock, err := s.lock()
-	if err != nil {
-		return nil, err
-	}
-	defer unlock()
 	if _, err := os.Stat(s.path(id)); err == nil {
 		return nil, fmt.Errorf("任务编号 %s 已存在", id)
 	}

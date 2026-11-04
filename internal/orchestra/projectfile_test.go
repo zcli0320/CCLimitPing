@@ -275,3 +275,98 @@ func TestSyncAgentsMDAddReplaceRemoveAndTwoProjects(t *testing.T) {
 		t.Fatalf("archive should keep rules file: %v", err)
 	}
 }
+
+func TestRulesEdgeCasesCRLFNoFrontMatterFolderChangeAndArchive(t *testing.T) {
+	e := setup(t)
+	if got := RulesPath(&Project{ID: "../escape", Folder: e.folder}); got != "" {
+		t.Fatalf("RulesPath allowed path traversal ID: %q", got)
+	}
+	if got := RulesPath(&Project{ID: "P1", Folder: "relative/path"}); got != "" {
+		t.Fatalf("RulesPath allowed relative folder: %q", got)
+	}
+
+	p, err := e.store.CreateProject(e.cfg, Project{
+		ID: "P-EDGE", Name: "Line1\nLine2", Folder: e.folder, Lead: "claude", Executor: "codex", SyncAgentsMD: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := RulesPath(p)
+
+	// 1. CRLF front matter edited by hand preserves exact body without duplicating front matter.
+	crlfFile := "---\r\nproject: P-EDGE\r\nname: Old\r\n---\r\n## CRLF Body\r\nLine A\r\n"
+	if err := os.WriteFile(path, []byte(crlfFile), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p, err = e.store.UpdateProject(e.cfg, "P-EDGE", ProjectPatch{Name: strPtr("Clean Name")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotBody := extractProjectBody(mustReadFile(t, path)); gotBody != "## CRLF Body\r\nLine A\r\n" {
+		t.Fatalf("CRLF body lost or duplicated: %q", gotBody)
+	}
+
+	// 2. File without front matter preserves all existing content as body.
+	rawNoFM := "Custom rules without front matter\n- Rule 1"
+	if err := os.WriteFile(path, []byte(rawNoFM), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p, err = e.store.UpdateProject(e.cfg, "P-EDGE", ProjectPatch{Reviewer: strPtr("claude")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotBody := extractProjectBody(mustReadFile(t, path)); gotBody != rawNoFM {
+		t.Fatalf("no-front-matter body not preserved: %q", gotBody)
+	}
+
+	// 3. Moving project to a new folder carries over the edited rules body and removes old AGENTS.md block.
+	newFolder := filepath.Join(filepath.Dir(e.folder), "moved-folder")
+	if err := os.MkdirAll(newFolder, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	p, err = e.store.UpdateProject(e.cfg, "P-EDGE", ProjectPatch{Folder: strPtr(newFolder)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if gotBody := extractProjectBody(mustReadFile(t, RulesPath(p))); gotBody != rawNoFM {
+		t.Fatalf("rules body not carried over to new folder: %q", gotBody)
+	}
+	oldAgents, _ := os.ReadFile(filepath.Join(e.folder, "AGENTS.md"))
+	if strings.Contains(string(oldAgents), "P-EDGE") {
+		t.Fatalf("old AGENTS.md still contains moved project block:\n%s", oldAgents)
+	}
+
+	// 4. AGENTS.md with CRLF around managed block and text without trailing newline.
+	agentsPath := filepath.Join(p.Folder, "AGENTS.md")
+	crlfAgents := "Header line\r\n<!-- codex-helper:project P-EDGE begin -->\r\nold\r\n<!-- codex-helper:project P-EDGE end -->\r\nFooter line"
+	if err := os.WriteFile(agentsPath, []byte(crlfAgents), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.store.UpdateProject(e.cfg, "P-EDGE", ProjectPatch{SyncAgentsMD: boolPtr(false)}); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(mustReadFile(t, agentsPath)); got != "Header line\r\nFooter line" {
+		t.Fatalf("CRLF AGENTS.md removal left artifacts: %q", got)
+	}
+
+	// 5. Archive does not recreate a removed rules file or rewrite an existing rules file.
+	customArchived := projectFrontMatter(p) + "DO NOT TOUCH ON ARCHIVE\n"
+	if err := os.WriteFile(RulesPath(p), []byte(customArchived), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.store.ArchiveProject("P-EDGE"); err != nil {
+		t.Fatal(err)
+	}
+	if got := string(mustReadFile(t, RulesPath(p))); got != customArchived {
+		t.Fatalf("ArchiveProject modified rules file:\ngot:  %q\nwant: %q", got, customArchived)
+	}
+}
+
+func mustReadFile(t *testing.T, path string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
