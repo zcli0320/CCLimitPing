@@ -17,12 +17,16 @@ type mcpFixture struct {
 }
 
 func startMCP(t *testing.T, e env) mcpFixture {
+	return startMCPAt(t, e, "")
+}
+
+func startMCPAt(t *testing.T, e env, cwd string) mcpFixture {
 	t.Helper()
 	in, writer := io.Pipe()
 	reader, out := io.Pipe()
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	go func() { done <- ServeMCP(ctx, in, out, e.cfg, e.store, "claude", ""); out.Close() }()
+	go func() { done <- serveMCP(ctx, in, out, e.cfg, e.store, "claude", captureCWD(cwd)); out.Close() }()
 	t.Cleanup(func() {
 		writer.Close()
 		cancel()

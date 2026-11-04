@@ -1,6 +1,7 @@
 package orchestra
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -11,16 +12,21 @@ import (
 )
 
 func TestLeadInstructionsContentAndCap(t *testing.T) {
+	root := t.TempDir()
+	alpha := filepath.Join(root, "alpha")
+	if err := os.MkdirAll(filepath.Join(alpha, "sub"), 0700); err != nil {
+		t.Fatal(err)
+	}
 	projects := []*Project{
-		{ID: "p-lead", Name: "Alpha", Folder: "/work/alpha", Lead: "claude", Executor: "codex", Reviewer: "antigravity"},
+		{ID: "p-lead", Name: "Alpha", Folder: alpha, Lead: "claude", Executor: "codex", Reviewer: "antigravity"},
 		{ID: "p-rev", Name: "Beta", Folder: "/work/beta", Lead: "codex", Executor: "codex", Reviewer: "claude"},
 		{ID: "p-other", Name: "Other", Folder: "/work/other", Lead: "codex", Executor: "codex"},
 		{ID: "p-arch", Name: "Arch", Folder: "/work/arch", Lead: "claude", Executor: "codex", Archived: true},
 	}
-	text := leadInstructions("claude", projects, "/work/alpha/sub", false)
+	text := leadInstructions("claude", projects, filepath.Join(alpha, "sub"), false)
 	for _, want := range []string{
 		"dispatch_task", "wait_task", "accept_task", "rework_task",
-		"p-lead", "Alpha", "/work/alpha", "codex", "antigravity", "role=lead",
+		"p-lead", "Alpha", alpha, "codex", "antigravity", "role=lead",
 		"p-rev", "Beta", "/work/beta", "role=reviewer",
 		"当前目录属于项目 p-lead，dispatch_task 可省略 project 和 folder",
 		"执行器未运行：任务只会排队，需在小助手『协作』窗口启动执行器",
@@ -136,6 +142,59 @@ func mustProjects(t *testing.T, s Store) []*Project {
 		t.Fatal(err)
 	}
 	return ps
+}
+
+func TestMCPRejectsUnavailableOrReplacedCWD(t *testing.T) {
+	for _, mode := range []string{"missing-symlink", "replaced-directory"} {
+		t.Run(mode, func(t *testing.T) {
+			e := setup(t)
+			if _, err := e.store.CreateProject(e.cfg, Project{ID: "P1", Name: "One", Folder: e.folder, Lead: "claude", Executor: "codex"}); err != nil {
+				t.Fatal(err)
+			}
+			cwd := filepath.Join(e.folder, "cwd")
+			if mode == "missing-symlink" {
+				if err := os.Symlink(t.TempDir(), cwd); err != nil {
+					t.Fatal(err)
+				}
+			} else if err := os.Mkdir(cwd, 0700); err != nil {
+				t.Fatal(err)
+			}
+			f := startMCPAt(t, e, cwd)
+			f.send(t, `{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18"}}`)
+			f.receive(t) // ensures the server captured the original directory
+			if err := os.Rename(cwd, cwd+"-old"); err != nil {
+				t.Fatal(err)
+			}
+			if mode == "replaced-directory" {
+				if err := os.Mkdir(cwd, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, failed := resultText(t, mcpCall(t, f, 2, "dispatch_task", map[string]any{"id": "T-INFER", "card": "TASK"}))
+			if !failed {
+				t.Fatal("inference accepted unavailable or replaced cwd")
+			}
+			_, failed = resultText(t, mcpCall(t, f, 3, "dispatch_task", map[string]any{"project": "P1", "id": "T-EXPLICIT", "card": "TASK"}))
+			if failed {
+				t.Fatal("explicit project dispatch should remain available")
+			}
+		})
+	}
+}
+
+func TestServeMCPRejectsCWDNotMatchingProcess(t *testing.T) {
+	e := setup(t)
+	if _, err := e.store.CreateProject(e.cfg, Project{ID: "P1", Name: "One", Folder: e.folder, Lead: "claude", Executor: "codex"}); err != nil {
+		t.Fatal(err)
+	}
+	input := strings.NewReader("{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{\"protocolVersion\":\"2025-06-18\"}}\n")
+	var output bytes.Buffer
+	if err := ServeMCP(context.Background(), input, &output, e.cfg, e.store, "claude", e.folder); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(output.String(), "当前目录属于项目") {
+		t.Fatalf("server trusted a path different from its cwd: %s", output.String())
+	}
 }
 
 func TestMCPDispatchInferenceListProjectsMineAndInitializeInstructions(t *testing.T) {

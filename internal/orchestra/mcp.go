@@ -335,6 +335,17 @@ func callMCPTool(ctx context.Context, cfg Config, store Store, lead, cwd, name s
 // concurrently, so a long wait_task doesn't hold up other calls, and
 // notifications/cancelled stops the matching call.
 func ServeMCP(ctx context.Context, in io.Reader, out io.Writer, cfg Config, store Store, lead, cwd string) error {
+	capturedCWD := captureCWD(cwd)
+	// Bind the snapshot to the actual process cwd, even if its path was
+	// replaced between Getwd and captureCWD.
+	dev, ino, err := folderID(".")
+	if err != nil || dev != capturedCWD.dev || ino != capturedCWD.ino {
+		capturedCWD = cwdSnapshot{}
+	}
+	return serveMCP(ctx, in, out, cfg, store, lead, capturedCWD)
+}
+
+func serveMCP(ctx context.Context, in io.Reader, out io.Writer, cfg Config, store Store, lead string, capturedCWD cwdSnapshot) error {
 	scanner := bufio.NewScanner(in)
 	scanner.Buffer(make([]byte, 4096), 4<<20)
 	enc := json.NewEncoder(out)
@@ -411,7 +422,7 @@ func ServeMCP(ctx context.Context, in io.Reader, out io.Writer, cfg Config, stor
 					"protocolVersion": p.ProtocolVersion,
 					"capabilities":    map[string]any{"tools": map[string]any{}},
 					"serverInfo":      map[string]string{"name": "codex-helper-orchestra", "version": "0.1.0"},
-					"instructions":    leadInstructions(lead, ps, cwd, RunnerActive(cfg.Dir)),
+					"instructions":    leadInstructions(lead, ps, capturedCWD.validPath(), RunnerActive(cfg.Dir)),
 				}
 			}
 		case "ping":
@@ -435,7 +446,7 @@ func ServeMCP(ctx context.Context, in io.Reader, out io.Writer, cfg Config, stor
 			calls.Add(1)
 			go func(id json.RawMessage) {
 				defer calls.Done()
-				v, e := callMCPTool(callCtx, cfg, store, lead, cwd, p.Name, p.Arguments)
+				v, e := callMCPTool(callCtx, cfg, store, lead, capturedCWD.validPath(), p.Name, p.Arguments)
 				mu.Lock()
 				delete(inflight, key)
 				mu.Unlock()

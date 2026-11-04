@@ -260,17 +260,43 @@ func (s Store) AssignProject(taskIDStr, projectID string) (*Task, error) {
 }
 
 func resolveDir(dir string) string {
-	dir = strings.TrimSpace(dir)
-	if dir == "" {
+	if dir == "" || !filepath.IsAbs(dir) {
 		return ""
 	}
 	if r, err := filepath.EvalSymlinks(dir); err == nil {
 		return filepath.Clean(r)
 	}
-	if filepath.IsAbs(dir) {
-		return filepath.Clean(dir)
-	}
 	return ""
+}
+
+// cwdSnapshot keeps inference tied to the directory captured at server startup.
+// A missing, redirected, or replaced path must never be used for inference.
+type cwdSnapshot struct {
+	path, resolved string
+	dev, ino       uint64
+}
+
+func captureCWD(path string) cwdSnapshot {
+	resolved := resolveDir(path)
+	if resolved == "" {
+		return cwdSnapshot{}
+	}
+	dev, ino, err := folderID(path)
+	if err != nil {
+		return cwdSnapshot{}
+	}
+	return cwdSnapshot{path: path, resolved: resolved, dev: dev, ino: ino}
+}
+
+func (c cwdSnapshot) validPath() string {
+	if c.path == "" || resolveDir(c.path) != c.resolved {
+		return ""
+	}
+	dev, ino, err := folderID(c.path)
+	if err != nil || dev != c.dev || ino != c.ino {
+		return ""
+	}
+	return c.path
 }
 
 func folderContains(folder, dir string) bool {
