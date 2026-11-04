@@ -233,7 +233,7 @@ var AGYBrainRoot = func() string {
 const AGYNoFallback = math.MaxInt
 
 type agyStep struct {
-	StepIndex int               `json:"step_index"`
+	StepIndex *int              `json:"step_index"`
 	Type      string            `json:"type"`
 	Status    string            `json:"status"`
 	Content   string            `json:"content"`
@@ -255,8 +255,8 @@ func agyTranscript(conversation string) ([]agyStep, bool) {
 			continue
 		}
 		var step agyStep
-		// A torn line means the transcript is still being written.
-		if json.Unmarshal([]byte(line), &step) != nil {
+		// A torn record or missing index cannot prove which turn completed.
+		if json.Unmarshal([]byte(line), &step) != nil || step.StepIndex == nil || *step.StepIndex < 0 {
 			return nil, false
 		}
 		steps = append(steps, step)
@@ -280,8 +280,8 @@ func AGYTranscriptLastStep(conversation string) int {
 	}
 	last := -1
 	for _, s := range steps {
-		if s.StepIndex > last {
-			last = s.StepIndex
+		if *s.StepIndex > last {
+			last = *s.StepIndex
 		}
 	}
 	return last
@@ -313,12 +313,12 @@ func agyTranscriptFinal(conversation string, run AGYRunIdentity) string {
 			turn = i
 		}
 	}
-	if turn < 0 || steps[turn].StepIndex <= run.AfterStep || !strings.Contains(steps[turn].Content, run.Marker) {
+	if turn < 0 || *steps[turn].StepIndex <= run.AfterStep || !strings.Contains(steps[turn].Content, run.Marker) {
 		return ""
 	}
 	pending := 0
 	for i, s := range steps[turn:] {
-		if s.StepIndex != steps[turn].StepIndex+i || s.Status != "DONE" {
+		if *s.StepIndex != *steps[turn].StepIndex+i || s.Status != "DONE" {
 			return ""
 		}
 		switch s.Type {

@@ -989,8 +989,12 @@ func TestFinalizeExitedAGYSessionUsesStoresWhenLogHasNoCompletionLine(t *testing
 			if err := os.WriteFile(logFile, []byte(log), 0o600); err != nil {
 				t.Fatal(err)
 			}
+			inode, ok := fileInode(logFile)
+			if !ok {
+				t.Fatal("could not read original log inode")
+			}
 			r := Reader{Home: home, SQLite: "/usr/bin/sqlite3"}
-			session := AGYGuardSession{ConversationID: convID}
+			session := AGYGuardSession{ConversationID: convID, LogInode: inode}
 			r.finalizeExitedAGYSession(&session, logFile, 0)
 			if session.State != c.want || !session.Exited {
 				t.Fatalf("state=%s exited=%v msg=%s", session.State, session.Exited, session.Message)
@@ -1005,6 +1009,28 @@ func TestFinalizeExitedAGYSessionUsesStoresWhenLogHasNoCompletionLine(t *testing
 			r.finalizeExitedAGYSession(&unbound, filepath.Join(home, "missing.log"), 0)
 			if unbound.State != AGYGuardStateWaitingUserAction {
 				t.Fatalf("unreadable log without conversation must not be idle, got %s", unbound.State)
+			}
+
+			// A readable replacement is no more trustworthy than a missing log.
+			replacement := filepath.Join(home, "replacement.log")
+			if err := os.WriteFile(replacement, nil, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Rename(replacement, logFile); err != nil {
+				t.Fatal(err)
+			}
+			if replacedInode, ok := fileInode(logFile); !ok || replacedInode == inode {
+				t.Fatal("log replacement did not change the inode")
+			}
+			replaced := AGYGuardSession{ConversationID: convID, LogInode: inode}
+			r.finalizeExitedAGYSession(&replaced, logFile, 0)
+			if replaced.State != c.want {
+				t.Fatalf("replaced log: state=%s msg=%s", replaced.State, replaced.Message)
+			}
+			unbound = AGYGuardSession{LogInode: inode}
+			r.finalizeExitedAGYSession(&unbound, logFile, 0)
+			if unbound.State != AGYGuardStateWaitingUserAction {
+				t.Fatalf("replaced log without conversation must not be idle, got %s", unbound.State)
 			}
 		})
 	}

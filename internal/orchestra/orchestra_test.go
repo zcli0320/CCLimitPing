@@ -429,6 +429,8 @@ func TestAntigravityResultFallsBackToFinishedTranscript(t *testing.T) {
 		{"concurrent turn by someone else", []string{input(0), reply(1), other(2), reply(3)}, -1, false, "", "报告错误"},
 		{"unfinished step before final", []string{input(0), tool(1), strings.Replace(step(2, "GENERIC", ""), "DONE", "RUNNING", 1), reply(3)}, -1, false, "", "报告错误"},
 		{"missing step indices", []string{input(0), reply(3)}, -1, false, "", "报告错误"},
+		{"missing step_index", []string{`{"type":"USER_INPUT","status":"DONE","content":"TASK Run marker: m1"}`, reply(1)}, -1, false, "", "报告错误"},
+		{"null step_index", []string{`{"step_index":null,"type":"USER_INPUT","status":"DONE","content":"TASK Run marker: m1"}`, reply(1)}, -1, false, "", "报告错误"},
 		{"unknown record as tool result", []string{input(0), tool(1), step(2, "SOMETHING_NEW", ""), reply(3)}, -1, false, "", "报告错误"},
 	}
 	for i, c := range cases {
@@ -491,6 +493,12 @@ func TestAGYTranscriptLastStep(t *testing.T) {
 	}
 	if got := AGYTranscriptLastStep("c2"); got != AGYNoFallback {
 		t.Fatalf("unreadable conversation = %d", got)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "transcript.jsonl"), []byte(`{"type":"USER_INPUT"}`+"\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got := AGYTranscriptLastStep("c1"); got != AGYNoFallback {
+		t.Fatalf("transcript without step_index = %d", got)
 	}
 }
 

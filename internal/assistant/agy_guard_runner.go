@@ -278,17 +278,19 @@ func (r Reader) RunManagedAGYSession(ctx context.Context, folder string, extraAr
 // Never claim task completion merely from exitCode == 0.
 func (r Reader) finalizeExitedAGYSession(session *AGYGuardSession, logFile string, exitCode int) {
 	finalLog, logErr := ParseAGYDedicatedLog(logFile)
+	currentInode, inodeOK := fileInode(logFile)
+	logUsable := logErr == nil && inodeOK && session.LogInode != 0 && currentInode == session.LogInode
 	session.Exited = true
 	session.ExitCode = exitCode
-	if logErr == nil && finalLog.ActiveConversationID != "" {
+	if logUsable && finalLog.ActiveConversationID != "" {
 		session.ConversationID = finalLog.ActiveConversationID
 	}
 	switch {
-	case logErr != nil && !r.agyTurnFinishedAtExit(session.ConversationID):
+	case !logUsable && !r.agyTurnFinishedAtExit(session.ConversationID):
 		session.State = AGYGuardStateWaitingUserAction
-		session.LastReason = fmt.Sprintf("进程已退出（退出码 %d），但专用日志不可读取，无法确认最后一轮是否完成", exitCode)
+		session.LastReason = fmt.Sprintf("进程已退出（退出码 %d），但专用日志不可读取或已替换，无法确认最后一轮是否完成", exitCode)
 		session.Message = session.LastReason
-	case logErr == nil && finalLog.LastTurnStartedLine > 0 && finalLog.LastTurnCompletedLine < finalLog.LastTurnStartedLine &&
+	case logUsable && finalLog.LastTurnStartedLine > 0 && finalLog.LastTurnCompletedLine < finalLog.LastTurnStartedLine &&
 		!r.agyTurnFinishedAtExit(session.ConversationID):
 		session.State = AGYGuardStateWaitingUserAction
 		session.LastReason = fmt.Sprintf("进程已退出（退出码 %d），但最后一轮生成未见完成信号，不凭退出码宣告任务完成", exitCode)
