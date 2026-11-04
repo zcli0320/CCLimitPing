@@ -398,6 +398,11 @@ func TestReviewChangesAutoRework(t *testing.T) {
 	if done.Runs[1].Kind != "auto_rework" {
 		t.Fatalf("second run kind=%q, want auto_rework", done.Runs[1].Kind)
 	}
+	// The rework prompt must carry the card's limits, so a review-only card
+	// never turns into code edits (seen with a real read-only review task).
+	if log, err := os.ReadFile(e.args + ".prompts"); err != nil || !strings.Contains(string(log), AutoReworkLimits) {
+		t.Fatalf("auto rework prompt lacks the card limits: %v", err)
+	}
 	r1, err := e.store.Get("T1-r1")
 	if err != nil || r1.Status != Accepted {
 		t.Fatalf("r1=%+v err=%v", r1, err)
@@ -425,6 +430,16 @@ func TestReviewSkippedWhenReviewerIsLeadOrNoProject(t *testing.T) {
 	}
 	if _, err := e.store.Get("T1-r1"); err == nil {
 		t.Fatal("review child should not exist when reviewer == lead")
+	}
+
+	// The executor never reviews its own receipt (P1 lists reviewer claude,
+	// so dispatch to claude here).
+	if _, err := e.store.DispatchInProject(e.cfg, "lead", "P1", "claude", "", "T3", "TASK T3", nil, nil); err != nil {
+		t.Fatal(err)
+	}
+	t3 := waitDone(t, e, "T3")
+	if t3.Status != Receipt || t3.ReviewTask != "" || t3.ReviewedRuns != 0 {
+		t.Fatalf("reviewer==executor task=%+v", t3)
 	}
 
 	if _, err := e.store.Dispatch(e.cfg, "lead", "codex", e.folder, "T2", "TASK T2"); err != nil {

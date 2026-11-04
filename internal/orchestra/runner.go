@@ -104,6 +104,11 @@ Verified: <commands and results>
 Doubts: <remaining issues>
 `
 
+// AutoReworkLimits keeps an automatic rework inside the original card: a
+// review-only or read-only card must not turn into code edits because a
+// reviewer or check asked for changes.
+const AutoReworkLimits = "The original card's Don't limits still apply. If the card is a review, a test run, or says not to edit files, do not edit anything: report what would need to change in your receipt instead."
+
 // Runner starts queued tasks, at most one per executor at a time.
 type Runner struct {
 	Cfg             Config

@@ -22,6 +22,7 @@ const fakeCodex = `#!/bin/bash
 echo "$@" >> "$ARGS_LOG"
 echo "$PATH" > "$ARGS_LOG.path"
 prompt=$(cat)
+printf '%s\n' "$prompt" >> "$ARGS_LOG.prompts"
 out=""; prev=""
 for a in "$@"; do [ "$prev" = "-o" ] && out="$a"; prev="$a"; done
 echo '{"type":"thread.started","thread_id":"thread-1"}'

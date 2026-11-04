@@ -343,7 +343,7 @@ func (r *Runner) finishChecks(a *active) {
 		}
 		if len(fails) > 0 && settingsErr == nil && t.AutoReworkCount < settings.AutoReworkMax && t.Session != "" {
 			text := reworkEvidence(fails)
-			t.Rework = "Fix the following failed checks, then give a new receipt:\n" + text
+			t.Rework = "Fix the following failed checks, then give a new receipt:\n" + text + "\n" + AutoReworkLimits
 			t.AutoReworkCount++
 			t.AutoReworkPending = true
 			t.Status = Queued

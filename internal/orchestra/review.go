@@ -56,7 +56,9 @@ func (s Store) pendingReview(t *Task) string {
 		return ""
 	}
 	p, err := s.GetProject(t.Project)
-	if err != nil || p.Archived || p.Reviewer == t.Lead {
+	// Nobody reviews their own work: the lead accepts it, and an executor
+	// reviewing its own receipt adds nothing but spent quota.
+	if err != nil || p.Archived || p.Reviewer == t.Lead || p.Reviewer == t.Executor {
 		return ""
 	}
 	return p.Reviewer
@@ -155,7 +157,7 @@ func (r *Runner) reviewTick(tasks []*Task) {
 			t.ReviewVerdict = verdict
 			t.ReviewText = text
 			if verdict == "changes" && settingsErr == nil && t.AutoReworkCount < settings.AutoReworkMax && t.Session != "" {
-				t.Rework = "The project reviewer requested changes:\n" + text + "\n\nFix these, then give a new receipt."
+				t.Rework = "The project reviewer requested changes:\n" + text + "\n\nFix these, then give a new receipt.\n" + AutoReworkLimits
 				t.AutoReworkCount++
 				t.AutoReworkPending = true
 				t.Status = Queued

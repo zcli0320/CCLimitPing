@@ -271,6 +271,7 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
     private var pendingSelectTaskID: String?
     private var runner: Process?
     private var runnerActive = false
+    private var terminating = false
     private var confirmedRunner = false
     private var actionBusy = false
     private var loginInfo: OrchestraLoginInfo?
@@ -1038,10 +1039,8 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
                 DispatchQueue.main.async {
                     self.actionBusy = false
                     guard !status.active else { self.runnerActive = true; self.notice.stringValue = "已有执行器运行，未启动第二个。"; self.updateButtons(); return }
-                    let process = Process(); process.executableURL = self.executable; process.arguments = ["orchestra", "run"]
-                    process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
-                    do { try process.run(); self.runner = process; self.notice.stringValue = "已请求启动执行器。" } catch { self.notice.stringValue = "启动失败：\(error.localizedDescription)" }
-                    self.updateButtons(); self.refresh()
+                    self.runnerActive = false // fresher than any earlier refresh
+                    self.launchRunnerIfUnowned()
                 }
             } catch { DispatchQueue.main.async { self.actionBusy = false; self.notice.stringValue = "无法确认执行器状态：\(error.localizedDescription)"; self.updateButtons() } }
         }
@@ -1070,14 +1069,26 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
                 DispatchQueue.main.async {
                     self.settings = settings
                     self.confirmedRunner = true
-                    guard !self.runnerActive, self.runner?.isRunning != true else { return }
-                    let process = Process(); process.executableURL = self.executable; process.arguments = ["orchestra", "run"]
-                    process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
-                    do { try process.run(); self.runner = process; self.notice.stringValue = "已请求启动执行器。" } catch { self.notice.stringValue = "启动失败：\(error.localizedDescription)" }
-                    self.updateButtons(); self.refresh()
+                    self.runnerActive = false // fresher than any earlier refresh
+                    self.launchRunnerIfUnowned()
                 }
-            } catch {}
+            } catch {
+                DispatchQueue.main.async {
+                    guard !self.terminating else { return }
+                    self.notice.stringValue = "自动启动执行器失败：\(error.localizedDescription)"
+                    self.updateButtons()
+                }
+            }
         }
+    }
+    // Both start paths meet on the main queue, so a stale status response can
+    // never overwrite the process handle of an already started runner.
+    private func launchRunnerIfUnowned() {
+        guard !terminating, !runnerActive, runner?.isRunning != true else { updateButtons(); return }
+        let process = Process(); process.executableURL = executable; process.arguments = ["orchestra", "run"]
+        process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
+        do { try process.run(); runner = process; notice.stringValue = "已请求启动执行器。" } catch { notice.stringValue = "启动失败：\(error.localizedDescription)" }
+        updateButtons(); refresh()
     }
     @objc private func stopRunnerAction() { stopOwnedRunner(wait: false); notice.stringValue = "正在停止本小助手启动的执行器。"; refresh() }
     private func stopOwnedRunner(wait: Bool) {
@@ -1091,7 +1102,7 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
             DispatchQueue.global(qos: .utility).asyncAfter(deadline: .now() + 10) { if process.isRunning { kill(process.processIdentifier, SIGKILL) } }
         }
     }
-    func stopRunnerForTermination() { timer?.invalidate(); cancelLogin(); stopOwnedRunner(wait: true) }
+    func stopRunnerForTermination() { terminating = true; timer?.invalidate(); cancelLogin(); stopOwnedRunner(wait: true) }
 
     @objc private func beginLogin() {
         guard !loginBusy, let info = loginInfo, !info.login.logged_in else { return }
