@@ -41,8 +41,13 @@ struct OrchestraChangeEvidence: Decodable, Equatable { let status: String; let c
 struct OrchestraEvidence: Decodable, Equatable { let summary: String; let checks: [OrchestraCheckEvidence]?; let changes: OrchestraChangeEvidence?; let phase: String? }
 struct OrchestraProject: Decodable, Equatable {
     let id: String; let name: String; let folder: String; let executor: String
-    let lead: String?; let reviewer: String?; let checks: [String]?; let scope: [String]?; let archived: Bool?
+    let lead: String?; let reviewer: String?; let checks: [String]?; let scope: [String]?; let sync_agents_md: Bool?; let archived: Bool?
+    var rulesPath: String {
+        guard !folder.isEmpty, !id.isEmpty else { return "" }
+        return URL(fileURLWithPath: folder).appendingPathComponent(".codex-helper/projects/\(id).md").path
+    }
 }
+private struct OrchestraCommandWarning: Decodable { let warning: String? }
 struct OrchestraTask: Decodable, Equatable {
     let id: String
     let lead: String?
@@ -308,7 +313,10 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
     private let expandAllButton = NSButton(title: "全部展开", target: nil, action: nil)
     private let collapseAllButton = NSButton(title: "全部收起", target: nil, action: nil)
     private let newProject = NSButton(title: "新建项目…", target: nil, action: nil)
+    private let editProject = NSButton(title: "编辑项目…", target: nil, action: nil)
     private let archiveProject = NSButton(title: "归档项目", target: nil, action: nil)
+    private let revealInFinder = NSButton(title: "在 Finder 中显示", target: nil, action: nil)
+    private let openProjectRules = NSButton(title: "打开项目规则", target: nil, action: nil)
     private let newTask = NSButton(title: "新任务…", target: nil, action: nil)
     private let assignTask = NSButton(title: "归入项目…", target: nil, action: nil)
     private let cancelTask = NSButton(title: "停止", target: nil, action: nil)
@@ -424,16 +432,27 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
         collapseAllButton.target = self; collapseAllButton.action = #selector(collapseAllGroups); Theme.button(collapseAllButton, small: true)
         newProject.target = self; newProject.action = #selector(createProject); Theme.button(newProject, small: true)
         newProject.image = NSImage(systemSymbolName: "folder.badge.plus", accessibilityDescription: nil); newProject.imagePosition = .imageLeading
+        editProject.target = self; editProject.action = #selector(editSelectedProject); Theme.button(editProject, small: true)
+        editProject.image = NSImage(systemSymbolName: "pencil", accessibilityDescription: nil); editProject.imagePosition = .imageLeading
         archiveProject.target = self; archiveProject.action = #selector(archiveSelectedProject); Theme.button(archiveProject, small: true)
         archiveProject.image = NSImage(systemSymbolName: "archivebox", accessibilityDescription: nil); archiveProject.imagePosition = .imageLeading
+        revealInFinder.target = self; revealInFinder.action = #selector(revealProjectFolder); Theme.button(revealInFinder, small: true)
+        revealInFinder.image = NSImage(systemSymbolName: "folder", accessibilityDescription: nil); revealInFinder.imagePosition = .imageLeading
+        revealInFinder.setContentHuggingPriority(.required, for: .horizontal)
+        revealInFinder.setContentCompressionResistancePriority(.required, for: .horizontal)
+        openProjectRules.target = self; openProjectRules.action = #selector(openSelectedProjectRules); Theme.button(openProjectRules, small: true)
+        openProjectRules.image = NSImage(systemSymbolName: "doc.text", accessibilityDescription: nil); openProjectRules.imagePosition = .imageLeading
+        openProjectRules.setContentHuggingPriority(.required, for: .horizontal)
+        openProjectRules.setContentCompressionResistancePriority(.required, for: .horizontal)
         let folderIcon = NSImageView(image: NSImage(systemSymbolName: "folder.fill.badge.person.crop", accessibilityDescription: nil)!)
         folderIcon.contentTintColor = .systemBlue
-        projectBox.add(Theme.hstack([folderIcon, Theme.text("工作群视图：", size: 12, weight: .medium, wraps: false), projectFilter, expandAllButton, collapseAllButton, Theme.flexible(), newProject, archiveProject], spacing: 8))
-        projectCaption.maximumNumberOfLines = 0; projectBox.add(projectCaption)
+        projectBox.add(Theme.hstack([folderIcon, Theme.text("工作群视图：", size: 12, weight: .medium, wraps: false), projectFilter, expandAllButton, collapseAllButton, Theme.flexible(), newProject, editProject, archiveProject], spacing: 8))
+        projectCaption.maximumNumberOfLines = 0
+        projectBox.add(Theme.hstack([projectCaption, Theme.flexible(), revealInFinder, openProjectRules], spacing: 8))
         add(projectBox)
 
         let taskBox = SectionBox(spacing: 10)
-        for (identifier,title,width) in [("id","项目 / 任务",220.0),("status","状态",96.0),("executor","执行与审查",135.0),("review","审查结论",88.0),("summary","任务说明 / 证据摘要",290.0),("folder","工作目录",140.0),("updated","更新时间",145.0)] {
+        for (identifier,title,width) in [("id","项目 / 任务",260.0),("status","状态",96.0),("executor","执行与审查",135.0),("review","审查结论",88.0),("summary","任务说明 / 证据摘要",290.0),("folder","工作目录",140.0),("updated","更新时间",145.0)] {
             let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(identifier)); column.title = title; column.width = width; table.addTableColumn(column)
         }
         table.outlineTableColumn = table.tableColumns.first
@@ -692,17 +711,6 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
             }
             loginPath.stringValue = "目录：" + info.dir
         }
-        if let p = selectedFilterProject {
-            let rev = (p.reviewer ?? "").isEmpty ? "无" : p.reviewer!
-            projectCaption.stringValue = "仅显示项目「\(p.name)」· 执行者：\(p.executor) · 审查者：\(rev) · 目录：\(p.folder)"
-        } else if isUnassignedSelected {
-            projectCaption.stringValue = "仅显示尚未归入项目的独立任务；选中任务后可点击「归入项目…」收纳进任意工作群。"
-        } else if projects.isEmpty {
-            projectCaption.stringValue = "当前尚未建立项目（工作群）。点击右上角「新建项目…」创建工作群，任务将自动按项目收纳管理。"
-        } else {
-            projectCaption.stringValue = "按项目（工作群）层级收纳展示全部任务；点击项目行可查看配置或直接在该项目下派发新任务。"
-        }
-
         renderingOutline = true
         table.reloadData()
         for item in groupItems {
@@ -754,7 +762,25 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
         expandAllButton.isEnabled = !actionBusy && !groupItems.isEmpty
         collapseAllButton.isEnabled = !actionBusy && groupItems.count > 1
         newProject.isEnabled = !actionBusy && agents.contains(where: { $0.available })
+        editProject.isEnabled = !actionBusy && activeProject != nil
         archiveProject.isEnabled = !actionBusy && activeProject != nil
+        revealInFinder.isEnabled = !actionBusy && activeProject != nil
+        openProjectRules.isEnabled = !actionBusy && activeProject != nil
+        if let p = activeProject {
+            let rev = (p.reviewer ?? "").isEmpty ? "无" : p.reviewer!
+            let prefix = selectedFilterProject != nil ? "仅显示项目「\(p.name)」" : "项目「\(p.name)」"
+            projectCaption.stringValue = "\(prefix)· 执行者：\(p.executor) · 审查者：\(rev) · 目录：\(p.folder)\n规则文件：\(p.rulesPath)"
+            projectCaption.toolTip = "\(p.folder)\n\(p.rulesPath)"
+        } else if isUnassignedSelected {
+            projectCaption.stringValue = "仅显示尚未归入项目的独立任务；选中任务后可点击「归入项目…」收纳进任意工作群。"
+            projectCaption.toolTip = nil
+        } else if projects.isEmpty {
+            projectCaption.stringValue = "当前尚未建立项目（工作群）。点击右上角「新建项目…」创建工作群，任务将自动按项目收纳管理。"
+            projectCaption.toolTip = nil
+        } else if let first = projects.first {
+            projectCaption.stringValue = "按项目（工作群）层级收纳展示全部任务；规则文件位于 \(first.rulesPath)（点击项目行可查看或打开）。"
+            projectCaption.toolTip = first.rulesPath
+        }
         newTask.isEnabled = !actionBusy && (activeProject != nil || agents.contains(where: { $0.available }))
         assignTask.isEnabled = !actionBusy && selected != nil && !projects.isEmpty
         cancelTask.isEnabled = !actionBusy && selected?.canCancel == true
@@ -815,11 +841,14 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
             if let p = group.project {
                 let leadText = (p.lead ?? "").isEmpty ? "不限（任意主控）" : p.lead!
                 let revText = (p.reviewer ?? "").isEmpty ? "无自动审查" : p.reviewer!
+                let syncText = p.sync_agents_md == true ? "已开启" : "未开启"
                 let checksText = (p.checks ?? []).isEmpty ? "（未配置检查命令）" : (p.checks ?? []).map { "  • \($0)" }.joined(separator: "\n")
                 let scopeText = (p.scope ?? []).isEmpty ? "（未限制改动范围）" : (p.scope ?? []).map { "  • \($0)" }.joined(separator: "\n")
                 let text = """
                 项目（工作群）：\(p.name)（编号：\(p.id)）\(p.archived == true ? " · 已归档" : "")
                 工作目录：\(p.folder)
+                项目规则：\(p.rulesPath)
+                同步 AGENTS.md：\(syncText)
                 主控代理：\(leadText) · 执行代理：\(p.executor) · 审查代理：\(revText)
                 收纳任务：共 \(group.tasks.count) 个任务（点击下方「新任务…」可直接向该项目派活）
 
@@ -881,11 +910,21 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
                 icon.contentTintColor = grp.isUnassigned ? .secondaryLabelColor : (grp.isArchived ? .tertiaryLabelColor : .systemBlue)
                 icon.setContentHuggingPriority(.required, for: .horizontal)
                 let titleField = Theme.text(grp.title, size: 12.5, weight: .semibold, wraps: false)
-                titleField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+                titleField.setContentHuggingPriority(.required, for: .horizontal)
+                titleField.setContentCompressionResistancePriority(.defaultHigh, for: .horizontal)
                 var rowViews: [NSView] = [icon, titleField]
                 if let pid = grp.projectID, pid != grp.title {
                     let idChip = StatusChip(pid, tint: .secondaryLabelColor)
                     rowViews.append(idChip)
+                }
+                if !grp.folder.isEmpty {
+                    let pathField = NSTextField(labelWithString: grp.folder)
+                    pathField.font = .systemFont(ofSize: 11)
+                    pathField.textColor = .secondaryLabelColor
+                    pathField.lineBreakMode = .byTruncatingMiddle
+                    pathField.toolTip = grp.folder
+                    pathField.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+                    rowViews.append(pathField)
                 }
                 let row = Theme.hstack(rowViews, spacing: 6)
                 cell.addSubview(row); row.translatesAutoresizingMaskIntoConstraints = false
@@ -894,7 +933,7 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
                     row.trailingAnchor.constraint(lessThanOrEqualTo: cell.trailingAnchor, constant: -4),
                     row.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
                 ])
-                cell.toolTip = grp.projectID.map { "\(grp.title)（\($0)）" } ?? grp.title
+                cell.toolTip = grp.folder.isEmpty ? (grp.projectID.map { "\(grp.title)（\($0)）" } ?? grp.title) : grp.folder
                 return cell
             }
             if key == "status" {
@@ -944,12 +983,12 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
                     text = grp.subtitle
                 }
             case "folder":
-                text = grp.folder.isEmpty ? "—" : URL(fileURLWithPath: grp.folder).lastPathComponent
+                text = grp.folder.isEmpty ? "—" : grp.folder
             default:
                 text = grp.tasks.first.map { $0.updated.replacingOccurrences(of: "T", with: " ").prefix(19).description } ?? "—"
             }
             let field = NSTextField(labelWithString: text)
-            field.lineBreakMode = .byTruncatingTail
+            field.lineBreakMode = key == "folder" ? .byTruncatingMiddle : .byTruncatingTail
             field.toolTip = key == "folder" && !grp.folder.isEmpty ? grp.folder : text
             field.font = .systemFont(ofSize: 11.5, weight: key == "executor" ? .medium : .regular)
             field.textColor = text == "—" ? .tertiaryLabelColor : .secondaryLabelColor
@@ -1161,10 +1200,11 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
         queue.async { [weak self] in
             guard let self = self else { return }
             do {
-                _ = try self.command(args, input: input)
+                let data = try self.command(args, input: input)
+                let warning = (try? JSONDecoder().decode(OrchestraCommandWarning.self, from: data))?.warning?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
                 DispatchQueue.main.async {
                     self.actionBusy = false
-                    self.notice.stringValue = successMessage
+                    self.notice.stringValue = warning.isEmpty ? successMessage : "\(successMessage) 警告：\(warning)"
                     onSuccess?()
                     self.updateButtons()
                     self.refresh()
@@ -1278,95 +1318,142 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
             self.mutate(["assign", "--id", task.id, "--project", targetProjectID], successMessage: "已将任务「\(task.id)」归入\(targetName)。")
         }
     }
+    @objc private func revealProjectFolder() {
+        guard let p = activeProject, !p.folder.isEmpty else { return }
+        NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: p.folder)])
+    }
+    @objc private func openSelectedProjectRules() {
+        guard !actionBusy, let p = activeProject else { return }
+        actionBusy = true; updateButtons()
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            do {
+                let data = try self.command(["project", "path", p.id])
+                let path = String(data: data, encoding: .utf8)?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+                DispatchQueue.main.async {
+                    self.actionBusy = false; self.updateButtons()
+                    guard !path.isEmpty else { self.notice.stringValue = "打开项目规则失败：未返回规则文件路径。"; return }
+                    if !NSWorkspace.shared.open(URL(fileURLWithPath: path)) {
+                        self.notice.stringValue = "无法打开项目规则：\(path)"
+                    }
+                }
+            } catch {
+                DispatchQueue.main.async {
+                    self.actionBusy = false; self.notice.stringValue = "打开项目规则失败：\(error.localizedDescription)"; self.updateButtons()
+                }
+            }
+        }
+    }
     @objc private func createProject() {
         let defaultFolder = activeProject?.folder ?? selected?.folder ?? projects.first?.folder ?? allTasks.first?.folder ?? ""
-        presentCreateProject(initialFolder: defaultFolder)
+        presentProjectForm(initialFolder: defaultFolder)
     }
-    private func presentCreateProject(
+    @objc private func editSelectedProject() {
+        guard let p = activeProject else { return }
+        let leadIdx = (p.lead ?? "").isEmpty ? 0 : ((agents.firstIndex(where: { $0.name == p.lead }) ?? -1) + 1)
+        let revIdx = (p.reviewer ?? "").isEmpty ? 0 : ((agents.firstIndex(where: { $0.name == p.reviewer }) ?? -1) + 1)
+        presentProjectForm(
+            editing: p,
+            initialName: p.name,
+            initialID: p.id,
+            initialFolder: p.folder,
+            initialExecName: p.executor,
+            initialLeadIndex: max(0, leadIdx),
+            initialRevIndex: max(0, revIdx),
+            initialChecks: (p.checks ?? []).joined(separator: "\n"),
+            initialScope: (p.scope ?? []).joined(separator: "\n"),
+            initialSyncAgentsMD: p.sync_agents_md == true
+        )
+    }
+    private func presentProjectForm(
+        editing: OrchestraProject? = nil,
         initialName: String = "",
         initialID: String = "",
         initialFolder: String = "",
-        initialExecIndex: Int = 0,
+        initialExecName: String? = nil,
         initialLeadIndex: Int = 0,
         initialRevIndex: Int = 0,
         initialChecks: String = "",
         initialScope: String = "",
+        initialSyncAgentsMD: Bool = false,
         errorMessage: String? = nil
     ) {
         guard let window = window else { return }
-        let available = agents.filter { $0.available }
-        guard !available.isEmpty else { return }
+        var execAgents = agents.filter { $0.available || $0.name == editing?.executor || $0.name == initialExecName }
+        if let currentExec = initialExecName ?? editing?.executor, !currentExec.isEmpty, !execAgents.contains(where: { $0.name == currentExec }) {
+            execAgents.append(OrchestraAgent(name: currentExec, label: currentExec, available: true, reason: nil))
+        }
+        guard !execAgents.isEmpty else { return }
+        let isEditing = editing != nil
         let alert = NSAlert()
-        alert.messageText = "新建项目（工作群）"
-        alert.informativeText = (errorMessage.map { "创建未完成：\($0)\n\n" } ?? "") + "项目是收纳任务的协作工作群：统一配置工作目录、主控/执行/审查代理、验收检查命令与改动范围。"
-        let form = NSStackView(); form.orientation = .vertical; form.alignment = .leading; form.spacing = 8; form.frame = NSRect(x: 0, y: 0, width: 460, height: 380)
+        alert.messageText = isEditing ? "编辑项目（工作群）" : "新建项目（工作群）"
+        alert.informativeText = (errorMessage.map { "\(isEditing ? "保存" : "创建")未完成：\($0)\n\n" } ?? "") + "项目是收纳任务的协作工作群：统一配置工作目录、主控/执行/审查代理、验收检查命令与改动范围。"
+        let form = NSStackView(); form.orientation = .vertical; form.alignment = .leading; form.spacing = 8; form.frame = NSRect(x: 0, y: 0, width: 460, height: 408)
         func labeledRow(_ title: String, _ control: NSView) -> NSStackView {
             let lbl = Theme.text(title, size: 12, weight: .medium, wraps: false)
             lbl.widthAnchor.constraint(equalToConstant: 76).isActive = true
             return Theme.hstack([lbl, control], spacing: 8)
         }
         let name = NSTextField(string: initialName); name.placeholderString = "必填，例如：前端重构组 / 账号管理迭代"
-        let id = NSTextField(string: initialID); id.placeholderString = "可选，留空根据项目名称或目录自动生成（如 fe-refactor）"
+        let id = NSTextField(string: editing?.id ?? initialID); id.placeholderString = "可选，留空根据项目名称或目录自动生成（如 fe-refactor）"
+        if isEditing { id.isEditable = false; id.isSelectable = true; id.textColor = .secondaryLabelColor }
         let folder = NSTextField(string: initialFolder); folder.placeholderString = "输入路径或点击右侧选择工作目录"; folder.isEditable = true; folder.lineBreakMode = .byTruncatingMiddle
         let choose = NSButton(title: "选择文件夹…", target: nil, action: nil); Theme.button(choose, small: true)
-        let target = FolderPickerTarget(field: folder, nameField: name, window: alert.window); choose.target = target; choose.action = #selector(FolderPickerTarget.choose)
+        let target = FolderPickerTarget(field: folder, nameField: isEditing ? nil : name, window: alert.window); choose.target = target; choose.action = #selector(FolderPickerTarget.choose)
         let folderRow = labeledRow("工作目录：", Theme.hstack([folder, choose], spacing: 6))
-        let execPopup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 376, height: 26)); execPopup.addItems(withTitles: available.map { $0.label })
-        if available.indices.contains(initialExecIndex) { execPopup.selectItem(at: initialExecIndex) }
+        let execPopup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 376, height: 26)); execPopup.addItems(withTitles: execAgents.map { $0.label })
+        if let targetExec = initialExecName ?? editing?.executor, let idx = execAgents.firstIndex(where: { $0.name == targetExec }) { execPopup.selectItem(at: idx) }
         let leadPopup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 376, height: 26)); leadPopup.addItems(withTitles: ["不指定（任意主控）"] + agents.map { $0.label })
         if initialLeadIndex >= 0 && initialLeadIndex < leadPopup.numberOfItems { leadPopup.selectItem(at: initialLeadIndex) }
         let revPopup = NSPopUpButton(frame: NSRect(x: 0, y: 0, width: 376, height: 26)); revPopup.addItems(withTitles: ["无自动审查"] + agents.map { $0.label })
         if initialRevIndex >= 0 && initialRevIndex < revPopup.numberOfItems { revPopup.selectItem(at: initialRevIndex) }
-        let execRow = labeledRow("执行代理：", execPopup)
-        let leadRow = labeledRow("主控代理：", leadPopup)
-        let revRow = labeledRow("审查代理：", revPopup)
         let checks = NSTextView(); checks.font = .monospacedSystemFont(ofSize: 11.5, weight: .regular); checks.string = initialChecks
-        let checksScroll = NSScrollView(); checksScroll.documentView = checks; checksScroll.borderType = .bezelBorder; checksScroll.hasVerticalScroller = true; checksScroll.heightAnchor.constraint(equalToConstant: 52).isActive = true
+        let checksScroll = NSScrollView(); checksScroll.documentView = checks; checksScroll.borderType = .bezelBorder; checksScroll.hasVerticalScroller = true; checksScroll.heightAnchor.constraint(equalToConstant: 50).isActive = true
         checks.isVerticallyResizable = true; checks.autoresizingMask = [.width]; checks.textContainer?.widthTracksTextView = true
         let scope = NSTextView(); scope.font = .monospacedSystemFont(ofSize: 11.5, weight: .regular); scope.string = initialScope
-        let scopeScroll = NSScrollView(); scopeScroll.documentView = scope; scopeScroll.borderType = .bezelBorder; scopeScroll.hasVerticalScroller = true; scopeScroll.heightAnchor.constraint(equalToConstant: 52).isActive = true
+        let scopeScroll = NSScrollView(); scopeScroll.documentView = scope; scopeScroll.borderType = .bezelBorder; scopeScroll.hasVerticalScroller = true; scopeScroll.heightAnchor.constraint(equalToConstant: 50).isActive = true
         scope.isVerticallyResizable = true; scope.autoresizingMask = [.width]; scope.textContainer?.widthTracksTextView = true
-        let items: [NSView] = [labeledRow("项目名称：", name), labeledRow("项目编号：", id), folderRow, execRow, revRow, leadRow, Theme.caption("检查命令（可选，每行一条，如 go test ./...）："), checksScroll, Theme.caption("允许改动范围（可选，每行一个相对路径前缀）："), scopeScroll]
+        let syncBox = NSButton(checkboxWithTitle: "同步到项目 AGENTS.md（会修改该目录下的 AGENTS.md）", target: nil, action: nil)
+        syncBox.state = initialSyncAgentsMD ? .on : .off
+        let items: [NSView] = [labeledRow("项目名称：", name), labeledRow("项目编号：", id), folderRow, labeledRow("执行代理：", execPopup), labeledRow("审查代理：", revPopup), labeledRow("主控代理：", leadPopup), Theme.caption("检查命令（可选，每行一条，如 go test ./...）："), checksScroll, Theme.caption("允许改动范围（可选，每行一个相对路径前缀）："), scopeScroll, syncBox]
         for item in items { form.addArrangedSubview(item); item.widthAnchor.constraint(equalToConstant: 460).isActive = true }
-        alert.accessoryView = form; alert.addButton(withTitle: "创建项目"); alert.addButton(withTitle: "取消")
+        alert.accessoryView = form; alert.addButton(withTitle: isEditing ? "保存修改" : "创建项目"); alert.addButton(withTitle: "取消")
         alert.beginSheetModal(for: window) { [weak self] response in
             _ = target
-            guard response == .alertFirstButtonReturn, let self = self, available.indices.contains(execPopup.indexOfSelectedItem) else { return }
+            guard response == .alertFirstButtonReturn, let self = self, execAgents.indices.contains(execPopup.indexOfSelectedItem) else { return }
             let draftName = name.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             let rawID = id.stringValue.trimmingCharacters(in: .whitespacesAndNewlines)
             let draftFolder = (folder.stringValue.trimmingCharacters(in: .whitespacesAndNewlines) as NSString).expandingTildeInPath
-            let execIdx = execPopup.indexOfSelectedItem
+            let chosenExec = execAgents[execPopup.indexOfSelectedItem].name
             let leadIdx = leadPopup.indexOfSelectedItem
             let revIdx = revPopup.indexOfSelectedItem
+            let chosenLead = self.agents.indices.contains(leadIdx - 1) ? self.agents[leadIdx - 1].name : ""
+            let chosenRev = self.agents.indices.contains(revIdx - 1) ? self.agents[revIdx - 1].name : ""
             let draftChecks = checks.string
             let draftScope = scope.string
+            let draftSync = syncBox.state == .on
             let reopen: (String) -> Void = { [weak self] msg in
-                self?.presentCreateProject(
-                    initialName: draftName,
-                    initialID: rawID,
-                    initialFolder: draftFolder,
-                    initialExecIndex: execIdx,
-                    initialLeadIndex: leadIdx,
-                    initialRevIndex: revIdx,
-                    initialChecks: draftChecks,
-                    initialScope: draftScope,
-                    errorMessage: msg
-                )
+                self?.presentProjectForm(editing: editing, initialName: draftName, initialID: rawID, initialFolder: draftFolder, initialExecName: chosenExec, initialLeadIndex: leadIdx, initialRevIndex: revIdx, initialChecks: draftChecks, initialScope: draftScope, initialSyncAgentsMD: draftSync, errorMessage: msg)
             }
             if draftName.isEmpty { reopen("请填写项目名称。"); return }
             if draftFolder.isEmpty { reopen("请选择或填写工作目录。"); return }
-            let existingProjectIDs = Set(self.allProjects.map(\.id))
-            let resolvedID = resolveOrchestraProjectID(rawID, name: draftName, folder: draftFolder, existingIDs: existingProjectIDs)
-            var args = ["project", "create", "--id", resolvedID, "--name", draftName, "--folder", draftFolder, "--to", available[execIdx].name]
-            if self.agents.indices.contains(leadIdx - 1) { args += ["--lead", self.agents[leadIdx - 1].name] }
-            if self.agents.indices.contains(revIdx - 1) { args += ["--reviewer", self.agents[revIdx - 1].name] }
-            for line in draftChecks.components(separatedBy: .newlines).map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) }) where !line.isEmpty { args += ["--check", line] }
-            for line in draftScope.components(separatedBy: .newlines).map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) }) where !line.isEmpty { args += ["--scope", line] }
-            self.pendingSelectProjectID = resolvedID
-            self.mutate(args, successMessage: "已创建项目「\(draftName)」（\(resolvedID)）。", onFailure: { msg in
-                self.pendingSelectProjectID = nil
-                reopen(msg)
-            })
+            let checkLines = draftChecks.components(separatedBy: .newlines).map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) }).filter { !$0.isEmpty }
+            let scopeLines = draftScope.components(separatedBy: .newlines).map({ $0.trimmingCharacters(in: .whitespacesAndNewlines) }).filter { !$0.isEmpty }
+            if let old = editing {
+                let flags = orchestraProjectUpdateArgs(from: old, name: draftName, folder: draftFolder, executor: chosenExec, lead: chosenLead, reviewer: chosenRev, checks: checkLines, scope: scopeLines, syncAgentsMD: draftSync)
+                self.pendingSelectProjectID = old.id
+                self.mutate(["project", "update", old.id] + flags, successMessage: "已更新项目「\(draftName)」（\(old.id)）。", onFailure: { msg in self.pendingSelectProjectID = nil; reopen(msg) })
+            } else {
+                let resolvedID = resolveOrchestraProjectID(rawID, name: draftName, folder: draftFolder, existingIDs: Set(self.allProjects.map(\.id)))
+                var args = ["project", "create", "--id", resolvedID, "--name", draftName, "--folder", draftFolder, "--to", chosenExec]
+                if !chosenLead.isEmpty { args += ["--lead", chosenLead] }
+                if !chosenRev.isEmpty { args += ["--reviewer", chosenRev] }
+                for line in checkLines { args += ["--check", line] }
+                for line in scopeLines { args += ["--scope", line] }
+                if draftSync { args.append("--sync-agents-md") }
+                self.pendingSelectProjectID = resolvedID
+                self.mutate(args, successMessage: "已创建项目「\(draftName)」（\(resolvedID)）。", onFailure: { msg in self.pendingSelectProjectID = nil; reopen(msg) })
+            }
         }
     }
     @objc private func createTask() {
@@ -1491,6 +1578,37 @@ func resolveOrchestraProjectID(_ raw: String, name: String, folder: String, exis
     var suffix = 2
     while existingIDs.contains("\(base)-\(suffix)") { suffix += 1 }
     return "\(base)-\(suffix)"
+}
+
+func orchestraProjectUpdateArgs(
+    from old: OrchestraProject,
+    name: String,
+    folder: String,
+    executor: String,
+    lead: String,
+    reviewer: String,
+    checks: [String],
+    scope: [String],
+    syncAgentsMD: Bool
+) -> [String] {
+    var args: [String] = []
+    if name != old.name { args += ["--name", name] }
+    if folder != old.folder { args += ["--folder", folder] }
+    if executor != old.executor { args += ["--to", executor] }
+    if lead != (old.lead ?? "") { args += lead.isEmpty ? ["--lead="] : ["--lead", lead] }
+    if reviewer != (old.reviewer ?? "") { args += reviewer.isEmpty ? ["--reviewer="] : ["--reviewer", reviewer] }
+    if checks != (old.checks ?? []) {
+        args.append("--clear-checks")
+        for c in checks { args += ["--check", c] }
+    }
+    if scope != (old.scope ?? []) {
+        args.append("--clear-scope")
+        for s in scope { args += ["--scope", s] }
+    }
+    if syncAgentsMD != (old.sync_agents_md ?? false) {
+        args.append("--sync-agents-md=\(syncAgentsMD ? "true" : "false")")
+    }
+    return args
 }
 
 func resolveOrchestraTaskID(_ raw: String, project: String?, existingIDs: Set<String> = [], now: Date = Date()) -> String {
