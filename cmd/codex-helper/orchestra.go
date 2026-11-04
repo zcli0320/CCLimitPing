@@ -127,6 +127,7 @@ func orchestraCommand() {
 		account := fs.String("account", "", "desktop or separate")
 		minimum := fs.Float64("min-remaining", -1, "minimum percent")
 		autoSwitch := fs.Bool("auto-switch", false, "automatically switch while Desktop is closed")
+		autoStartRunner := fs.Bool("auto-start-runner", false, "start the runner with Codex Helper")
 		autoRework := fs.Int("auto-rework-max", -1, "maximum automatic reworks (0-2)")
 		checkTimeout := fs.Int("check-timeout-seconds", -1, "per-check timeout")
 		fs.Parse(args)
@@ -148,6 +149,9 @@ func orchestraCommand() {
 			}
 			if f.Name == "auto-switch" {
 				s.AutoSwitch = *autoSwitch
+			}
+			if f.Name == "auto-start-runner" {
+				s.AutoStartRunner = *autoStartRunner
 			}
 			if f.Name == "auto-rework-max" {
 				s.AutoReworkMax = *autoRework

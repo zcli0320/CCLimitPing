@@ -24,7 +24,7 @@ struct OrchestraAutoSwitchStatus: Decodable {
     }
 }
 struct OrchestraRunnerStatus: Decodable { let active: Bool; let dir: String; let paused: Bool?; let reason: String?; let remaining: Double?; let account: String?; let auto_switch: OrchestraAutoSwitchStatus? }
-struct OrchestraSettings: Decodable { let account: String; let min_remaining: Double; let auto_switch: Bool?; let auto_rework_max: Int? }
+struct OrchestraSettings: Decodable { let account: String; let min_remaining: Double; let auto_switch: Bool?; let auto_start_runner: Bool?; let auto_rework_max: Int? }
 struct OrchestraLoginStatus: Decodable { let logged_in: Bool; let state: String; let mode: String; let detail: String }
 struct OrchestraLoginInfo: Decodable { let dir: String; let created: [String]; let login: OrchestraLoginStatus; let codex_bin: String }
 struct OrchestraLoginActions {
@@ -274,7 +274,7 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
     private var confirmedRunner = false
     private var actionBusy = false
     private var loginInfo: OrchestraLoginInfo?
-    private var settings = OrchestraSettings(account: "desktop", min_remaining: 10, auto_switch: false, auto_rework_max: 1)
+    private var settings = OrchestraSettings(account: "desktop", min_remaining: 10, auto_switch: false, auto_start_runner: false, auto_rework_max: 1)
     private var runnerStatus: OrchestraRunnerStatus?
     private var loginProcess: Process?
     private var loginBusy = false
@@ -295,6 +295,7 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
     private let loginCancel = NSButton(title: "取消登录", target: nil, action: nil)
     private let accountMode = NSPopUpButton()
     private let autoSwitch = NSButton(checkboxWithTitle: "Desktop 已关闭时自动切换账号", target: nil, action: nil)
+    private let autoStartRunner = NSButton(checkboxWithTitle: "随小助手启动执行器", target: nil, action: nil)
     private let autoSwitchAck = NSButton(title: "已检查，解除自动切号暂停", target: nil, action: nil)
     private let reworkLimit = NSPopUpButton()
     private let showEvidence = NSButton(checkboxWithTitle: "显示检查详情", target: nil, action: nil)
@@ -374,7 +375,9 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
             Theme.flexible()
         ], spacing: 6))
         runnerLabel.font = .systemFont(ofSize: 11.5); runnerLabel.maximumNumberOfLines = 0; runnerBox.add(runnerLabel)
-        autoSwitch.target = self; autoSwitch.action = #selector(changeAutoSwitch); runnerBox.add(autoSwitch)
+        autoSwitch.target = self; autoSwitch.action = #selector(changeAutoSwitch)
+        autoStartRunner.target = self; autoStartRunner.action = #selector(changeAutoStartRunner)
+        runnerBox.add(Theme.hstack([autoSwitch, autoStartRunner, Theme.flexible()], spacing: 12))
         autoSwitchAck.target = self; autoSwitchAck.action = #selector(ackAutoSwitch); Theme.button(autoSwitchAck, small: true)
         autoSwitchAck.image = NSImage(systemSymbolName: "checkmark.shield", accessibilityDescription: nil); autoSwitchAck.imagePosition = .imageLeading
         runnerBox.add(autoSwitchAck)
@@ -677,6 +680,7 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
             runnerLabel.stringValue += "\n" + status.display
         }
         autoSwitch.state = settings.auto_switch == true ? .on : .off
+        autoStartRunner.state = settings.auto_start_runner == true ? .on : .off
         reworkLimit.selectItem(at: max(0, min(2, settings.auto_rework_max ?? 1)))
         accountMode.selectItem(at: settings.account == "separate" ? 1 : 0)
         if let info = loginInfo {
@@ -759,6 +763,7 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
         confirmStopped.isEnabled = !actionBusy && selected?.canConfirmStopped == true
         accountMode.isEnabled = !actionBusy && !loginBusy
         autoSwitch.isEnabled = !actionBusy && settings.account == "desktop"
+        autoStartRunner.isEnabled = !actionBusy
         autoSwitchAck.isEnabled = !actionBusy && runnerStatus?.auto_switch?.stage == "uncertain" && runnerStatus?.auto_switch?.review_required == true
         reworkLimit.isEnabled = !actionBusy
         let separate = settings.account == "separate"
@@ -1041,6 +1046,39 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
             } catch { DispatchQueue.main.async { self.actionBusy = false; self.notice.stringValue = "无法确认执行器状态：\(error.localizedDescription)"; self.updateButtons() } }
         }
     }
+    func startRunnerIfConfigured() {
+        queue.async { [weak self] in
+            guard let self = self else { return }
+            do {
+                let decoder = JSONDecoder()
+                let settings = try decoder.decode(OrchestraSettings.self, from: self.command(["settings"]))
+                guard settings.auto_start_runner == true else { return }
+                if settings.account == "separate" {
+                    let login = try decoder.decode(OrchestraLoginInfo.self, from: self.command(["login-status"]))
+                    guard login.login.state == "logged_in" else {
+                        DispatchQueue.main.async {
+                            self.settings = settings
+                            self.loginInfo = login
+                            self.notice.stringValue = "独立账号未登录，未随小助手自动启动执行器。"
+                            self.updateButtons()
+                        }
+                        return
+                    }
+                }
+                let status = try decoder.decode(OrchestraRunnerStatus.self, from: self.command(["runner"]))
+                guard !status.active else { return }
+                DispatchQueue.main.async {
+                    self.settings = settings
+                    self.confirmedRunner = true
+                    guard !self.runnerActive, self.runner?.isRunning != true else { return }
+                    let process = Process(); process.executableURL = self.executable; process.arguments = ["orchestra", "run"]
+                    process.standardOutput = FileHandle.nullDevice; process.standardError = FileHandle.nullDevice
+                    do { try process.run(); self.runner = process; self.notice.stringValue = "已请求启动执行器。" } catch { self.notice.stringValue = "启动失败：\(error.localizedDescription)" }
+                    self.updateButtons(); self.refresh()
+                }
+            } catch {}
+        }
+    }
     @objc private func stopRunnerAction() { stopOwnedRunner(wait: false); notice.stringValue = "正在停止本小助手启动的执行器。"; refresh() }
     private func stopOwnedRunner(wait: Bool) {
         guard let process = runner, process.isRunning else { return }
@@ -1144,6 +1182,20 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
         autoSwitch.state = .off
         let alert=NSAlert(); alert.messageText="启用自动切换账号？"; alert.informativeText="只有 Codex Desktop 已关闭时才会切换 ~/.codex 的账号。之后 Desktop 和执行器都会使用新账号，并消耗其他账号的额度。"; alert.addButton(withTitle:"启用"); alert.addButton(withTitle:"取消")
         alert.beginSheetModal(for:window) { [weak self] response in if response == .alertFirstButtonReturn { self?.mutate(["settings", "--auto-switch=true"]) } }
+    }
+    @objc private func changeAutoStartRunner() {
+        guard let window = window else { return }
+        if autoStartRunner.state == .off { mutate(["settings", "--auto-start-runner=false"]); return }
+        autoStartRunner.state = .off
+        let alert = NSAlert(); alert.messageText = "启动无人值守执行器？"
+        alert.informativeText = "执行器会随小助手自动启动并立即处理队列中已有任务。代理将在无人值守时运行，并消耗所选代理的使用额度。Codex 使用工作区写入限制，请先核对任务和工作目录。" + (settings.account == "separate" && loginInfo?.login.state == "not_logged_in" ? "\n\n独立账号未登录，Codex 任务会失败。" : "")
+        alert.addButton(withTitle: "启用"); alert.addButton(withTitle: "取消")
+        alert.beginSheetModal(for: window) { [weak self] response in
+            if response == .alertFirstButtonReturn {
+                self?.confirmedRunner = true
+                self?.mutate(["settings", "--auto-start-runner=true"])
+            }
+        }
     }
     @objc private func resumeSelected() { if let task = selected, task.canResume { mutate(["resume", task.id]) } }
     @objc private func confirmStoppedSelected() {

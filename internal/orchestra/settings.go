@@ -17,6 +17,7 @@ type Settings struct {
 	Account             string  `json:"account"`
 	MinRemaining        float64 `json:"min_remaining"`
 	AutoSwitch          bool    `json:"auto_switch"`
+	AutoStartRunner     bool    `json:"auto_start_runner"`
 	Revision            string  `json:"revision,omitempty"`
 	AutoReworkMax       int     `json:"auto_rework_max"`
 	CheckTimeoutSeconds int     `json:"check_timeout_seconds"`

@@ -13,15 +13,22 @@ func TestSettingsAndQuotaGate(t *testing.T) {
 	e := setup(t)
 	e.cfg.Home = t.TempDir()
 	s, err := ReadSettings(e.cfg.Dir)
-	if err != nil || s != DefaultSettings() {
+	if err != nil || s != DefaultSettings() || s.AutoStartRunner {
 		t.Fatalf("default: %+v %v", s, err)
 	}
 	s.MinRemaining = 15
+	s.AutoStartRunner = true
 	if err = WriteSettings(e.cfg.Dir, s); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := ReadSettings(e.cfg.Dir); got.Account != s.Account || got.MinRemaining != s.MinRemaining || got.Revision == "" {
+	if got, _ := ReadSettings(e.cfg.Dir); got.Account != s.Account || got.MinRemaining != s.MinRemaining || !got.AutoStartRunner || got.Revision == "" {
 		t.Fatal(got)
+	}
+	if err = os.WriteFile(filepath.Join(e.cfg.Dir, "settings.json"), []byte(`{"account":"desktop","min_remaining":15,"auto_rework_max":1,"check_timeout_seconds":600}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := ReadSettings(e.cfg.Dir); err != nil || got.AutoStartRunner {
+		t.Fatalf("legacy settings without auto_start_runner: %+v %v", got, err)
 	}
 	value, known, calls := float64(5), true, 0
 	e.cfg.Quota = func(context.Context) (float64, bool) { calls++; return value, known }

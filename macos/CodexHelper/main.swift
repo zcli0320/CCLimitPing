@@ -537,6 +537,12 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
             self?.runResumeCheckIfDue()
             self?.updateLoginItem()
         }
+        if fixture == nil {
+            if orchestraCenter == nil {
+                orchestraCenter = OrchestraWindowController(executable: Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/codex-helper"))
+            }
+            orchestraCenter?.startRunnerIfConfigured()
+        }
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { !backgroundEnabled }
