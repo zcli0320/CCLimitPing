@@ -214,6 +214,8 @@ func (r Reader) Snapshot(ctx context.Context) Snapshot {
 			s.Handoff.Message = "Desktop 执行器已停止，交接结果待核查；请检查会话和账号后解除暂停。"
 		}
 	}
+	agyGuard := r.AGYGuardStatus()
+	s.AGYGuard = &agyGuard
 	return s
 }
 

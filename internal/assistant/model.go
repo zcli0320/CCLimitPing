@@ -73,6 +73,7 @@ type Snapshot struct {
 	Warmup           *WarmupReport         `json:"warmup,omitempty"`
 	Resume           *ResumeReport         `json:"resume,omitempty"`
 	Handoff          *HandoffSummary       `json:"handoff,omitempty"`
+	AGYGuard         *AGYGuardReport       `json:"agy_guard,omitempty"`
 }
 
 // GUI consumers need status and binding only, never account ids or the

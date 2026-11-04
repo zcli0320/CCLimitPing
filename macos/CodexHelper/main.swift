@@ -43,6 +43,15 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
     let quickLaunchCodexButton = NSButton(title: QuickLaunchTool.codex.buttonTitle, target: nil, action: nil)
     let quickLaunchAgyButton = NSButton(title: QuickLaunchTool.agy.buttonTitle, target: nil, action: nil)
     let quickLaunchStatus = NSTextField(wrappingLabelWithString: "选择文件夹后可在终端直接进入该目录以 yolo 模式启动 \(QuickLaunchTool.codex.label) 或 \(QuickLaunchTool.agy.label)。")
+    let agyGuardLaunchToggle = NSButton(checkboxWithTitle: "受管启动 AGY（接入会话监测）", target: nil, action: nil)
+    let agyAutoRecoveryToggle = NSButton(checkboxWithTitle: "网络异常有限自动恢复（默认关闭）", target: nil, action: nil)
+    let agyGuardPauseButton = NSButton(title: "暂停恢复", target: nil, action: nil)
+    let agyGuardStateChip = StatusChip("普通模式", tint: .secondaryLabelColor)
+    let agyGuardReasonLabel = NSTextField(wrappingLabelWithString: "普通启动保留原方式；勾选“受管启动 AGY”可在终端保留原交互的同时监测会话状态（自动恢复默认关闭）。")
+    var agyGuardReport: AGYGuardReport?
+    var agyGuardBusy = false
+    var agyGuardInFlight = false
+    var agyGuardRevision = 0
     var quickLaunchFolders: [String] = []
     let accountActionNotice = NSTextField(wrappingLabelWithString: "")
     var accountMetadata: [String: [String: Any]] = [:]
@@ -298,8 +307,27 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         quickLaunchStatus.font = .systemFont(ofSize: 11); quickLaunchStatus.textColor = .secondaryLabelColor
         quickLaunchStatus.maximumNumberOfLines = 2
         quickLaunchBox.add(quickLaunchStatus)
+        quickLaunchBox.addDivider()
+        agyGuardLaunchToggle.target = self; agyGuardLaunchToggle.action = #selector(toggleAGYGuardLaunch)
+        agyGuardLaunchToggle.controlSize = .small; agyGuardLaunchToggle.font = .systemFont(ofSize: 11.5, weight: .medium)
+        agyGuardLaunchToggle.state = state.agyGuardLaunchEnabled ? .on : .off
+        agyGuardLaunchToggle.toolTip = "启用后，“启动 AGY CLI”由受管运行器（PTY + 专用日志）持有终端通道，记录启动标识、PID、工作目录与确认后的会话 ID；未勾选则保持普通启动。"
+        agyAutoRecoveryToggle.target = self; agyAutoRecoveryToggle.action = #selector(toggleAGYAutoRecovery)
+        agyAutoRecoveryToggle.controlSize = .small; agyAutoRecoveryToggle.font = .systemFont(ofSize: 11.5)
+        agyAutoRecoveryToggle.state = .off
+        agyAutoRecoveryToggle.toolTip = "交付默认关闭。开启后仅在确认绑定会话前台模型连续网络异常、且无活动工具/后台任务/用户输入时才执行有边界恢复（30 分钟最多 2 次）。"
+        agyGuardPauseButton.target = self; agyGuardPauseButton.action = #selector(toggleAGYGuardPause)
+        Theme.button(agyGuardPauseButton, small: true)
+        agyGuardPauseButton.image = NSImage(systemSymbolName: "pause.circle", accessibilityDescription: nil)
+        agyGuardPauseButton.imagePosition = .imageLeading
+        agyGuardReasonLabel.font = .systemFont(ofSize: 11); agyGuardReasonLabel.textColor = .secondaryLabelColor
+        agyGuardReasonLabel.maximumNumberOfLines = 3
+        agyGuardReasonLabel.isSelectable = true
+        quickLaunchBox.add(Theme.hstack([agyGuardLaunchToggle, agyAutoRecoveryToggle, Theme.flexible(), agyGuardStateChip, agyGuardPauseButton], spacing: 8))
+        quickLaunchBox.add(agyGuardReasonLabel)
         add(quickLaunchBox, to: stack); gap(after: quickLaunchBox)
         updateQuickLaunchFolders()
+        updateAGYGuardUI()
 
         // Accounts, per-client state, and explicit manual switching.
         let manageLink = Theme.iconTextButton("添加 / 管理授权", symbol: "key.fill", small: true, target: self, action: #selector(openNativeAccountCenter))
@@ -501,6 +529,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         accountMetadataTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
             guard self?.window.isVisible == true else { return }
             self?.refreshAccountMetadata()
+            self?.refreshAGYGuardStatusIfNeeded()
         }
         timer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
             self?.refreshData(forceQuota: false)
@@ -802,6 +831,12 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
                     if queryQuota { self.lastQuotaRefresh = Date() }
                     else { snapshot.keepQuotaReadings(from: self.snapshot) }
                     self.readError = nil; self.snapshot = snapshot
+                    if !self.agyGuardBusy {
+                        if let agyGuard = snapshot.agy_guard {
+                            self.agyGuardReport = agyGuard
+                        }
+                        self.updateAGYGuardUI()
+                    }
                     if !self.warmupControlBusy && self.warmupControlRevision == warmupRevision { self.warmupReport = snapshot.warmup; self.updateWarmupUI() }
                     self.state.reconcile(snapshot.sessions(in: self.state.activeScope), complete: snapshot.complete(in: self.state.activeScope))
                     if !self.resumeBusy && self.resumeRevision == resumeRevision { self.resumeReport = snapshot.resume; self.updateResumeUI() }
@@ -1764,18 +1799,192 @@ extension Assistant {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true, attributes: [.posixPermissions: 0o700])
             let folderName = (folder as NSString).lastPathComponent
             let safeName = folderName.isEmpty || folderName == "/" ? "Workspace" : folderName.replacingOccurrences(of: "/", with: "-")
-            let file = directory.appendingPathComponent("\(tool.label) - \(safeName).command")
-            let script = quickLaunchCommandScript(tool: tool, folder: folder)
+            let useGuardedAGY = (tool.id == "agy" && state.agyGuardLaunchEnabled)
+            let fileTitle = useGuardedAGY ? "\(tool.label) (受管) - \(safeName).command" : "\(tool.label) - \(safeName).command"
+            let file = directory.appendingPathComponent(fileTitle)
+            let bridge = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/codex-helper").path
+            let script = useGuardedAGY
+                ? quickLaunchGuardedAGYScript(helperExecutable: bridge, folder: folder)
+                : quickLaunchCommandScript(tool: tool, folder: folder)
             try script.write(to: file, atomically: true, encoding: .utf8)
             try FileManager.default.setAttributes([.posixPermissions: 0o700], ofItemAtPath: file.path)
             if NSWorkspace.shared.open(file) {
-                quickLaunchStatus.stringValue = "已在终端启动 \(tool.label)（yolo 模式）：\((folder as NSString).abbreviatingWithTildeInPath)"
+                if useGuardedAGY {
+                    let autoLabel = (agyGuardReport?.policy.auto_recovery_enabled == true && agyGuardReport?.policy.paused != true) ? "有限自动恢复已开启" : "自动恢复默认关闭"
+                    quickLaunchStatus.stringValue = "已在终端启动受管 \(tool.label)（会话监测已接入 · \(autoLabel)）：\((folder as NSString).abbreviatingWithTildeInPath)"
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 2) { [weak self] in
+                        self?.refreshAGYGuardStatus(force: true)
+                    }
+                } else {
+                    quickLaunchStatus.stringValue = "已在终端启动 \(tool.label)（yolo 模式）：\((folder as NSString).abbreviatingWithTildeInPath)"
+                }
             } else {
                 quickLaunchStatus.stringValue = "终端未打开，请重试。"
             }
         } catch {
             quickLaunchStatus.stringValue = "无法创建终端启动脚本，请重试。"
         }
+    }
+
+    @objc func toggleAGYGuardLaunch() {
+        let enabled = agyGuardLaunchToggle.state == .on
+        state.agyGuardLaunchEnabled = enabled
+        save()
+        configureAGYGuard(arguments: ["agy-guard", "configure", "--guard-launch", enabled ? "on" : "off"])
+    }
+
+    @objc func toggleAGYAutoRecovery() {
+        guard !agyGuardBusy, fixture == nil else { return }
+        let enable = agyAutoRecoveryToggle.state == .on
+        if enable && !state.agyGuardLaunchEnabled {
+            state.agyGuardLaunchEnabled = true
+            agyGuardLaunchToggle.state = .on
+            save()
+        }
+        var args = ["agy-guard", "configure", "--auto-recovery", enable ? "on" : "off"]
+        if enable {
+            args += ["--guard-launch", "on", "--paused", "off"]
+        }
+        configureAGYGuard(arguments: args)
+    }
+
+    @objc func toggleAGYGuardPause() {
+        guard !agyGuardBusy, fixture == nil else { return }
+        let currentlyPaused = agyGuardReport?.policy.paused == true
+        configureAGYGuard(arguments: ["agy-guard", "configure", "--paused", currentlyPaused ? "off" : "on"])
+    }
+
+    private func configureAGYGuard(arguments: [String]) {
+        guard fixture == nil else {
+            updateAGYGuardUI()
+            return
+        }
+        agyGuardBusy = true
+        agyGuardRevision += 1
+        let rev = agyGuardRevision
+        updateAGYGuardUI()
+        let bridge = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/codex-helper")
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let report = try? JSONDecoder().decode(AGYGuardReport.self, from: BridgeClient.read(executable: bridge, arguments: arguments, timeout: 8))
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.agyGuardBusy = false
+                if self.agyGuardRevision == rev, let report = report {
+                    self.agyGuardReport = report
+                }
+                self.updateAGYGuardUI()
+            }
+        }
+    }
+
+    private func refreshAGYGuardStatusIfNeeded() {
+        let hasSessions = (agyGuardReport?.sessions.isEmpty == false)
+        guard state.agyGuardLaunchEnabled || hasSessions else { return }
+        refreshAGYGuardStatus(force: false)
+    }
+
+    private func refreshAGYGuardStatus(force: Bool) {
+        guard fixture == nil, !shuttingDown, !agyGuardBusy, (!agyGuardInFlight || force) else { return }
+        agyGuardInFlight = true
+        let rev = agyGuardRevision
+        let bridge = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/codex-helper")
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            let report = try? JSONDecoder().decode(AGYGuardReport.self, from: BridgeClient.read(executable: bridge, arguments: ["agy-guard", "status"], timeout: 6))
+            DispatchQueue.main.async {
+                guard let self = self else { return }
+                self.agyGuardInFlight = false
+                if !self.agyGuardBusy && self.agyGuardRevision == rev, let report = report {
+                    self.agyGuardReport = report
+                    self.updateAGYGuardUI()
+                }
+            }
+        }
+    }
+
+    func updateAGYGuardUI() {
+        let policy = agyGuardReport?.policy
+        let guardEnabled = state.agyGuardLaunchEnabled
+        let autoEnabled = policy?.auto_recovery_enabled == true
+        let paused = policy?.paused == true
+        agyGuardLaunchToggle.state = guardEnabled ? .on : .off
+        agyAutoRecoveryToggle.state = autoEnabled ? .on : .off
+        agyLaunchButtonUpdate(guardEnabled: guardEnabled)
+        agyGuardLaunchToggle.isEnabled = !agyGuardBusy && fixture == nil
+        agyAutoRecoveryToggle.isEnabled = !agyGuardBusy && fixture == nil
+        agyGuardPauseButton.title = paused ? "继续监测恢复" : "暂停恢复"
+        agyGuardPauseButton.image = NSImage(systemSymbolName: paused ? "play.circle" : "pause.circle", accessibilityDescription: nil)
+        agyGuardPauseButton.isEnabled = !agyGuardBusy && fixture == nil && (guardEnabled || autoEnabled || (agyGuardReport?.sessions.isEmpty == false))
+
+        if let session = agyGuardReport?.sessions.first {
+            agyGuardStateChip.text = session.state_label
+            switch session.state {
+            case "observing":
+                agyGuardStateChip.tint = .systemBlue
+            case "running":
+                agyGuardStateChip.tint = .systemGreen
+            case "model_retrying", "waiting_network":
+                agyGuardStateChip.tint = .systemOrange
+            case "recovering":
+                agyGuardStateChip.tint = .systemPurple
+            case "waiting_user_action":
+                agyGuardStateChip.tint = .systemRed
+            default:
+                agyGuardStateChip.tint = .secondaryLabelColor
+            }
+            let convText: String
+            if let cid = session.conversation_id, !cid.isEmpty {
+                convText = "会话 \(cid.prefix(8))(\(session.binding_confirmed ? "已核验" : "待核验"))"
+            } else {
+                convText = "会话待绑定"
+            }
+            let maxRec = policy?.max_recoveries_in_window ?? 2
+            let recCount = session.recovery_count_window
+            let pidVal = session.child_pid > 0 ? session.child_pid : session.runner_pid
+            var detailParts: [String] = [
+                "[\(session.state_label)] \(convText)",
+                "PID \(pidVal)",
+                "恢复 \(recCount)/\(maxRec)"
+            ]
+            let reasonText = (session.last_reason?.isEmpty == false) ? session.last_reason! : session.message
+            if !reasonText.isEmpty {
+                detailParts.append("原因：\(reasonText)")
+            }
+            if let conflict = session.proxy_conflict, !conflict.isEmpty {
+                detailParts.append("代理提示：\(conflict)")
+            }
+            let activeCount = agyGuardReport?.active_count ?? 0
+            if activeCount > 1 {
+                detailParts.append("共 \(activeCount) 个受管实例互不串线")
+            }
+            agyGuardReasonLabel.stringValue = detailParts.joined(separator: " · ")
+            if let signals = session.signals, !signals.isEmpty {
+                let sigLines = signals.map { "• [\($0.source) / 可信度:\($0.confidence)] \($0.detail)" }.joined(separator: "\n")
+                agyGuardReasonLabel.toolTip = "\(agyGuardReasonLabel.stringValue)\n\n信号来源与可信度：\n\(sigLines)"
+            } else {
+                agyGuardReasonLabel.toolTip = agyGuardReasonLabel.stringValue
+            }
+        } else {
+            if !guardEnabled {
+                agyGuardStateChip.text = "普通启动"
+                agyGuardStateChip.tint = .secondaryLabelColor
+                agyGuardReasonLabel.stringValue = "当前为普通启动模式；勾选“受管启动 AGY”可在保留终端交互体验的同时接入会话监测（自动恢复默认关闭）。"
+            } else if paused {
+                agyGuardStateChip.text = "已暂停"
+                agyGuardStateChip.tint = .systemOrange
+                agyGuardReasonLabel.stringValue = "受管启动已开启，自动恢复当前处于暂停状态。点击「\(QuickLaunchTool.agy.buttonTitle)」将启动受管终端。"
+            } else {
+                agyGuardStateChip.text = autoEnabled ? "监测+恢复待命" : "观察中(待命)"
+                agyGuardStateChip.tint = autoEnabled ? .systemTeal : .systemBlue
+                let modeDesc = autoEnabled ? "有限自动恢复已开启（30 分钟最多 2 次）" : "自动恢复默认关闭（仅观察与记录原因）"
+                agyGuardReasonLabel.stringValue = "受管启动已启用 · \(modeDesc)。点击「\(QuickLaunchTool.agy.buttonTitle)」后将自动绑定专用日志与会话 ID。"
+            }
+            agyGuardReasonLabel.toolTip = agyGuardReasonLabel.stringValue
+        }
+        layoutDocument()
+    }
+
+    private func agyLaunchButtonUpdate(guardEnabled: Bool) {
+        quickLaunchAgyButton.title = guardEnabled ? "受管启动 AGY CLI" : QuickLaunchTool.agy.buttonTitle
     }
     @objc func toggleResume() {
         guard handoffReport?.hasAuthorization != true, handoffPendingKey == nil, !handoffBusy, !resumeBusy, let target = selected, fixture == nil else { return }

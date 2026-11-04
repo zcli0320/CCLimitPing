@@ -160,6 +160,58 @@ enum Tests {
             try Data(script.utf8).write(to: scriptFile)
             _ = try BridgeClient.read(executable: URL(fileURLWithPath: "/bin/zsh"), arguments: ["-n", scriptFile.path])
         }
+        let guardedScript = quickLaunchGuardedAGYScript(helperExecutable: "/Applications/Codex 小助手.app/Contents/MacOS/codex-helper", folder: quotedFolder)
+        precondition(guardedScript.contains("agy-guard run --folder '/tmp/it'\\''s dir'"), "Guarded AGY launch script must invoke codex-helper agy-guard run with quoted folder")
+        let guardedFile = dir.appendingPathComponent("syntax-agy-guarded.command")
+        try Data(guardedScript.utf8).write(to: guardedFile)
+        _ = try BridgeClient.read(executable: URL(fileURLWithPath: "/bin/zsh"), arguments: ["-n", guardedFile.path])
+
+        var guardSel = SelectionState()
+        precondition(guardSel.agyGuardLaunchEnabled == false, "Guarded AGY launch must default to false")
+        guardSel.agyGuardLaunchEnabled = true
+        try store.save(guardSel)
+        precondition(store.load().agyGuardLaunchEnabled == true, "Guarded AGY launch toggle must persist")
+
+        let agyGuardJSON = """
+        {
+          "policy": {
+            "guard_launch_enabled": true,
+            "auto_recovery_enabled": false,
+            "paused": false,
+            "cooldown_minutes": 30,
+            "max_recoveries_in_window": 2,
+            "network_stable_seconds": 20,
+            "consecutive_failures": 2
+          },
+          "active_count": 1,
+          "headline": "观察中 · 1 个受管会话",
+          "summary": "仅观察模式",
+          "sessions": [
+            {
+              "launch_id": "agy-test-1",
+              "runner_pid": 1001,
+              "child_pid": 1002,
+              "folder": "/tmp/work",
+              "log_file": "/tmp/work.log",
+              "conversation_id": "2bb57372-64fb-4dc7-b5b5-b66fd6da3c6d",
+              "binding_confirmed": true,
+              "state": "waiting_user_action",
+              "state_label": "等待用户处理",
+              "message": "满足恢复候选条件，但自动恢复当前关闭",
+              "last_reason": "前台模型请求连接异常中断（EOF）",
+              "proxy_url": "http://127.0.0.1:17893",
+              "proxy_healthy": true,
+              "recovery_count_window": 0,
+              "signals": [
+                {"source": "dedicated_log", "confidence": "high", "detail": "已由专用日志绑定会话 2bb57372"}
+              ]
+            }
+          ]
+        }
+        """.data(using: .utf8)!
+        let decodedGuard = try JSONDecoder().decode(AGYGuardReport.self, from: agyGuardJSON)
+        precondition(decodedGuard.policy.auto_recovery_enabled == false && decodedGuard.primaryStateLabel == "等待用户处理" && decodedGuard.sessions.first?.signals?.first?.confidence == "high",
+                     "AGYGuardReport must decode policy, state label, and signal confidence")
         let existingDir = dir.appendingPathComponent("existing-launch-folder")
         try FileManager.default.createDirectory(at: existingDir, withIntermediateDirectories: true)
         let missingDir = dir.appendingPathComponent("missing-launch-folder")

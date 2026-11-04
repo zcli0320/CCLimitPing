@@ -17,6 +17,10 @@ import (
 )
 
 func main() {
+	if len(os.Args) >= 2 && os.Args[1] == "agy-guard" {
+		agyGuardCommand()
+		return
+	}
 	if len(os.Args) >= 2 && os.Args[1] == "desktop-runtime" {
 		desktopRuntimeCommand()
 		return
@@ -277,5 +281,69 @@ func desktopRuntimeCommand() {
 	}
 	if json.NewEncoder(os.Stdout).Encode(result) != nil {
 		os.Exit(1)
+	}
+}
+
+func agyGuardCommand() {
+	if len(os.Args) < 3 {
+		fmt.Fprintln(os.Stderr, "Usage: codex-helper agy-guard status | run --folder <dir> [-- ...] | configure [options]")
+		os.Exit(2)
+	}
+	r, err := assistant.NewReader()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	switch os.Args[2] {
+	case "status":
+		report := r.AGYGuardStatus()
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetEscapeHTML(false)
+		if enc.Encode(report) != nil {
+			os.Exit(1)
+		}
+	case "run":
+		var folder string
+		var extraArgs []string
+		for i := 3; i < len(os.Args); i++ {
+			if os.Args[i] == "--" {
+				extraArgs = append(extraArgs, os.Args[i+1:]...)
+				break
+			}
+			if os.Args[i] == "--folder" && i+1 < len(os.Args) {
+				folder = os.Args[i+1]
+				i++
+				continue
+			}
+			extraArgs = append(extraArgs, os.Args[i])
+		}
+		if folder == "" {
+			fmt.Fprintln(os.Stderr, "Usage: codex-helper agy-guard run --folder <dir> [-- extra-args...]")
+			os.Exit(2)
+		}
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM, syscall.SIGHUP)
+		defer stop()
+		exitCode, err := r.RunManagedAGYSession(ctx, folder, extraArgs)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			if exitCode == 0 {
+				exitCode = 1
+			}
+		}
+		os.Exit(exitCode)
+	case "configure":
+		if _, err := r.ConfigureAGYGuardPolicy(os.Args[3:]); err != nil {
+			fmt.Fprintln(os.Stderr, err)
+			os.Exit(2)
+		}
+		report := r.AGYGuardStatus()
+		enc := json.NewEncoder(os.Stdout)
+		enc.SetEscapeHTML(false)
+		if enc.Encode(report) != nil {
+			os.Exit(1)
+		}
+	default:
+		fmt.Fprintln(os.Stderr, "Usage: codex-helper agy-guard status | run --folder <dir> | configure ...")
+		os.Exit(2)
 	}
 }

@@ -274,6 +274,75 @@ struct HandoffReport: Decodable {
     let runner_ready: Bool?
 }
 
+struct AGYGuardPolicy: Codable, Equatable {
+    var guard_launch_enabled: Bool
+    var auto_recovery_enabled: Bool
+    var paused: Bool
+    var pause_reason: String?
+    var cooldown_minutes: Int
+    var max_recoveries_in_window: Int
+    var network_stable_seconds: Int
+    var consecutive_failures: Int
+}
+
+struct AGYSignalEvidence: Decodable {
+    let source: String
+    let confidence: String
+    let detail: String
+}
+
+struct AGYGuardSession: Decodable {
+    let launch_id: String
+    let runner_pid: Int
+    let child_pid: Int
+    let folder: String
+    let log_file: String
+    let conversation_id: String?
+    let binding_confirmed: Bool
+    let state: String
+    let state_label: String
+    let message: String
+    let last_reason: String?
+    let proxy_url: String?
+    let proxy_conflict: String?
+    let proxy_healthy: Bool
+    let proxy_stable_seconds: Int?
+    let active_tools: Int?
+    let background_task_doubt: Bool?
+    let user_typing: Bool?
+    let awaiting_approval: Bool?
+    let recovery_count_window: Int
+    let signals: [AGYSignalEvidence]?
+    let exited: Bool?
+    let exit_code: Int?
+}
+
+struct AGYGuardReport: Decodable {
+    let policy: AGYGuardPolicy
+    let active_count: Int
+    let headline: String
+    let summary: String
+    let last_reason: String?
+    let sessions: [AGYGuardSession]
+
+    var primaryStateLabel: String {
+        if let active = sessions.first(where: { $0.exited != true }) {
+            return active.state_label
+        }
+        if !sessions.isEmpty {
+            return "空闲／已结束"
+        }
+        return policy.guard_launch_enabled ? "观察待命" : "普通启动"
+    }
+
+    var primaryStateCode: String {
+        if let active = sessions.first(where: { $0.exited != true }) {
+            return active.state
+        }
+        return "idle"
+    }
+}
+
 struct Snapshot: Decodable {
     let version: String
     let captured_at: String
@@ -287,6 +356,7 @@ struct Snapshot: Decodable {
     let warmup: WarmupReport?
     let resume: ResumeReport?
     let handoff: HandoffReport?
+    let agy_guard: AGYGuardReport?
 
     func sessions(in scope: String) -> [HelperSession] { sessions.filter { $0.sessionScope == scope } }
     func complete(in scope: String) -> Bool {
@@ -317,9 +387,10 @@ struct SelectionState: Codable {
     var initializedScopes: [String] = []
     var launchFolder: String?
     var recentLaunchFolders: [String] = []
+    var agyGuardLaunchEnabled = false
 
     init() {}
-    enum CodingKeys: String, CodingKey { case selectedKey, observing, expandedProjects, projectLayoutInitialized, activeScope, selectedByScope, initializedScopes, launchFolder, recentLaunchFolders }
+    enum CodingKeys: String, CodingKey { case selectedKey, observing, expandedProjects, projectLayoutInitialized, activeScope, selectedByScope, initializedScopes, launchFolder, recentLaunchFolders, agyGuardLaunchEnabled }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
         selectedKey = try values.decodeIfPresent(String.self, forKey: .selectedKey)
@@ -332,6 +403,7 @@ struct SelectionState: Codable {
         initializedScopes = try values.decodeIfPresent([String].self, forKey: .initializedScopes) ?? []
         launchFolder = try values.decodeIfPresent(String.self, forKey: .launchFolder)
         recentLaunchFolders = try values.decodeIfPresent([String].self, forKey: .recentLaunchFolders) ?? []
+        agyGuardLaunchEnabled = try values.decodeIfPresent(Bool.self, forKey: .agyGuardLaunchEnabled) ?? false
     }
 
     mutating func addRecentLaunchFolder(_ folder: String?) {
@@ -632,6 +704,23 @@ func quickLaunchCommandScript(tool: QuickLaunchTool, folder: String) -> String {
     cd \(quotedFolder) || exit 1
     printf '%s\\n' \(header)
     \(runBlock)
+    exec /bin/zsh -i
+    """ + "\n"
+}
+
+func quickLaunchGuardedAGYScript(helperExecutable: String, folder: String) -> String {
+    let quotedFolder = shellSingleQuote(folder)
+    let quotedHelper = shellSingleQuote(helperExecutable)
+    let header = shellSingleQuote("[AGY CLI · 受管监测] 工作目录：\(folder)（yolo 模式：已跳过权限确认）")
+    return """
+    #!/bin/zsh -l
+    export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$HOME/.antigravity/bin:$PATH"
+    export CODEX_HELPER_NATIVE_PREVIEW=1
+    cd \(quotedFolder) || exit 1
+    printf '%s\\n' \(header)
+    \(quotedHelper) agy-guard run --folder \(quotedFolder)
+    exit_code=$?
+    printf '%s\\n' "[AGY CLI · 受管监测] 已退出（退出码：$exit_code）"
     exec /bin/zsh -i
     """ + "\n"
 }
