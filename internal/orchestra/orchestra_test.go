@@ -349,6 +349,9 @@ func TestAntigravityPrepare(t *testing.T) {
 			if !reflect.DeepEqual(inv.Argv, want) || inv.Stdin != "" || inv.Dir != dir {
 				t.Fatalf("inv=%+v want argv=%q", inv, want)
 			}
+			if last := inv.Env[len(inv.Env)-1]; last != "GODEBUG=http2client=0" {
+				t.Fatalf("last env entry = %q, want HTTP/2 off for agy", last)
+			}
 		})
 	}
 	if _, err := a.Resolve(t.TempDir()); err == nil {

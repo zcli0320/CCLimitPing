@@ -55,7 +55,9 @@ func DefaultAgents(home string) map[string]Agent {
 		"codex": codex,
 		"claude": {Name: "claude", Label: "Claude Code", Bin: "claude",
 			Args: []string{"--permission-mode", "acceptEdits", "--allowedTools", "Bash,Read,Edit,Write,Glob,Grep"}},
-		"antigravity": {Name: "antigravity", Label: "Antigravity", Bin: "agy",
+		// HTTP/2 off: through the user's flaky proxy, agy's pooled HTTP/2 streams die
+		// mid-run (instant EOF on reuse, or ~250s stalls); HTTP/1.1 recovers better.
+		"antigravity": {Name: "antigravity", Label: "Antigravity", Bin: "agy", Env: []string{"GODEBUG=http2client=0"},
 			Args: []string{"--model", "gemini-4-argon-medium", "--mode", "accept-edits", "--settings", `{"permissions":{"allow":["command(*)"]}}`, "--output-format", "json"}},
 	}
 }

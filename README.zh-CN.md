@@ -7,7 +7,7 @@
 [English](README.md) | **中文**
 
 > 本 fork 的个人改造计划：[Codex 小助手：个人需求与实施计划](docs/personal-codex-assistant-plan.zh-CN.md)。
-> 当前个人版 **Codex 小助手 0.4.9 / build 43** 提供账号授权管理、额度与定时预热、Desktop／CLI 会话分区、按项目（工作群）组织的代理协作（项目可编辑，项目规则文件随任务下发），以及为指定会话开启的续跑和切号。支持受管启动 AGY、会话监测和网络断流有限自动恢复，受管启动及自动恢复默认关闭；已改进正常退出状态和断流后的回执核验。Desktop 切号前核验运行账号；由 CC Switch 管理 Desktop 时使用 CC Switch 切换。自然额度耗尽后的完整自动交接仍待实机验收。使用和构建方法见[小助手指南](docs/macos-helper.zh-CN.md)。
+> 当前个人版 **Codex 小助手 0.4.9 / build 44** 提供账号授权管理、额度与定时预热、Desktop／CLI 会话分区、按项目（工作群）组织的代理协作（项目可编辑，项目规则文件随任务下发），以及为指定会话开启的续跑和切号。支持受管启动 AGY、会话监测和网络断流有限自动恢复，受管启动及自动恢复默认关闭；已改进正常退出状态和断流后的回执核验，协作执行器启动 AGY 时禁用 HTTP/2 以应对不稳定代理。Desktop 切号前核验运行账号；由 CC Switch 管理 Desktop 时使用 CC Switch 切换。自然额度耗尽后的完整自动交接仍待实机验收。使用和构建方法见[小助手指南](docs/macos-helper.zh-CN.md)。
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 [![CI](https://github.com/wavever/CCLimitPing/actions/workflows/ci.yml/badge.svg)](https://github.com/wavever/CCLimitPing/actions/workflows/ci.yml)
