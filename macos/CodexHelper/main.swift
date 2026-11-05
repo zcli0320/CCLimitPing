@@ -26,6 +26,9 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
     var accountCenter: AccountCenterController?
     var orchestraCenter: OrchestraWindowController?
     var accountClient: AccountCenterClient?
+    var mainContentHost: NSView!
+    var orchestraShowing = false
+    var collaborationButton: NSButton!
     let accountStack = NSStackView()
     let accountCountChip = StatusChip("", tint: .secondaryLabelColor)
     let warmupStatusChip = StatusChip("未开启", tint: .secondaryLabelColor)
@@ -212,22 +215,52 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
         editItem.submenu = editMenu; mainMenu.addItem(editItem); NSApp.mainMenu = mainMenu
 
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 740, height: 820),
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 980, height: 840),
                           styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
         window.title = "Codex 小助手"
         window.titleVisibility = .hidden
-        window.minSize = NSSize(width: 620, height: 560)
+        window.minSize = NSSize(width: 820, height: 580)
         window.delegate = self
         window.isReleasedWhenClosed = false
         window.titlebarAppearsTransparent = true
         window.backgroundColor = .windowBackgroundColor
         let content = NSView(); window.contentView = content
+
+        let helperExec = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/codex-helper")
+        let orc = OrchestraWindowController(executable: helperExec, hostWindow: window)
+        orchestraCenter = orc
+        orc.onNavigateHome = { [weak self] in self?.showMainOverview() }
+        orc.onSelectSidebarScope = { [weak self] in self?.showOrchestraWorkbench() }
+        orc.onSummaryChanged = { [weak self] projCount, taskCount, runningCount, runnerActive, paused in
+            self?.updateOrchestraSummary(projCount: projCount, taskCount: taskCount, runningCount: runningCount, runnerActive: runnerActive, paused: paused)
+        }
+
+        let sidebarPanel = orc.makeSidebarView()
+        let host = NSView()
+        mainContentHost = host
+        content.addSubview(sidebarPanel); sidebarPanel.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(host); host.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            sidebarPanel.topAnchor.constraint(equalTo: content.topAnchor),
+            sidebarPanel.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            sidebarPanel.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            sidebarPanel.widthAnchor.constraint(equalToConstant: 226),
+            host.topAnchor.constraint(equalTo: content.topAnchor),
+            host.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            host.leadingAnchor.constraint(equalTo: sidebarPanel.trailingAnchor),
+            host.trailingAnchor.constraint(equalTo: content.trailingAnchor)
+        ])
+
         outerScroll.hasVerticalScroller = true; outerScroll.autohidesScrollers = true
         outerScroll.drawsBackground = false
-        content.addSubview(outerScroll); outerScroll.translatesAutoresizingMaskIntoConstraints = false
+        host.addSubview(outerScroll); outerScroll.translatesAutoresizingMaskIntoConstraints = false
+        host.addSubview(orc.rootView); orc.rootView.translatesAutoresizingMaskIntoConstraints = false
+        orc.rootView.isHidden = true
         NSLayoutConstraint.activate([
-            outerScroll.topAnchor.constraint(equalTo: content.topAnchor), outerScroll.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            outerScroll.leadingAnchor.constraint(equalTo: content.leadingAnchor), outerScroll.trailingAnchor.constraint(equalTo: content.trailingAnchor)
+            outerScroll.topAnchor.constraint(equalTo: host.topAnchor), outerScroll.bottomAnchor.constraint(equalTo: host.bottomAnchor),
+            outerScroll.leadingAnchor.constraint(equalTo: host.leadingAnchor), outerScroll.trailingAnchor.constraint(equalTo: host.trailingAnchor),
+            orc.rootView.topAnchor.constraint(equalTo: host.topAnchor), orc.rootView.bottomAnchor.constraint(equalTo: host.bottomAnchor),
+            orc.rootView.leadingAnchor.constraint(equalTo: host.leadingAnchor), orc.rootView.trailingAnchor.constraint(equalTo: host.trailingAnchor)
         ])
         outerScroll.documentView = document
         document.autoresizingMask = [.width]
@@ -249,7 +282,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         let version = Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "开发版"
         let versionLabel = cliHandoffAvailable ? version : version + " · 验收中"
         let title = Theme.text("Codex 小助手", size: 20, weight: .bold, wraps: false)
-        let subtitleTag = StatusChip("账号 · 会话 · 协作", tint: .systemBlue)
+        let subtitleTag = StatusChip("账号 · 会话 · 项目协作", tint: .systemBlue)
         let titleRow = Theme.hstack([title, StatusChip("v" + versionLabel, tint: .secondaryLabelColor), subtitleTag], spacing: 6)
         status.font = .systemFont(ofSize: 11); status.textColor = .secondaryLabelColor
         status.maximumNumberOfLines = 2
@@ -260,7 +293,8 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         refresh.target = self; refresh.action = #selector(refreshNow); refresh.bezelStyle = .rounded
         refresh.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil)
         refresh.imagePosition = .imageLeading
-        let collaboration = Theme.iconTextButton("代理协作", symbol: "person.3.sequence.fill", target: self, action: #selector(openOrchestra))
+        let collaboration = Theme.iconTextButton("项目与协作", symbol: "folder.fill.badge.person.crop", target: self, action: #selector(openOrchestra))
+        collaborationButton = collaboration
         let header = Theme.hstack([icon, heading, Theme.flexible(), collaboration, openSwitch, refresh], spacing: 10)
         add(header, to: stack)
 
@@ -274,7 +308,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         sessionOverviewCard = QuickEntryCard(title: "会话与切号", symbol: "arrow.triangle.2.circlepath.circle.fill", tint: .systemTeal, subtitle: "选择会话可观察或续跑", badgeText: "待命") { [weak self] in
             self?.scrollToSection(self?.sessionsSectionAnchor)
         }
-        orchestraOverviewCard = QuickEntryCard(title: "多代理协作", symbol: "cpu.fill", tint: .systemIndigo, subtitle: "工作群派活与自动审查", badgeText: "打开") { [weak self] in
+        orchestraOverviewCard = QuickEntryCard(title: "项目与协作", symbol: "folder.fill.badge.person.crop", tint: .systemIndigo, subtitle: "左侧边栏切换项目工作群", badgeText: "进入") { [weak self] in
             self?.openOrchestra()
         }
         let overviewGrid = NSStackView(views: [accountOverviewCard, warmupOverviewCard, sessionOverviewCard, orchestraOverviewCard])
@@ -509,7 +543,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         feedback.font = .systemFont(ofSize: 11); feedback.textColor = .secondaryLabelColor
         feedback.maximumNumberOfLines = 2
         if let visible = NSScreen.main?.visibleFrame {
-            window.setContentSize(NSSize(width: min(740, visible.width - 40), height: min(860, visible.height - 60)))
+            window.setContentSize(NSSize(width: min(980, visible.width - 40), height: min(860, visible.height - 60)))
         }
         loginItem.target = self; loginItem.action = #selector(toggleLoginItem)
         loginStatus.font = .systemFont(ofSize: 11); loginStatus.textColor = .secondaryLabelColor
@@ -538,9 +572,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
             self?.updateLoginItem()
         }
         if fixture == nil {
-            if orchestraCenter == nil {
-                orchestraCenter = OrchestraWindowController(executable: Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/codex-helper"))
-            }
+            orchestraCenter?.startBackgroundRefresh()
             orchestraCenter?.startRunnerIfConfigured()
         }
     }
@@ -569,7 +601,10 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         showHelperWindow(); return true
     }
     @objc func showHelperWindow() { window.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true); refreshAccountMetadata() }
-    func windowDidResize(_ notification: Notification) { layoutDocument() }
+    func windowDidResize(_ notification: Notification) {
+        layoutDocument()
+        orchestraCenter?.layoutContent()
+    }
 
     func layoutDocument() {
         guard tableHeight != nil else { return }
@@ -734,11 +769,37 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         }
     }
 
+    func showMainOverview() {
+        orchestraShowing = false
+        outerScroll.isHidden = false
+        orchestraCenter?.rootView.isHidden = true
+        orchestraCenter?.setEmbeddedActive(false)
+        collaborationButton?.title = "项目与协作"
+        layoutDocument()
+    }
+
+    func showOrchestraWorkbench() {
+        orchestraShowing = true
+        outerScroll.isHidden = true
+        orchestraCenter?.rootView.isHidden = false
+        orchestraCenter?.setEmbeddedActive(true)
+        collaborationButton?.title = "返回总览"
+    }
+
+    func updateOrchestraSummary(projCount: Int, taskCount: Int, runningCount: Int, runnerActive: Bool, paused: Bool) {
+        let badge = runningCount > 0 ? "\(runningCount) 进行中" : (runnerActive ? (paused ? "已暂停" : "执行器就绪") : "\(projCount) 个项目")
+        let tint: NSColor = runningCount > 0 ? .systemBlue : (runnerActive ? (paused ? .systemOrange : .systemGreen) : .systemIndigo)
+        let sub = projCount > 0 ? "\(projCount) 个项目 · \(taskCount) 个任务" : "点击新建项目或切换工作群"
+        orchestraOverviewCard?.isActiveCard = runningCount > 0 || runnerActive
+        orchestraOverviewCard?.update(subtitle: sub, badgeText: badge, tint: tint)
+    }
+
     @objc func openOrchestra() {
-        if orchestraCenter == nil {
-            orchestraCenter = OrchestraWindowController(executable: Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/codex-helper"))
+        if orchestraShowing {
+            showMainOverview()
+        } else {
+            showOrchestraWorkbench()
         }
-        orchestraCenter?.showWindow(nil)
     }
     @objc func openNativeAccountCenter() {
         guard fixture == nil else { return }

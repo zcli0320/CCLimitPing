@@ -128,14 +128,20 @@ type taskView struct {
 	RunnerActive  *bool         `json:"runner_active,omitempty"`
 	Note          string        `json:"note,omitempty"`
 	Evidence      *EvidenceView `json:"evidence,omitempty"`
+	Progress      *TaskProgress `json:"progress,omitempty"`
 }
 
 func view(t *Task) taskView {
+	prog := Progress(t)
+	sess := t.Session
+	if sess == "" && prog != nil && prog.ConversationID != "" {
+		sess = prog.ConversationID
+	}
 	return taskView{
 		ID: t.ID, Project: t.Project, Status: t.Status, Executor: t.Executor, Folder: t.Folder,
-		Session: t.Session, Runs: len(t.Runs), LastReceipt: t.LastReceipt(),
+		Session: sess, Runs: len(t.Runs), LastReceipt: t.LastReceipt(),
 		ReviewOf: t.ReviewOf, ReviewTask: t.ReviewTask, ReviewVerdict: t.ReviewVerdict,
-		Evidence: Evidence(t),
+		Evidence: Evidence(t), Progress: prog,
 	}
 }
 

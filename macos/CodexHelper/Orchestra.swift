@@ -39,6 +39,18 @@ struct OrchestraRun: Decodable, Equatable { let receipt: String?; let error: Str
 struct OrchestraCheckEvidence: Decodable, Equatable { let command: String; let status: String; let exit: Int; let tail: String? }
 struct OrchestraChangeEvidence: Decodable, Equatable { let status: String; let changed: [String]?; let out_of_scope: [String]?; let head_changed: Bool? }
 struct OrchestraEvidence: Decodable, Equatable { let summary: String; let checks: [OrchestraCheckEvidence]?; let changes: OrchestraChangeEvidence?; let phase: String? }
+struct OrchestraTaskProgress: Decodable, Equatable {
+    let state: String
+    let summary: String
+    let latest_stage: String?
+    let stages: [String]?
+    let recent_actions: [String]?
+    let steps: Int?
+    let warning: String?
+    let conversation_id: String?
+    let last_active: String?
+    let idle_seconds: Int?
+}
 struct OrchestraProject: Decodable, Equatable {
     let id: String; let name: String; let folder: String; let executor: String
     let lead: String?; let reviewer: String?; let checks: [String]?; let scope: [String]?; let sync_agents_md: Bool?; let archived: Bool?
@@ -60,6 +72,7 @@ struct OrchestraTask: Decodable, Equatable {
     let runs: [OrchestraRun]?
     let unconfirmed: Bool?
     let evidence: OrchestraEvidence?
+    let progress: OrchestraTaskProgress?
     let project: String?
     let review_of: String?
     let review_task: String?
@@ -70,14 +83,23 @@ struct OrchestraTask: Decodable, Equatable {
     var canRework: Bool { (status == "receipt" || status == "failed" || status == "quota_exhausted") && unconfirmed != true }
     var canResume: Bool { status == "quota_exhausted" && !(session ?? "").isEmpty && unconfirmed != true }
     var canConfirmStopped: Bool { unconfirmed == true }
-    var lastResult: String { runs?.last?.receipt ?? runs?.last?.error ?? "暂无回执" }
+    var lastResult: String {
+        if let r = runs?.last?.receipt, !r.isEmpty { return r }
+        if let e = runs?.last?.error, !e.isEmpty { return e }
+        if status == "running", let p = progress { return "正在执行：\(p.summary)" }
+        return "暂无回执"
+    }
     var cardHeadline: String {
         let first = card.components(separatedBy: .newlines).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }.first { !$0.isEmpty } ?? ""
         return first.isEmpty ? "（无说明）" : first
     }
     var statusLabel: String {
         if unconfirmed == true { return "待确认已停止" }
-        if evidence?.phase == "checking" { return "检查中" }
+        if evidence?.phase == "checking" || progress?.state == "checking" { return "检查中" }
+        if status == "running" {
+            if progress?.state == "retrying" { return "断流重试" }
+            if let steps = progress?.steps, steps > 0 { return "执行中(\(steps)步)" }
+        }
         return ["queued":"排队中","running":"执行中","reviewing":"审查中","receipt":"待验收","failed":"失败","quota_exhausted":"额度耗尽","cancelled":"已取消","accepted":"已验收"][status] ?? status
     }
     var reviewLabel: String {
@@ -85,6 +107,32 @@ struct OrchestraTask: Decodable, Equatable {
         if status == "reviewing" { return "审查中" }
         if !(review_of ?? "").isEmpty { return "审查任务" }
         return "—"
+    }
+    var formattedProgressSection: String? {
+        guard let p = progress else { return nil }
+        var lines: [String] = []
+        var head = "实时进度：\(p.summary)"
+        if let idle = p.idle_seconds, status == "running" {
+            head += "（最后活跃 \(idle)s 前）"
+        }
+        lines.append(head)
+        let conv = (session ?? "").isEmpty ? (p.conversation_id ?? "") : (session ?? "")
+        if !conv.isEmpty {
+            lines.append("绑定会话：\(conv)")
+        }
+        if let warn = p.warning, !warn.isEmpty {
+            lines.append("⚠️ 监视预警：\(warn)")
+        }
+        if let stages = p.stages, !stages.isEmpty {
+            lines.append("阶段性汇报（最近 \(stages.count) 条）：")
+            for (idx, s) in stages.enumerated() {
+                lines.append("  \(idx + 1). \(s)")
+            }
+        }
+        if let actions = p.recent_actions, !actions.isEmpty {
+            lines.append("最近动作：" + actions.joined(separator: " → "))
+        }
+        return lines.joined(separator: "\n")
     }
 }
 
@@ -254,9 +302,54 @@ private func orderOrchestraTasksWithReviewChildren(_ sorted: [OrchestraTask]) ->
     return out
 }
 
+enum OrchestraSidebarSelection: Equatable {
+    case all
+    case project(String)
+    case unassigned
+}
+
+private enum OrchestraSidebarItemKind: Equatable {
+    case overviewHome
+    case sectionHeader(String)
+    case filterAll
+    case projectItem(OrchestraProject, activeCount: Int, receiptCount: Int, totalCount: Int)
+    case filterUnassigned(activeCount: Int, totalCount: Int)
+}
+
+private final class OrchestraSidebarRowItem: NSObject {
+    let kind: OrchestraSidebarItemKind
+    init(_ kind: OrchestraSidebarItemKind) { self.kind = kind }
+}
+
+final class OrchestraSidebarSelectionRowView: NSTableRowView {
+    override func drawSelection(in dirtyRect: NSRect) {
+        guard isSelected else { return }
+        let rect = bounds.insetBy(dx: 6, dy: 2)
+        let path = NSBezierPath(roundedRect: rect, xRadius: 7, yRadius: 7)
+        NSColor.controlAccentColor.withAlphaComponent(0.16).setFill()
+        path.fill()
+        NSColor.controlAccentColor.withAlphaComponent(0.45).setStroke()
+        path.lineWidth = 0.5
+        path.stroke()
+    }
+}
+
 // CLI calls run on a serial background queue; stderr is returned to the user.
-final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSOutlineViewDataSource, NSOutlineViewDelegate {
+final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSOutlineViewDataSource, NSOutlineViewDelegate, NSTableViewDataSource, NSTableViewDelegate {
     private let executable: URL
+    private weak var hostWindow: NSWindow?
+    let rootView = NSView()
+    var onSummaryChanged: ((Int, Int, Int, Bool, Bool) -> Void)?
+    var onNavigateHome: (() -> Void)?
+    var onSelectSidebarScope: (() -> Void)?
+    private(set) var sidebarSelection: OrchestraSidebarSelection = .all
+    private(set) var isEmbeddedActive = false
+    private let sidebarTable = NSTableView()
+    private var sidebarItems: [OrchestraSidebarRowItem] = []
+    private var renderingSidebar = false
+    private let settingsToggleButton = NSButton(title: "配置与高级设置", target: nil, action: nil)
+    private let settingsContainer = NSStackView()
+    private var settingsExpanded = false
     private let queue = DispatchQueue(label: "codex-helper.orchestra")
     private var timer: Timer?
     private var refreshing = false
@@ -324,18 +417,25 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
     private let reworkTask = NSButton(title: "返工", target: nil, action: nil)
     private let resumeTask = NSButton(title: "继续", target: nil, action: nil)
     private let confirmStopped = NSButton(title: "确认已停止", target: nil, action: nil)
+    private let monitorStatusChip = StatusChip("空闲待命", tint: .secondaryLabelColor)
+    private let agyGuardChip = StatusChip("AGY 防断流：HTTP/1.1 + 会话锁定 + 自动断点续跑", tint: .systemGreen)
+    private let checkpointResumeButton = NSButton(title: "一键断点续跑", target: nil, action: nil)
+    private let monitorHeadline = NSTextField(wrappingLabelWithString: "正在读取项目执行监视状态…")
+    private let monitorFeed = NSTextField(wrappingLabelWithString: "")
     private let refreshButton = NSButton(title: "刷新", target: nil, action: nil)
     private let copyMCPButton = NSButton(title: "复制配置", target: nil, action: nil)
     private let table = NSOutlineView()
     private let details = NSTextView()
 
-    init(executable: URL) {
+    init(executable: URL, hostWindow: NSWindow? = nil) {
         self.executable = executable
+        self.hostWindow = hostWindow
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 880, height: 800), styleMask: [.titled, .closable, .resizable, .miniaturizable], backing: .buffered, defer: false)
         window.title = "代理协作"; window.minSize = NSSize(width: 680, height: 600)
         window.titleVisibility = .hidden
         window.titlebarAppearsTransparent = true
         window.backgroundColor = .windowBackgroundColor
+        window.contentView = rootView
         super.init(window: window)
         window.delegate = self
         build()
@@ -343,8 +443,12 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
     }
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
 
+    private var sheetWindow: NSWindow? {
+        hostWindow ?? rootView.window ?? window
+    }
+
     private func build() {
-        guard let content = window?.contentView else { return }
+        let content = rootView
         outerScroll.hasVerticalScroller = true; outerScroll.autohidesScrollers = true; outerScroll.drawsBackground = false
         outerScroll.documentView = scrollDocument
         scrollDocument.autoresizingMask = [.width]
@@ -355,82 +459,33 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
         NSLayoutConstraint.activate([stack.leadingAnchor.constraint(equalTo: scrollDocument.leadingAnchor, constant: 20), stack.trailingAnchor.constraint(equalTo: scrollDocument.trailingAnchor, constant: -20), stack.topAnchor.constraint(equalTo: scrollDocument.topAnchor, constant: 16)])
         func add(_ view: NSView) { stack.addArrangedSubview(view); view.translatesAutoresizingMaskIntoConstraints = false; view.widthAnchor.constraint(equalTo: stack.widthAnchor).isActive = true }
 
-        // Header bar
-        let headerIcon = NSImageView(image: NSImage(systemSymbolName: "person.3.sequence.fill", accessibilityDescription: "代理协作")!)
+        // Header bar + quick runner controls
+        let headerIcon = NSImageView(image: NSImage(systemSymbolName: "folder.fill.badge.person.crop", accessibilityDescription: "项目与协作")!)
         headerIcon.symbolConfiguration = NSImage.SymbolConfiguration(pointSize: 22, weight: .semibold)
         headerIcon.contentTintColor = .systemIndigo
         headerIcon.setContentHuggingPriority(.required, for: .horizontal)
-        let title = Theme.text("多代理协作中心", size: 20, weight: .bold, wraps: false)
-        let subtitle = Theme.caption("工作群分组派活、自动审查与无人值守队列执行。")
+        let title = Theme.text("项目工作台与多代理协作", size: 20, weight: .bold, wraps: false)
+        let subtitle = Theme.caption("通过左侧边栏快速切换项目（工作群），管理派活、自动审查与无人值守执行。")
         let titleBlock = Theme.vstack([Theme.hstack([title, runnerStatusChip, taskCountChip], spacing: 8), subtitle], spacing: 2)
-        refreshButton.target = self; refreshButton.action = #selector(refreshManual); Theme.button(refreshButton)
-        refreshButton.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil); refreshButton.imagePosition = .imageLeading
-        add(Theme.hstack([headerIcon, titleBlock, Theme.flexible(), refreshButton], spacing: 12))
-
-        // Agents status section
-        add(Theme.sectionTitle("代理状态"))
-        let agentBox = SectionBox(spacing: 8)
-        agentStack.orientation = .horizontal; agentStack.alignment = .centerY; agentStack.spacing = 10; agentStack.distribution = .fillEqually
-        agentBox.add(agentStack)
-        agentLabel.font = .systemFont(ofSize: 11.5); agentLabel.textColor = .secondaryLabelColor; agentLabel.maximumNumberOfLines = 0
-        agentBox.add(agentLabel)
-        add(agentBox)
-
-        // Two-column dashboard: Runner (left) & Execution Account (right)
-        let runnerBox = SectionBox(spacing: 8)
-        runnerBox.add(Theme.hstack([
-            NSImageView(image: NSImage(systemSymbolName: "gearshape.2.fill", accessibilityDescription: nil)!),
-            Theme.text("执行器控制", size: 13, weight: .semibold, wraps: false),
-            Theme.flexible()
-        ], spacing: 6))
-        runnerLabel.font = .systemFont(ofSize: 11.5); runnerLabel.maximumNumberOfLines = 0; runnerBox.add(runnerLabel)
-        autoSwitch.target = self; autoSwitch.action = #selector(changeAutoSwitch)
-        autoStartRunner.target = self; autoStartRunner.action = #selector(changeAutoStartRunner)
-        runnerBox.add(Theme.hstack([autoSwitch, autoStartRunner, Theme.flexible()], spacing: 12))
-        autoSwitchAck.target = self; autoSwitchAck.action = #selector(ackAutoSwitch); Theme.button(autoSwitchAck, small: true)
-        autoSwitchAck.image = NSImage(systemSymbolName: "checkmark.shield", accessibilityDescription: nil); autoSwitchAck.imagePosition = .imageLeading
-        runnerBox.add(autoSwitchAck)
-        reworkLimit.addItems(withTitles:["自动返工：0 次", "自动返工：1 次", "自动返工：2 次"]); reworkLimit.target = self; reworkLimit.action = #selector(changeReworkLimit)
-        runnerBox.add(reworkLimit)
-        start.target = self; start.action = #selector(startRunner); Theme.button(start, primary: true)
+        start.target = self; start.action = #selector(startRunner); Theme.button(start, small: true, primary: true)
         start.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: nil); start.imagePosition = .imageLeading
-        stop.target = self; stop.action = #selector(stopRunnerAction); Theme.button(stop)
+        stop.target = self; stop.action = #selector(stopRunnerAction); Theme.button(stop, small: true)
         stop.image = NSImage(systemSymbolName: "stop.fill", accessibilityDescription: nil); stop.imagePosition = .imageLeading
-        runnerBox.add(Theme.hstack([start, stop, Theme.flexible()], spacing: 8))
-        notice.font = .systemFont(ofSize: 11, weight: .medium); notice.textColor = .systemOrange; notice.maximumNumberOfLines = 0; runnerBox.add(notice)
+        settingsToggleButton.target = self; settingsToggleButton.action = #selector(toggleSettingsSection); Theme.button(settingsToggleButton, small: true)
+        settingsToggleButton.image = NSImage(systemSymbolName: "slider.horizontal.3", accessibilityDescription: nil); settingsToggleButton.imagePosition = .imageLeading
+        refreshButton.target = self; refreshButton.action = #selector(refreshManual); Theme.button(refreshButton, small: true)
+        refreshButton.image = NSImage(systemSymbolName: "arrow.clockwise", accessibilityDescription: nil); refreshButton.imagePosition = .imageLeading
+        add(Theme.hstack([headerIcon, titleBlock, Theme.flexible(), start, stop, settingsToggleButton, refreshButton], spacing: 8))
+        notice.font = .systemFont(ofSize: 11, weight: .medium); notice.textColor = .systemOrange; notice.maximumNumberOfLines = 0
+        add(notice)
 
-        let loginBox = SectionBox(spacing: 8)
-        loginBox.add(Theme.hstack([
-            NSImageView(image: NSImage(systemSymbolName: "person.badge.key.fill", accessibilityDescription: nil)!),
-            Theme.text("Codex 执行账号", size: 13, weight: .semibold, wraps: false),
-            Theme.flexible()
-        ], spacing: 6))
-        accountMode.addItems(withTitles: ["使用 Desktop 账号", "使用独立账号"]); accountMode.target = self; accountMode.action = #selector(changeAccountMode); loginBox.add(accountMode)
-        loginLabel.font = .systemFont(ofSize: 12, weight: .medium); loginBox.add(loginLabel)
-        loginPath.font = .systemFont(ofSize: 11); loginPath.textColor = .secondaryLabelColor; loginPath.isSelectable = true; loginBox.add(loginPath)
-        let accountCaption = Theme.caption("任务消耗所选账号的额度；使用独立账号可与日常客户端隔离。")
-        accountCaption.maximumNumberOfLines = 0; loginBox.add(accountCaption)
-        loginButton.target = self; loginButton.action = #selector(beginLogin); Theme.button(loginButton, small: true)
-        loginButton.image = NSImage(systemSymbolName: "key.fill", accessibilityDescription: nil); loginButton.imagePosition = .imageLeading
-        logoutButton.target = self; logoutButton.action = #selector(confirmLogout); Theme.button(logoutButton, small: true)
-        loginCancel.target = self; loginCancel.action = #selector(cancelLogin); Theme.button(loginCancel, small: true)
-        loginBox.add(Theme.hstack([loginButton, logoutButton, loginCancel, Theme.flexible()], spacing: 8))
-        loginMessage.font = .systemFont(ofSize: 11); loginMessage.textColor = .secondaryLabelColor; loginMessage.maximumNumberOfLines = 0; loginBox.add(loginMessage)
-
-        let controlGrid = NSStackView(views: [runnerBox, loginBox])
-        controlGrid.orientation = .horizontal; controlGrid.distribution = .fillEqually; controlGrid.alignment = .top; controlGrid.spacing = 14
-        runnerBox.bottomAnchor.constraint(equalTo: controlGrid.bottomAnchor).isActive = true
-        loginBox.bottomAnchor.constraint(equalTo: controlGrid.bottomAnchor).isActive = true
-        add(controlGrid)
-
-        // Projects (Workgroups) & Tasks Workbench
-        add(Theme.sectionTitle("项目（工作群）与任务队列"))
+        // Primary Workbench: Projects (Workgroups) & Tasks Queue
         let projectBox = SectionBox(spacing: 8)
         projectFilter.addItems(withTitles: ["全部项目与任务", "未归入项目"]); projectFilter.target = self; projectFilter.action = #selector(changeProjectFilter)
         projectFilter.widthAnchor.constraint(greaterThanOrEqualToConstant: 210).isActive = true
         expandAllButton.target = self; expandAllButton.action = #selector(expandAllGroups); Theme.button(expandAllButton, small: true)
         collapseAllButton.target = self; collapseAllButton.action = #selector(collapseAllGroups); Theme.button(collapseAllButton, small: true)
-        newProject.target = self; newProject.action = #selector(createProject); Theme.button(newProject, small: true)
+        newProject.target = self; newProject.action = #selector(createProject); Theme.button(newProject, small: true, primary: true)
         newProject.image = NSImage(systemSymbolName: "folder.badge.plus", accessibilityDescription: nil); newProject.imagePosition = .imageLeading
         editProject.target = self; editProject.action = #selector(editSelectedProject); Theme.button(editProject, small: true)
         editProject.image = NSImage(systemSymbolName: "pencil", accessibilityDescription: nil); editProject.imagePosition = .imageLeading
@@ -444,15 +499,34 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
         openProjectRules.image = NSImage(systemSymbolName: "doc.text", accessibilityDescription: nil); openProjectRules.imagePosition = .imageLeading
         openProjectRules.setContentHuggingPriority(.required, for: .horizontal)
         openProjectRules.setContentCompressionResistancePriority(.required, for: .horizontal)
-        let folderIcon = NSImageView(image: NSImage(systemSymbolName: "folder.fill.badge.person.crop", accessibilityDescription: nil)!)
+        let folderIcon = NSImageView(image: NSImage(systemSymbolName: "folder.fill", accessibilityDescription: nil)!)
         folderIcon.contentTintColor = .systemBlue
-        projectBox.add(Theme.hstack([folderIcon, Theme.text("工作群视图：", size: 12, weight: .medium, wraps: false), projectFilter, expandAllButton, collapseAllButton, Theme.flexible(), newProject, editProject, archiveProject], spacing: 8))
+        projectBox.add(Theme.hstack([folderIcon, Theme.text("当前视图：", size: 12, weight: .medium, wraps: false), projectFilter, expandAllButton, collapseAllButton, Theme.flexible(), newProject, editProject, archiveProject], spacing: 8))
         projectCaption.maximumNumberOfLines = 0
         projectBox.add(Theme.hstack([projectCaption, Theme.flexible(), revealInFinder, openProjectRules], spacing: 8))
         add(projectBox)
 
+        let monitorBox = SectionBox(spacing: 6)
+        let monitorIcon = NSImageView(image: NSImage(systemSymbolName: "waveform.path.ecg", accessibilityDescription: "实时执行监视")!)
+        monitorIcon.contentTintColor = .systemTeal
+        checkpointResumeButton.target = self; checkpointResumeButton.action = #selector(checkpointResumeSelected); Theme.button(checkpointResumeButton, small: true)
+        checkpointResumeButton.image = NSImage(systemSymbolName: "bolt.horizontal.circle.fill", accessibilityDescription: nil); checkpointResumeButton.imagePosition = .imageLeading
+        monitorBox.add(Theme.hstack([
+            monitorIcon,
+            Theme.text("实时执行监视与阶段汇报", size: 13, weight: .semibold, wraps: false),
+            monitorStatusChip,
+            agyGuardChip,
+            Theme.flexible(),
+            checkpointResumeButton
+        ], spacing: 8))
+        monitorHeadline.font = .systemFont(ofSize: 12, weight: .medium); monitorHeadline.maximumNumberOfLines = 2
+        monitorFeed.font = .monospacedSystemFont(ofSize: 11.5, weight: .regular); monitorFeed.textColor = .secondaryLabelColor; monitorFeed.maximumNumberOfLines = 4
+        monitorBox.add(monitorHeadline)
+        monitorBox.add(monitorFeed)
+        add(monitorBox)
+
         let taskBox = SectionBox(spacing: 10)
-        for (identifier,title,width) in [("id","项目 / 任务",260.0),("status","状态",96.0),("executor","执行与审查",135.0),("review","审查结论",88.0),("summary","任务说明 / 证据摘要",290.0),("folder","工作目录",140.0),("updated","更新时间",145.0)] {
+        for (identifier,title,width) in [("id","项目 / 任务",240.0),("status","状态",96.0),("progress","实时阶段与动作监视",230.0),("executor","执行与审查",125.0),("review","审查结论",84.0),("summary","任务说明 / 证据摘要",260.0),("folder","工作目录",130.0),("updated","更新时间",140.0)] {
             let column = NSTableColumn(identifier: NSUserInterfaceItemIdentifier(identifier)); column.title = title; column.width = width; table.addTableColumn(column)
         }
         table.outlineTableColumn = table.tableColumns.first
@@ -485,19 +559,80 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
         details.textContainerInset = NSSize(width: 8, height: 8)
         let detailScroll = NestedScrollView(); detailScroll.documentView = details; detailScroll.hasVerticalScroller = true; detailScroll.borderType = .bezelBorder
         details.isVerticallyResizable = true; details.autoresizingMask = [.width]; details.textContainer?.widthTracksTextView = true
-        detailScroll.heightAnchor.constraint(equalToConstant: 150).isActive = true; taskBox.add(detailScroll); add(taskBox)
+        detailScroll.heightAnchor.constraint(equalToConstant: 165).isActive = true; taskBox.add(detailScroll); add(taskBox)
+
+        // Collapsible Advanced Settings: Agents status, Runner & Execution Account, MCP Configuration
+        settingsContainer.orientation = .vertical; settingsContainer.alignment = .leading; settingsContainer.spacing = 12; settingsContainer.detachesHiddenViews = true
+        func addSetting(_ view: NSView) { settingsContainer.addArrangedSubview(view); view.translatesAutoresizingMaskIntoConstraints = false; view.widthAnchor.constraint(equalTo: settingsContainer.widthAnchor).isActive = true }
+
+        addSetting(Theme.sectionTitle("代理状态"))
+        let agentBox = SectionBox(spacing: 8)
+        agentStack.orientation = .horizontal; agentStack.alignment = .centerY; agentStack.spacing = 10; agentStack.distribution = .fillEqually
+        agentBox.add(agentStack)
+        agentLabel.font = .systemFont(ofSize: 11.5); agentLabel.textColor = .secondaryLabelColor; agentLabel.maximumNumberOfLines = 0
+        agentBox.add(agentLabel)
+        addSetting(agentBox)
+
+        let runnerBox = SectionBox(spacing: 8)
+        runnerBox.add(Theme.hstack([
+            NSImageView(image: NSImage(systemSymbolName: "gearshape.2.fill", accessibilityDescription: nil)!),
+            Theme.text("执行器策略与状态", size: 13, weight: .semibold, wraps: false),
+            Theme.flexible()
+        ], spacing: 6))
+        runnerLabel.font = .systemFont(ofSize: 11.5); runnerLabel.maximumNumberOfLines = 0; runnerBox.add(runnerLabel)
+        autoSwitch.target = self; autoSwitch.action = #selector(changeAutoSwitch)
+        autoStartRunner.target = self; autoStartRunner.action = #selector(changeAutoStartRunner)
+        runnerBox.add(Theme.hstack([autoSwitch, autoStartRunner, Theme.flexible()], spacing: 12))
+        autoSwitchAck.target = self; autoSwitchAck.action = #selector(ackAutoSwitch); Theme.button(autoSwitchAck, small: true)
+        autoSwitchAck.image = NSImage(systemSymbolName: "checkmark.shield", accessibilityDescription: nil); autoSwitchAck.imagePosition = .imageLeading
+        runnerBox.add(autoSwitchAck)
+        reworkLimit.addItems(withTitles:["自动返工：0 次", "自动返工：1 次", "自动返工：2 次"]); reworkLimit.target = self; reworkLimit.action = #selector(changeReworkLimit)
+        runnerBox.add(reworkLimit)
+
+        let loginBox = SectionBox(spacing: 8)
+        loginBox.add(Theme.hstack([
+            NSImageView(image: NSImage(systemSymbolName: "person.badge.key.fill", accessibilityDescription: nil)!),
+            Theme.text("Codex 执行账号", size: 13, weight: .semibold, wraps: false),
+            Theme.flexible()
+        ], spacing: 6))
+        accountMode.addItems(withTitles: ["使用 Desktop 账号", "使用独立账号"]); accountMode.target = self; accountMode.action = #selector(changeAccountMode); loginBox.add(accountMode)
+        loginLabel.font = .systemFont(ofSize: 12, weight: .medium); loginBox.add(loginLabel)
+        loginPath.font = .systemFont(ofSize: 11); loginPath.textColor = .secondaryLabelColor; loginPath.isSelectable = true; loginBox.add(loginPath)
+        let accountCaption = Theme.caption("任务消耗所选账号的额度；使用独立账号可与日常客户端隔离。")
+        accountCaption.maximumNumberOfLines = 0; loginBox.add(accountCaption)
+        loginButton.target = self; loginButton.action = #selector(beginLogin); Theme.button(loginButton, small: true)
+        loginButton.image = NSImage(systemSymbolName: "key.fill", accessibilityDescription: nil); loginButton.imagePosition = .imageLeading
+        logoutButton.target = self; logoutButton.action = #selector(confirmLogout); Theme.button(logoutButton, small: true)
+        loginCancel.target = self; loginCancel.action = #selector(cancelLogin); Theme.button(loginCancel, small: true)
+        loginBox.add(Theme.hstack([loginButton, logoutButton, loginCancel, Theme.flexible()], spacing: 8))
+        loginMessage.font = .systemFont(ofSize: 11); loginMessage.textColor = .secondaryLabelColor; loginMessage.maximumNumberOfLines = 0; loginBox.add(loginMessage)
+
+        let controlGrid = NSStackView(views: [runnerBox, loginBox])
+        controlGrid.orientation = .horizontal; controlGrid.distribution = .fillEqually; controlGrid.alignment = .top; controlGrid.spacing = 14
+        runnerBox.bottomAnchor.constraint(equalTo: controlGrid.bottomAnchor).isActive = true
+        loginBox.bottomAnchor.constraint(equalTo: controlGrid.bottomAnchor).isActive = true
+        addSetting(controlGrid)
 
         // MCP Connection Footer
         copyMCPButton.target = self; copyMCPButton.action = #selector(copyMCPInstructions); Theme.button(copyMCPButton, small: true)
         copyMCPButton.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: nil); copyMCPButton.imagePosition = .imageLeading
-        add(Theme.sectionTitle("连接主控（MCP 配置）", accessories: [copyMCPButton]))
+        addSetting(Theme.sectionTitle("连接主控（MCP 配置）", accessories: [copyMCPButton]))
         let connectBox = SectionBox(); let instructions = NSTextView(); instructions.isEditable = false; instructions.isSelectable = true; instructions.font = .monospacedSystemFont(ofSize: 11, weight: .regular)
         instructions.textContainerInset = NSSize(width: 8, height: 8)
         instructions.string = orchestraConnectionInstructions(executable: executable, stateDir: ProcessInfo.processInfo.environment["CODEX_HELPER_ORCHESTRA_DIR"])
         let connectScroll = NestedScrollView(); connectScroll.documentView = instructions; connectScroll.hasVerticalScroller = true; connectScroll.borderType = .bezelBorder
         instructions.isVerticallyResizable = true; instructions.autoresizingMask = [.width]; instructions.textContainer?.widthTracksTextView = true
-        connectScroll.heightAnchor.constraint(equalToConstant: 125).isActive = true; connectBox.add(connectScroll); add(connectBox)
+        connectScroll.heightAnchor.constraint(equalToConstant: 120).isActive = true; connectBox.add(connectScroll); addSetting(connectBox)
+        settingsContainer.isHidden = !settingsExpanded
+        add(settingsContainer)
         updateButtons()
+        layoutContent()
+    }
+
+    @objc private func toggleSettingsSection() {
+        settingsExpanded.toggle()
+        settingsContainer.isHidden = !settingsExpanded
+        settingsToggleButton.title = settingsExpanded ? "收起设置" : "配置与高级设置"
         layoutContent()
     }
 
@@ -532,12 +667,318 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
     }
 
     override func showWindow(_ sender: Any?) {
-        super.showWindow(sender); window?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
-        layoutContent()
-        refresh()
-        if timer == nil { timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.refresh() } }
+        setEmbeddedActive(true)
+        if hostWindow == nil {
+            super.showWindow(sender); window?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+        }
     }
     func windowWillClose(_ notification: Notification) { timer?.invalidate(); timer = nil; cancelLogin() }
+
+    func setEmbeddedActive(_ active: Bool) {
+        isEmbeddedActive = active
+        syncSidebarSelectionRows()
+        if active {
+            layoutContent()
+            refresh(force: true)
+            if timer == nil {
+                timer = Timer.scheduledTimer(withTimeInterval: 3, repeats: true) { [weak self] _ in self?.refresh() }
+            }
+        }
+    }
+
+    func startBackgroundRefresh() {
+        refresh(force: true)
+        if timer == nil {
+            timer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in self?.refresh(force: true) }
+        }
+    }
+
+    func makeSidebarView() -> NSView {
+        let panel = NSView()
+        panel.wantsLayer = true
+        let titleLabel = Theme.text("工作区与项目", size: 12, weight: .semibold, color: .secondaryLabelColor, wraps: false)
+        let addBtn = Theme.symbolButton("folder.badge.plus", label: "新建项目…", target: self, action: #selector(createProjectFromSidebar))
+        addBtn.controlSize = .small
+        let headerRow = Theme.hstack([titleLabel, Theme.flexible(), addBtn], spacing: 6)
+
+        if sidebarTable.tableColumns.isEmpty {
+            let col = NSTableColumn(identifier: NSUserInterfaceItemIdentifier("sidebar"))
+            col.title = "导航"
+            sidebarTable.addTableColumn(col)
+        }
+        sidebarTable.headerView = nil
+        sidebarTable.rowHeight = 32
+        sidebarTable.style = .plain
+        sidebarTable.intercellSpacing = NSSize(width: 0, height: 2)
+        sidebarTable.backgroundColor = .clear
+        sidebarTable.delegate = self
+        sidebarTable.dataSource = self
+        sidebarTable.setAccessibilityLabel("项目与工作区侧边栏")
+
+        let scroll = NSScrollView()
+        scroll.documentView = sidebarTable
+        scroll.hasVerticalScroller = true
+        scroll.autohidesScrollers = true
+        scroll.drawsBackground = false
+        scroll.borderType = .noBorder
+
+        let newTaskQuick = Theme.iconTextButton("派发新任务…", symbol: "plus.circle.fill", primary: true, small: true, target: self, action: #selector(createTaskFromSidebar))
+        let footerRow = Theme.hstack([newTaskQuick, Theme.flexible()], spacing: 6)
+
+        let divider = NSBox()
+        divider.boxType = .separator
+
+        for sub in [headerRow, scroll, footerRow, divider] {
+            panel.addSubview(sub)
+            sub.translatesAutoresizingMaskIntoConstraints = false
+        }
+        NSLayoutConstraint.activate([
+            headerRow.topAnchor.constraint(equalTo: panel.topAnchor, constant: 14),
+            headerRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 12),
+            headerRow.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -12),
+            scroll.topAnchor.constraint(equalTo: headerRow.bottomAnchor, constant: 8),
+            scroll.leadingAnchor.constraint(equalTo: panel.leadingAnchor),
+            scroll.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -1),
+            scroll.bottomAnchor.constraint(equalTo: footerRow.topAnchor, constant: -8),
+            footerRow.leadingAnchor.constraint(equalTo: panel.leadingAnchor, constant: 12),
+            footerRow.trailingAnchor.constraint(equalTo: panel.trailingAnchor, constant: -12),
+            footerRow.bottomAnchor.constraint(equalTo: panel.bottomAnchor, constant: -12),
+            divider.topAnchor.constraint(equalTo: panel.topAnchor),
+            divider.bottomAnchor.constraint(equalTo: panel.bottomAnchor),
+            divider.trailingAnchor.constraint(equalTo: panel.trailingAnchor),
+            divider.widthAnchor.constraint(equalToConstant: 1)
+        ])
+        rebuildSidebarItems()
+        return panel
+    }
+
+    @objc private func createProjectFromSidebar() {
+        onSelectSidebarScope?()
+        createProject()
+    }
+
+    @objc private func createTaskFromSidebar() {
+        onSelectSidebarScope?()
+        createTask()
+    }
+
+    func selectSidebarScope(_ scope: OrchestraSidebarSelection) {
+        sidebarSelection = scope
+        switch scope {
+        case .all:
+            if projectFilter.numberOfItems > 0 { projectFilter.selectItem(at: 0) }
+        case .project(let pid):
+            if let idx = projects.firstIndex(where: { $0.id == pid }), projectFilter.numberOfItems > idx + 1 {
+                projectFilter.selectItem(at: idx + 1)
+            } else if projectFilter.numberOfItems > 0 {
+                sidebarSelection = .all
+                projectFilter.selectItem(at: 0)
+            }
+        case .unassigned:
+            let unassignedIdx = projects.count + 1
+            if projectFilter.numberOfItems > unassignedIdx {
+                projectFilter.selectItem(at: unassignedIdx)
+            }
+        }
+        let selectedTaskID = selected?.id
+        let selectedGroupKey: String? = {
+            if case .project(let pid) = sidebarSelection { return "project:" + pid }
+            return selectedGroup?.key
+        }()
+        applyProjectFilter()
+        render(selectedTaskID: selectedTaskID, selectedGroupKey: selectedGroupKey)
+        syncSidebarSelectionRows()
+    }
+
+    private func rebuildSidebarItems() {
+        var rows: [OrchestraSidebarRowItem] = [
+            OrchestraSidebarRowItem(.overviewHome),
+            OrchestraSidebarRowItem(.sectionHeader("项目工作群（协作）")),
+            OrchestraSidebarRowItem(.filterAll)
+        ]
+        for p in projects {
+            let pTasks = allTasks.filter { $0.project == p.id }
+            let active = pTasks.filter { $0.status == "running" || $0.status == "reviewing" || $0.status == "queued" }.count
+            let receipt = pTasks.filter { $0.status == "receipt" }.count
+            rows.append(OrchestraSidebarRowItem(.projectItem(p, activeCount: active, receiptCount: receipt, totalCount: pTasks.count)))
+        }
+        let unassignedTasks = allTasks.filter { ($0.project ?? "").isEmpty }
+        let unassignedActive = unassignedTasks.filter { $0.status == "running" || $0.status == "reviewing" || $0.status == "queued" }.count
+        rows.append(OrchestraSidebarRowItem(.filterUnassigned(activeCount: unassignedActive, totalCount: unassignedTasks.count)))
+        sidebarItems = rows
+        renderingSidebar = true
+        sidebarTable.reloadData()
+        renderingSidebar = false
+        syncSidebarSelectionRows()
+    }
+
+    func syncSidebarSelectionRows() {
+        guard !sidebarItems.isEmpty else { return }
+        renderingSidebar = true
+        defer { renderingSidebar = false }
+        let targetRow: Int?
+        if !isEmbeddedActive {
+            targetRow = sidebarItems.firstIndex { $0.kind == .overviewHome }
+        } else {
+            switch sidebarSelection {
+            case .all:
+                targetRow = sidebarItems.firstIndex { $0.kind == .filterAll }
+            case .project(let pid):
+                targetRow = sidebarItems.firstIndex {
+                    if case .projectItem(let p, _, _, _) = $0.kind { return p.id == pid }
+                    return false
+                } ?? sidebarItems.firstIndex { $0.kind == .filterAll }
+            case .unassigned:
+                targetRow = sidebarItems.firstIndex {
+                    if case .filterUnassigned = $0.kind { return true }
+                    return false
+                }
+            }
+        }
+        if let row = targetRow, row >= 0, row < sidebarTable.numberOfRows {
+            sidebarTable.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false)
+        } else {
+            sidebarTable.deselectAll(nil)
+        }
+    }
+
+    func numberOfRows(in tableView: NSTableView) -> Int {
+        sidebarItems.count
+    }
+
+    func tableView(_ tableView: NSTableView, shouldSelectRow row: Int) -> Bool {
+        guard sidebarItems.indices.contains(row) else { return false }
+        if case .sectionHeader = sidebarItems[row].kind { return false }
+        return true
+    }
+
+    func tableView(_ tableView: NSTableView, heightOfRow row: Int) -> CGFloat {
+        guard sidebarItems.indices.contains(row) else { return 32 }
+        switch sidebarItems[row].kind {
+        case .sectionHeader: return 24
+        case .projectItem: return 42
+        default: return 32
+        }
+    }
+
+    func tableView(_ tableView: NSTableView, rowViewForRow row: Int) -> NSTableRowView? {
+        OrchestraSidebarSelectionRowView()
+    }
+
+    func tableView(_ tableView: NSTableView, viewFor tableColumn: NSTableColumn?, row: Int) -> NSView? {
+        guard sidebarItems.indices.contains(row) else { return nil }
+        let cell = NSTableCellView()
+        let item = sidebarItems[row]
+        switch item.kind {
+        case .overviewHome:
+            let icon = NSImageView(image: NSImage(systemSymbolName: "person.2.badge.gearshape.fill", accessibilityDescription: nil)!)
+            icon.contentTintColor = .systemBlue
+            icon.setContentHuggingPriority(.required, for: .horizontal)
+            let lbl = Theme.text("账号与会话总览", size: 12.5, weight: .semibold, wraps: false)
+            let rowView = Theme.hstack([icon, lbl, Theme.flexible()], spacing: 8)
+            cell.addSubview(rowView); rowView.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                rowView.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 12),
+                rowView.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -10),
+                rowView.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
+            ])
+        case .sectionHeader(let title):
+            let lbl = Theme.text(title, size: 11, weight: .semibold, color: .secondaryLabelColor, wraps: false)
+            cell.addSubview(lbl); lbl.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                lbl.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 12),
+                lbl.bottomAnchor.constraint(equalTo: cell.bottomAnchor, constant: -3)
+            ])
+        case .filterAll:
+            let icon = NSImageView(image: NSImage(systemSymbolName: "square.grid.2x2.fill", accessibilityDescription: nil)!)
+            icon.contentTintColor = .systemIndigo
+            icon.setContentHuggingPriority(.required, for: .horizontal)
+            let lbl = Theme.text("全部项目与任务", size: 12.5, weight: .medium, wraps: false)
+            let active = allTasks.filter { $0.status == "running" || $0.status == "reviewing" || $0.status == "queued" }.count
+            let chip = StatusChip(active > 0 ? "\(active) 进行中" : "\(allTasks.count)", tint: active > 0 ? .systemBlue : .secondaryLabelColor)
+            let rowView = Theme.hstack([icon, lbl, Theme.flexible(), chip], spacing: 7)
+            cell.addSubview(rowView); rowView.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                rowView.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 12),
+                rowView.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -10),
+                rowView.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
+            ])
+        case .projectItem(let p, let activeCount, let receiptCount, let totalCount):
+            let icon = NSImageView(image: NSImage(systemSymbolName: "folder.fill", accessibilityDescription: nil)!)
+            icon.contentTintColor = activeCount > 0 ? .systemBlue : .systemIndigo
+            icon.setContentHuggingPriority(.required, for: .horizontal)
+            let nameLbl = Theme.text(p.name, size: 12.5, weight: .semibold, wraps: false)
+            nameLbl.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+            let badgeText = activeCount > 0 ? "\(activeCount) 进行" : (receiptCount > 0 ? "\(receiptCount) 待验" : "\(totalCount)")
+            let badgeTint: NSColor = activeCount > 0 ? .systemBlue : (receiptCount > 0 ? .systemTeal : .secondaryLabelColor)
+            let chip = StatusChip(badgeText, tint: badgeTint)
+            let top = Theme.hstack([icon, nameLbl, Theme.flexible(), chip], spacing: 6)
+            let leadPrefix = (p.lead ?? "").isEmpty ? "" : "\(p.lead!)→"
+            let revSuffix = (p.reviewer ?? "").isEmpty ? "" : " · 审:\(p.reviewer!)"
+            let folderName = URL(fileURLWithPath: p.folder).lastPathComponent
+            let subLbl = Theme.caption("\(leadPrefix)\(p.executor)\(revSuffix) · \(folderName)")
+            subLbl.maximumNumberOfLines = 1
+            subLbl.lineBreakMode = .byTruncatingTail
+            let vstack = Theme.vstack([top, subLbl], spacing: 1)
+            top.widthAnchor.constraint(equalTo: vstack.widthAnchor).isActive = true
+            subLbl.widthAnchor.constraint(equalTo: vstack.widthAnchor).isActive = true
+            cell.addSubview(vstack); vstack.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                vstack.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 12),
+                vstack.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -10),
+                vstack.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
+            ])
+            cell.toolTip = "\(p.name)（\(p.id)）\n目录：\(p.folder)"
+        case .filterUnassigned(let activeCount, let totalCount):
+            let icon = NSImageView(image: NSImage(systemSymbolName: "tray.full.fill", accessibilityDescription: nil)!)
+            icon.contentTintColor = .secondaryLabelColor
+            icon.setContentHuggingPriority(.required, for: .horizontal)
+            let lbl = Theme.text("未归入项目", size: 12, weight: .regular, wraps: false)
+            let chip = StatusChip(activeCount > 0 ? "\(activeCount) 进行" : "\(totalCount)", tint: activeCount > 0 ? .systemBlue : .secondaryLabelColor)
+            let rowView = Theme.hstack([icon, lbl, Theme.flexible(), chip], spacing: 7)
+            cell.addSubview(rowView); rowView.translatesAutoresizingMaskIntoConstraints = false
+            NSLayoutConstraint.activate([
+                rowView.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 12),
+                rowView.trailingAnchor.constraint(equalTo: cell.trailingAnchor, constant: -10),
+                rowView.centerYAnchor.constraint(equalTo: cell.centerYAnchor)
+            ])
+        }
+        return cell
+    }
+
+    func tableViewSelectionDidChange(_ notification: Notification) {
+        guard !renderingSidebar else { return }
+        let row = sidebarTable.selectedRow
+        guard sidebarItems.indices.contains(row) else { return }
+        switch sidebarItems[row].kind {
+        case .overviewHome:
+            onNavigateHome?()
+        case .sectionHeader:
+            break
+        case .filterAll:
+            onSelectSidebarScope?()
+            selectSidebarScope(.all)
+        case .projectItem(let p, _, _, _):
+            onSelectSidebarScope?()
+            selectSidebarScope(.project(p.id))
+        case .filterUnassigned:
+            onSelectSidebarScope?()
+            selectSidebarScope(.unassigned)
+        }
+    }
+
+    func testSidebarRowCount() -> Int { sidebarItems.count }
+    func testInjectProjects(_ list: [OrchestraProject], tasks: [OrchestraTask] = []) {
+        projects = list
+        allProjects = list
+        allTasks = tasks
+        projectFilterBuilt = true
+        projectFilter.removeAllItems()
+        projectFilter.addItems(withTitles: ["全部项目与任务"] + list.map { "\($0.name)（\($0.id)）" } + ["未归入项目"])
+        projectFilter.selectItem(at: 0)
+        rebuildSidebarItems()
+        applyProjectFilter()
+    }
 
     private func command(_ arguments: [String], input: String? = nil) throws -> Data {
         let process = Process(); process.executableURL = executable; process.arguments = ["orchestra"] + arguments
@@ -553,8 +994,9 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
         return data
     }
 
-    private func refresh() {
-        guard window?.isVisible == true, !refreshing else { return }
+    func refresh(force: Bool = false) {
+        let visible = isEmbeddedActive || (rootView.window?.isVisible == true) || (window?.isVisible == true)
+        guard (force || visible), !refreshing else { return }
         refreshing = true
         queue.async { [weak self] in
             guard let self = self else { return }
@@ -590,13 +1032,19 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
                         self.projectFilter.addItems(withTitles: ["全部项目与任务"] + projects.map { "\($0.name)（\($0.id)）" } + ["未归入项目"])
                         if let pid = prevProjectID, let idx = projects.firstIndex(where: { $0.id == pid }) {
                             self.projectFilter.selectItem(at: idx + 1)
+                            self.sidebarSelection = .project(pid)
                         } else if prevUnassigned {
                             self.projectFilter.selectItem(at: projects.count + 1)
+                            self.sidebarSelection = .unassigned
                         } else {
                             self.projectFilter.selectItem(at: 0)
+                            self.sidebarSelection = .all
                         }
                     }
                     self.allTasks = tasks.sorted { $0.updated > $1.updated }
+                    let runningCount = self.allTasks.filter { $0.status == "running" || $0.status == "reviewing" || $0.status == "queued" }.count
+                    self.onSummaryChanged?(projects.count, self.allTasks.count, runningCount, status.active, status.paused == true)
+                    self.rebuildSidebarItems()
                     self.applyProjectFilter()
                     self.render(selectedTaskID: selectedTaskID, selectedGroupKey: selectedGroupKey)
                 }
@@ -800,6 +1248,7 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
         logoutButton.isEnabled = loginInfo != nil && loginActions.canLogout
         loginCancel.isEnabled = loginProcess?.isRunning == true && !loginCancelling
         loginCancel.isHidden = !loginBusy
+        updateMonitorPanel()
         if let task = selected {
             let projLabel: String
             if let pid = task.project, !pid.isEmpty {
@@ -812,7 +1261,10 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
                 projLabel = "未归入项目"
             }
             var text = "所属项目：\(projLabel) · 执行代理：\(task.executor) · 目录：\(task.folder)\n"
-            text += "任务卡：\n\(task.card)\n\n最近回执或错误：\n\(task.lastResult)"
+            if let progSection = task.formattedProgressSection {
+                text += "\n【📡 实时执行监视与阶段汇报】\n\(progSection)\n"
+            }
+            text += "\n最近回执或错误：\n\(task.lastResult)\n\n任务卡：\n\(task.card)"
             if !(task.review_verdict ?? "").isEmpty || !(task.review_text ?? "").isEmpty {
                 text += "\n\n审查结论：\(task.reviewLabel)\n\(task.review_text ?? "")"
             }
@@ -867,6 +1319,79 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
             let fallback = "选择项目查看工作群配置，或选择任务查看任务卡与执行回执。"
             if details.string != fallback { details.string = fallback }
         }
+    }
+
+    private var monitoredTaskCandidate: OrchestraTask? {
+        if let sel = selected { return sel }
+        if let runningTask = tasks.first(where: { $0.status == "running" }) { return runningTask }
+        if let firstWithProg = tasks.first(where: { $0.progress != nil }) { return firstWithProg }
+        if let p = activeProject, let sameFolderTask = allTasks.first(where: { $0.folder == p.folder && $0.progress != nil }) {
+            return sameFolderTask
+        }
+        return tasks.first ?? allTasks.first(where: { $0.progress != nil })
+    }
+
+    private func updateMonitorPanel() {
+        let candidate = monitoredTaskCandidate
+        let canCheckpointResume: Bool
+        if let t = candidate {
+            let sess = (t.session ?? "").isEmpty ? (t.progress?.conversation_id ?? "") : (t.session ?? "")
+            canCheckpointResume = !actionBusy && t.canRework && !sess.isEmpty
+        } else {
+            canCheckpointResume = false
+        }
+        checkpointResumeButton.isEnabled = canCheckpointResume
+
+        guard let task = candidate else {
+            monitorStatusChip.text = "待命中"
+            monitorStatusChip.tint = .secondaryLabelColor
+            monitorHeadline.stringValue = "当前暂无执行记录。派发任务后，此处将实时直播 AGY / Codex / Claude 的执行步数、STAGE 阶段汇报与工具调用。"
+            monitorFeed.stringValue = "防断流机制：AGY 启用 HTTP/1.1 + Run Marker 秒级会话锁定；若遇代理或模型断流，将自动保留会话并发起 1 次断点续跑。"
+            return
+        }
+        let isCrossProjectHint = activeProject != nil && (task.project ?? "") != activeProject?.id
+        let p = task.progress
+        let conv = (task.session ?? "").isEmpty ? (p?.conversation_id ?? "未绑定") : (task.session ?? "")
+        if task.status == "running" {
+            if p?.state == "retrying" {
+                monitorStatusChip.text = "⚠️ 断流重试中 · \(task.id)"
+                monitorStatusChip.tint = .systemOrange
+            } else {
+                monitorStatusChip.text = "实时监视中 · \(task.id)"
+                monitorStatusChip.tint = .systemBlue
+            }
+        } else if task.status == "failed" || task.status == "cancelled" {
+            monitorStatusChip.text = "已中断 · \(task.id)"
+            monitorStatusChip.tint = .systemOrange
+        } else {
+            monitorStatusChip.text = "最近轨迹 · \(task.id)"
+            monitorStatusChip.tint = .systemTeal
+        }
+        var head = "监视对象：\(task.id)（\(task.executor)） · \(p?.summary ?? task.statusLabel) · 会话：\(conv)"
+        if let idle = p?.idle_seconds, task.status == "running" {
+            head += " · 最后活跃 \(idle)s 前"
+        }
+        if isCrossProjectHint, let proj = activeProject {
+            head += "（注：该任务当前未归入「\(proj.name)」，但位于同一工作目录）"
+        }
+        monitorHeadline.stringValue = head
+
+        var feedLines: [String] = []
+        if let warn = p?.warning, !warn.isEmpty {
+            feedLines.append("⚠️ 预警：\(warn)")
+        }
+        if let stages = p?.stages, !stages.isEmpty {
+            feedLines.append("阶段汇报：" + stages.enumerated().map { "\($0.offset + 1). \($0.element)" }.joined(separator: "  |  "))
+        } else if let latest = p?.latest_stage, !latest.isEmpty {
+            feedLines.append("阶段汇报：\(latest)")
+        }
+        if let actions = p?.recent_actions, !actions.isEmpty {
+            feedLines.append("最近动作：" + actions.joined(separator: " → "))
+        }
+        if feedLines.isEmpty {
+            feedLines.append("等待执行代理写入首个阶段汇报或工具调用…（AGY 监控 brain/<conv>/transcript.jsonl，Codex/Claude 监控 .out.jsonl）")
+        }
+        monitorFeed.stringValue = feedLines.joined(separator: "\n")
     }
 
     func outlineView(_ outlineView: NSOutlineView, numberOfChildrenOfItem item: Any?) -> Int {
@@ -968,6 +1493,14 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
                 } else {
                     text = "—"
                 }
+            case "progress":
+                if let runningTask = grp.tasks.first(where: { $0.status == "running" }), let prog = runningTask.progress {
+                    text = "实时：\(prog.summary)"
+                } else if let latestProg = grp.tasks.first(where: { $0.progress != nil })?.progress {
+                    text = "最近：\(latestProg.summary)"
+                } else {
+                    text = "防断流与步进监控已就绪"
+                }
             case "review":
                 if let p = grp.project {
                     text = (p.reviewer ?? "").isEmpty ? "无审查" : "审查 \(p.reviewer!)"
@@ -1005,8 +1538,17 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
         guard let taskItem = item as? OrchestraTaskRowItem else { return nil }
         let task = taskItem.task
         if key == "status" {
-            let colorKey = task.unconfirmed == true ? "unconfirmed" : (task.evidence?.phase == "checking" ? "checking" : task.status)
-            let chip = StatusChip(task.statusLabel, tint: Theme.statusColor(for: colorKey))
+            let tint: NSColor
+            if task.unconfirmed == true {
+                tint = Theme.statusColor(for: "unconfirmed")
+            } else if task.progress?.state == "retrying" {
+                tint = .systemOrange
+            } else if task.evidence?.phase == "checking" || task.progress?.state == "checking" {
+                tint = Theme.statusColor(for: "checking")
+            } else {
+                tint = Theme.statusColor(for: task.status)
+            }
+            let chip = StatusChip(task.statusLabel, tint: tint)
             cell.addSubview(chip); chip.translatesAutoresizingMaskIntoConstraints = false
             NSLayoutConstraint.activate([
                 chip.leadingAnchor.constraint(equalTo: cell.leadingAnchor, constant: 2),
@@ -1030,10 +1572,28 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
         case "id": text = isReviewChild ? "↳ \(task.id)" : task.id
         case "executor": text = (task.lead ?? "").isEmpty ? task.executor : "\(task.lead!) → \(task.executor)"
         case "status": text = task.statusLabel
+        case "progress":
+            if let p = task.progress {
+                if let warn = p.warning, !warn.isEmpty, task.status == "running" {
+                    text = "⚠️ \(warn)"
+                } else if let stage = p.latest_stage, !stage.isEmpty {
+                    text = "\(p.summary) · \(stage)"
+                } else if let act = p.recent_actions?.last, !act.isEmpty {
+                    text = "\(p.summary) · \(act)"
+                } else {
+                    text = p.summary
+                }
+            } else {
+                text = "—"
+            }
         case "review": text = task.reviewLabel
         case "summary":
-            if let ev = task.evidence?.summary, !ev.isEmpty {
+            if task.status == "running", let p = task.progress, !p.summary.isEmpty {
+                text = "[\(p.summary)] \(task.cardHeadline)"
+            } else if let ev = task.evidence?.summary, !ev.isEmpty {
                 text = "\(task.cardHeadline) · \(ev)"
+            } else if let stage = task.progress?.latest_stage, !stage.isEmpty {
+                text = "\(task.cardHeadline) · 最近阶段：\(stage)"
             } else {
                 text = task.cardHeadline
             }
@@ -1061,7 +1621,7 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
     }
 
     @objc private func startRunner() {
-        guard !actionBusy, !runnerActive, runner?.isRunning != true, let window = window else { return }
+        guard !actionBusy, !runnerActive, runner?.isRunning != true, let window = sheetWindow else { return }
         let begin = { [weak self] in self?.startAfterCheck() }
         if confirmedRunner && (settings.account == "desktop" || loginInfo?.login.state == "logged_in") { begin(); return }
         let alert = NSAlert(); alert.messageText = "启动无人值守执行器？"
@@ -1151,7 +1711,7 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
             do {
                 let setup = try JSONDecoder().decode(OrchestraLoginInfo.self, from: self.command(["setup"]))
                 DispatchQueue.main.async {
-                    guard self.loginBusy, self.window?.isVisible == true else { self.loginBusy = false; self.updateButtons(); return }
+                    guard self.loginBusy, self.sheetWindow?.isVisible == true else { self.loginBusy = false; self.updateButtons(); return }
                     guard !setup.codex_bin.isEmpty else { self.loginBusy = false; self.loginMessage.stringValue = "找不到 Codex 命令行。"; self.updateButtons(); return }
                     let process = Process(); process.executableURL = URL(fileURLWithPath: setup.codex_bin); process.arguments = ["login"]
                     var environment = ProcessInfo.processInfo.environment; environment["CODEX_HOME"] = setup.dir; process.environment = environment
@@ -1179,7 +1739,7 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
         updateButtons()
     }
     @objc private func confirmLogout() {
-        guard !loginBusy, let info = loginInfo, info.login.logged_in, let window = window else { return }
+        guard !loginBusy, let info = loginInfo, info.login.logged_in, let window = sheetWindow else { return }
         let alert = NSAlert(); alert.messageText = "退出 Codex 执行账号？"; alert.informativeText = "这会退出独立执行账号；之后 Codex 任务需要重新登录。"
         alert.addButton(withTitle: "退出登录"); alert.addButton(withTitle: "取消")
         alert.beginSheetModal(for: window) { [weak self] response in
@@ -1224,18 +1784,18 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
     @objc private func changeReworkLimit() { mutate(["settings", "--auto-rework-max", String(reworkLimit.indexOfSelectedItem)]) }
     @objc private func toggleEvidence() { updateButtons() }
     @objc private func ackAutoSwitch() {
-        guard let window = window else { return }; let alert=NSAlert(); alert.messageText="解除自动切号暂停？"; alert.informativeText="请先核查账号及所有交接恢复记录。确认不会重试上次切号，仍会保留冷却时间。"; alert.addButton(withTitle:"已检查，解除暂停"); alert.addButton(withTitle:"取消")
+        guard let window = sheetWindow else { return }; let alert=NSAlert(); alert.messageText="解除自动切号暂停？"; alert.informativeText="请先核查账号及所有交接恢复记录。确认不会重试上次切号，仍会保留冷却时间。"; alert.addButton(withTitle:"已检查，解除暂停"); alert.addButton(withTitle:"取消")
         alert.beginSheetModal(for:window) { [weak self] response in if response == .alertFirstButtonReturn { self?.mutate(["auto-switch-ack"]) } }
     }
     @objc private func changeAutoSwitch() {
-        guard let window = window else { return }
+        guard let window = sheetWindow else { return }
         if autoSwitch.state == .off { mutate(["settings", "--auto-switch=false"]); return }
         autoSwitch.state = .off
         let alert=NSAlert(); alert.messageText="启用自动切换账号？"; alert.informativeText="只有 Codex Desktop 已关闭时才会切换 ~/.codex 的账号。之后 Desktop 和执行器都会使用新账号，并消耗其他账号的额度。"; alert.addButton(withTitle:"启用"); alert.addButton(withTitle:"取消")
         alert.beginSheetModal(for:window) { [weak self] response in if response == .alertFirstButtonReturn { self?.mutate(["settings", "--auto-switch=true"]) } }
     }
     @objc private func changeAutoStartRunner() {
-        guard let window = window else { return }
+        guard let window = sheetWindow else { return }
         if autoStartRunner.state == .off { mutate(["settings", "--auto-start-runner=false"]); return }
         autoStartRunner.state = .off
         let alert = NSAlert(); alert.messageText = "启动无人值守执行器？"
@@ -1250,14 +1810,20 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
     }
     @objc private func resumeSelected() { if let task = selected, task.canResume { mutate(["resume", task.id]) } }
     @objc private func confirmStoppedSelected() {
-        guard let task = selected, task.canConfirmStopped, let window = window else { return }
+        guard let task = selected, task.canConfirmStopped, let window = sheetWindow else { return }
         let alert = NSAlert(); alert.messageText = "确认原执行进程已停止？"; alert.informativeText = "请先检查原进程及其子进程均已停止。"; alert.addButton(withTitle: "确认已停止"); alert.addButton(withTitle: "取消")
         alert.beginSheetModal(for: window) { [weak self] response in if response == .alertFirstButtonReturn { self?.mutate(["confirm-stopped", task.id]) } }
     }
     @objc private func cancelSelected() { if let task = selected, task.canCancel { mutate(["cancel", task.id]) } }
     @objc private func acceptSelected() { if let task = selected, task.canAccept { mutate(["accept", task.id]) } }
+    @objc private func checkpointResumeSelected() {
+        guard let task = monitoredTaskCandidate, task.canRework else { return }
+        let prompt = "刚才执行连接中断（断流）或未完成。请先使用 read_file 检查已落盘的文件修改与当前进展，不要盲目重复已完成的操作，继续完成剩余未完成的部分，最后按格式输出 RECEIPT。"
+        pendingSelectTaskID = task.id
+        mutate(["rework", task.id], input: prompt, successMessage: "已唤醒原会话对任务「\(task.id)」发起断点续跑。")
+    }
     @objc private func reworkSelected() {
-        guard let task = selected, task.canRework, let window = window else { return }
+        guard let task = selected, task.canRework, let window = sheetWindow else { return }
         let alert = NSAlert(); alert.messageText = "返工说明"; alert.informativeText = "仅描述需要执行者修改的内容。"
         let field = NSTextField(frame: NSRect(x: 0, y: 0, width: 400, height: 24)); alert.accessoryView = field
         alert.addButton(withTitle: "提交"); alert.addButton(withTitle: "取消")
@@ -1279,13 +1845,21 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
         renderingOutline = false
     }
     @objc private func changeProjectFilter() {
+        if let p = selectedFilterProject {
+            sidebarSelection = .project(p.id)
+        } else if isUnassignedSelected {
+            sidebarSelection = .unassigned
+        } else {
+            sidebarSelection = .all
+        }
+        syncSidebarSelectionRows()
         let selectedTaskID = selected?.id
         let selectedGroupKey = selectedGroup?.key
         applyProjectFilter()
         render(selectedTaskID: selectedTaskID, selectedGroupKey: selectedGroupKey)
     }
     @objc private func archiveSelectedProject() {
-        guard let p = activeProject, let window = window else { return }
+        guard let p = activeProject, let window = sheetWindow else { return }
         let alert = NSAlert(); alert.messageText = "归档项目“\(p.name)”？"; alert.informativeText = "归档后该项目不再显示在活跃项目列表中，已有任务记录仍会保留。"
         alert.addButton(withTitle: "归档"); alert.addButton(withTitle: "取消")
         alert.beginSheetModal(for: window) { [weak self] response in
@@ -1295,7 +1869,7 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
         }
     }
     @objc private func assignSelectedTaskToProject() {
-        guard let task = selected, !projects.isEmpty, let window = window else { return }
+        guard let task = selected, !projects.isEmpty, let window = sheetWindow else { return }
         let alert = NSAlert()
         alert.messageText = "归入项目（工作群）"
         alert.informativeText = "将任务「\(task.id)」收纳进指定项目，或移回未归入项目分组。"
@@ -1376,7 +1950,7 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
         initialSyncAgentsMD: Bool = false,
         errorMessage: String? = nil
     ) {
-        guard let window = window else { return }
+        guard let window = sheetWindow else { return }
         var execAgents = agents.filter { $0.available || $0.name == editing?.executor || $0.name == initialExecName }
         if let currentExec = initialExecName ?? editing?.executor, !currentExec.isEmpty, !execAgents.contains(where: { $0.name == currentExec }) {
             execAgents.append(OrchestraAgent(name: currentExec, label: currentExec, available: true, reason: nil))
@@ -1470,7 +2044,7 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
         presentCreateTask(initialProjectID: defaultProjectID, initialFolder: defaultFolder)
     }
     private func presentCreateTask(initialProjectID: String? = nil, initialID: String = "", initialFolder: String = "", initialCard: String = "", initialAgentIndex: Int = 0, errorMessage: String? = nil) {
-        guard let window = window else { return }
+        guard let window = sheetWindow else { return }
         let available = agents.filter { $0.available }
         guard !projects.isEmpty || !available.isEmpty else { return }
         let alert = NSAlert(); alert.messageText = "派发新任务"

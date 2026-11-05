@@ -74,13 +74,22 @@ func orchestraTaskJSON(t *orchestra.Task) any {
 		return nil
 	}
 	e := orchestra.Evidence(t)
-	if e == nil {
+	p := orchestra.Progress(t)
+	if e == nil && p == nil {
 		return t
 	}
 	b, _ := json.Marshal(t)
 	var m map[string]any
 	_ = json.Unmarshal(b, &m)
-	m["evidence"] = e
+	if e != nil {
+		m["evidence"] = e
+	}
+	if p != nil {
+		m["progress"] = p
+		if (t.Session == "") && p.ConversationID != "" {
+			m["session"] = p.ConversationID
+		}
+	}
 	return m
 }
 

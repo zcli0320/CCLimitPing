@@ -122,7 +122,7 @@ func (a Agent) prepare(path, session, folder, prompt, lastFile string) (Invocati
 		}
 		inv.Argv = append(argv, "-")
 	case "claude":
-		argv := []string{bin, "-p", "--output-format", "json"}
+		argv := []string{bin, "-p", "--output-format", "stream-json", "--verbose"}
 		if session != "" {
 			argv = append(argv, "--resume", session)
 		}
@@ -182,7 +182,16 @@ func (a Agent) result(stdoutPath, lastFile string, run AGYRunIdentity) (session,
 			}
 		}
 		if e := json.Unmarshal(payload, &out); e != nil {
+			if conv := agyFindConversationByMarker(run.Marker); conv != "" {
+				if final := agyTranscriptFinal(conv, run); final != "" {
+					return conv, final, nil
+				}
+				return conv, "", errors.New("Antigravity 输出不是预期的 JSON（已绑定对话会话）")
+			}
 			return out.ConversationID, "", errors.New("Antigravity 输出不是预期的 JSON")
+		}
+		if out.ConversationID == "" && run.Marker != "" {
+			out.ConversationID = agyFindConversationByMarker(run.Marker)
 		}
 		if len(out.DeniedActions) > 0 {
 			names := make([]string, 0, len(out.DeniedActions))
@@ -209,11 +218,37 @@ func (a Agent) result(stdoutPath, lastFile string, run AGYRunIdentity) (session,
 		return out.ConversationID, strings.TrimSpace(out.Response), nil
 	case "claude":
 		var out struct {
+			Type      string `json:"type"`
 			SessionID string `json:"session_id"`
 			Result    string `json:"result"`
 			IsError   bool   `json:"is_error"`
 		}
-		if e := json.Unmarshal(bytesTrim(data), &out); e != nil {
+		payload := bytesTrim(data)
+		if json.Unmarshal(payload, &out) != nil || (out.Result == "" && out.SessionID == "") {
+			lines := strings.Split(string(payload), "\n")
+			for i := len(lines) - 1; i >= 0; i-- {
+				line := strings.TrimSpace(lines[i])
+				if !strings.HasPrefix(line, "{") {
+					continue
+				}
+				var candidate struct {
+					Type      string `json:"type"`
+					SessionID string `json:"session_id"`
+					Result    string `json:"result"`
+					IsError   bool   `json:"is_error"`
+				}
+				if json.Unmarshal([]byte(line), &candidate) == nil {
+					if out.SessionID == "" && candidate.SessionID != "" {
+						out.SessionID = candidate.SessionID
+					}
+					if candidate.Type == "result" || candidate.Result != "" || candidate.IsError {
+						out = candidate
+						break
+					}
+				}
+			}
+		}
+		if out.SessionID == "" && out.Result == "" && !out.IsError {
 			return "", "", errors.New("Claude 输出不是预期的 JSON")
 		}
 		if out.IsError {

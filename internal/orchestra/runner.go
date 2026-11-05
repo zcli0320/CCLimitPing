@@ -96,6 +96,9 @@ started by Codex Helper. No human is watching this run and you cannot ask questi
 - Anything that needs the user's approval (credentials, logins, real accounts, payments, deleting
   data, anything irreversible, quitting or restarting other apps) you must NOT do unless the card
   says the user approved it; report it as blocked instead.
+- Report stage milestones briefly as you work (between tool batches, output a concise line starting
+  with "STAGE: " summarizing what you just inspected/modified and what is next) so the monitor can
+  track your progress in real time.
 - Report what actually happened. Never mark a check passed that you didn't run.
 Your final message is delivered to the lead as your receipt, in exactly this format:
 RECEIPT <id>: <done|blocked>
@@ -332,6 +335,16 @@ func (r *Runner) tick(running map[string]*active) {
 		default:
 		}
 		t, err := r.Store.Get(a.id)
+		if err == nil && a.agent.Name == "antigravity" && t.Session == "" && a.agyRun.Marker != "" {
+			if conv := agyFindConversationByMarker(a.agyRun.Marker); conv != "" {
+				_, _ = r.Store.Update(a.id, func(tk *Task) error {
+					if tk.Session == "" {
+						tk.Session = conv
+					}
+					return nil
+				})
+			}
+		}
 		switch {
 		case err == nil && t.CancelRequested && a.term.IsZero():
 			r.stop(a, "已按请求停止")
@@ -418,7 +431,11 @@ func (r *Runner) start(snap *Task) *active {
 		if t.Rework != "" {
 			kind = "rework"
 			if t.AutoReworkPending {
-				kind = "auto_rework"
+				if t.Rework == AGYStreamRecoveryPrompt {
+					kind = "stream_recovery"
+				} else {
+					kind = "auto_rework"
+				}
 			}
 			if t.Session != "" {
 				session = t.Session
@@ -648,7 +665,14 @@ func (r *Runner) finish(a *active, why string) {
 			if errTail := readTail(a.files.err, 1200); errTail != "" {
 				msg += "\nstderr 末尾：\n" + errTail
 			}
-			run.Error, t.Status = msg, Failed
+			if a.agent.Name == "antigravity" && session != "" && run.Kind != "stream_recovery" && agyTranscriptInterrupted(session, a.agyRun) {
+				run.Error = msg + "\n（已锁定对话会话 " + session + "，自动发起一次断点续跑）"
+				t.Rework = AGYStreamRecoveryPrompt
+				t.AutoReworkPending = true
+				t.Status = Queued
+			} else {
+				run.Error, t.Status = msg, Failed
+			}
 		}
 		t.CancelRequested = false
 		return nil

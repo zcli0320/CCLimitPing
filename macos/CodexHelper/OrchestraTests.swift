@@ -74,7 +74,10 @@ import Cocoa
         precondition(projIDFromName == "refactor-2.0", "Project ID should slugify ASCII segments from name")
         let projIDFromFolder = resolveOrchestraProjectID("", name: "纯中文项目", folder: "/Users/test/codex-helper", existingIDs: ["codex-helper"], now: fixedNow)
         precondition(projIDFromFolder == "codex-helper-2", "Project ID should fall back to folder name and deduplicate")
-        let reviewChild = try decoder.decode(OrchestraTask.self, from: Data("{\"id\":\"T2-review-1\",\"project\":\"p1\",\"review_of\":\"T2\",\"executor\":\"claude\",\"folder\":\"/tmp/p1\",\"card\":\"review\",\"status\":\"running\",\"updated\":\"2026-10-31T12:00:00Z\"}".utf8))
+        let reviewChild = try decoder.decode(OrchestraTask.self, from: Data("{\"id\":\"T2-review-1\",\"project\":\"p1\",\"review_of\":\"T2\",\"executor\":\"claude\",\"folder\":\"/tmp/p1\",\"card\":\"review\",\"status\":\"running\",\"updated\":\"2026-10-31T12:00:00Z\",\"progress\":{\"state\":\"working\",\"summary\":\"第 3 步 · Bash\",\"latest_stage\":\"正在核对单元测试\",\"stages\":[\"正在核对单元测试\"],\"recent_actions\":[\"Bash\"],\"steps\":3,\"conversation_id\":\"cl-77\",\"idle_seconds\":5}}".utf8))
+        precondition(reviewChild.statusLabel == "执行中(3步)" && reviewChild.formattedProgressSection?.contains("正在核对单元测试") == true && reviewChild.formattedProgressSection?.contains("cl-77") == true)
+        let retryingAGY = try decoder.decode(OrchestraTask.self, from: Data("{\"id\":\"A1\",\"project\":\"p1\",\"executor\":\"antigravity\",\"folder\":\"/tmp/p1\",\"card\":\"fix ui\",\"status\":\"running\",\"updated\":\"now\",\"progress\":{\"state\":\"retrying\",\"summary\":\"第 4 步 · 模型断流重试中\",\"steps\":4,\"warning\":\"检测到 AGY 断流\"}}".utf8))
+        precondition(retryingAGY.statusLabel == "断流重试" && retryingAGY.formattedProgressSection?.contains("⚠️ 监视预警") == true)
         let unassignedTask = try decoder.decode(OrchestraTask.self, from: Data("{\"id\":\"U1\",\"executor\":\"codex\",\"folder\":\"/tmp\",\"card\":\"free task\",\"status\":\"queued\",\"updated\":\"2026-10-31T11:00:00Z\"}".utf8))
         let groups = buildOrchestraProjectGroups(projects: [project], allProjects: [project], tasks: [reviewing, reviewed, reviewChild, unassignedTask])
         precondition(groups.count == 2 && groups[0].projectID == "p1" && groups[1].isUnassigned, "Tasks must be grouped into project containers plus unassigned")
@@ -82,6 +85,20 @@ import Cocoa
         if let idx = groups[0].tasks.firstIndex(where: { $0.id == "T2" }) {
             precondition(groups[0].tasks[idx + 1].id == "T2-review-1", "Review child task must be ordered directly after parent task")
         }
+        _ = NSApplication.shared
+        let hostWin = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 720), styleMask: [.titled], backing: .buffered, defer: false)
+        let controller = OrchestraWindowController(executable: URL(fileURLWithPath: "/usr/bin/true"), hostWindow: hostWin)
+        let sidebar = controller.makeSidebarView()
+        hostWin.contentView?.addSubview(sidebar)
+        hostWin.contentView?.addSubview(controller.rootView)
+        controller.testInjectProjects([project, syncedProject], tasks: [reviewing, reviewed, unassignedTask])
+        precondition(controller.testSidebarRowCount() == 6, "Sidebar must list Home, Header, All, 2 Projects, and Unassigned")
+        controller.setEmbeddedActive(true)
+        controller.selectSidebarScope(.project("p1"))
+        precondition(controller.sidebarSelection == .project("p1"), "Selecting project scope must filter to p1")
+        controller.selectSidebarScope(.unassigned)
+        precondition(controller.sidebarSelection == .unassigned, "Selecting unassigned scope must filter to unassigned")
+        hostWin.close()
         print("Orchestra JSON decoding and task action rules passed")
     }
 }
