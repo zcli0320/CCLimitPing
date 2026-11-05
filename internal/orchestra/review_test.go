@@ -467,7 +467,13 @@ func TestReviewerFails(t *testing.T) {
 	if done.Status != Receipt || done.ReviewVerdict != "unavailable" || !strings.Contains(done.ReviewText, "reviewer boom") {
 		t.Fatalf("failed reviewer parent=%+v", done)
 	}
+	// Parent receipt and child archival are separate store writes.
 	child, err := e.store.Get("T1-r1")
+	deadline := time.Now().Add(5 * time.Second)
+	for err == nil && child.Status != Accepted && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+		child, err = e.store.Get("T1-r1")
+	}
 	if err != nil || child.Status != Accepted {
 		t.Fatalf("failed reviewer child=%+v err=%v", child, err)
 	}

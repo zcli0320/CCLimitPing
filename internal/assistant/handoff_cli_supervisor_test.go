@@ -235,7 +235,9 @@ func TestOwnedCLISupervisorCompletesHandoffAgainstFakeBackend(t *testing.T) {
 	if err != nil || state.Stage != "ready_exit" {
 		t.Fatalf("usage-limit fallback did not proceed: %s %v", state.Stage, err)
 	}
-	for i := 0; i < 12; i++ {
+	// The fake backend responds asynchronously; wait for completion, not a poll count.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
 		state, err = r.AdvanceHandoff(ctx, s)
 		if err != nil || state.Stage == "uncertain" {
 			t.Fatalf("fallback failed at %s", state.Stage)
@@ -243,6 +245,7 @@ func TestOwnedCLISupervisorCompletesHandoffAgainstFakeBackend(t *testing.T) {
 		if state.Stage == "completed" {
 			break
 		}
+		time.Sleep(10 * time.Millisecond)
 	}
 	if state.Stage != "completed" {
 		t.Fatalf("fallback stalled at %s", state.Stage)
