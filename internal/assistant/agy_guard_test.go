@@ -531,7 +531,7 @@ func TestManagedAGYPTYRunnerEndToEndWithMockAGYAndSpacesInPath(t *testing.T) {
 	// 4. When it receives the bounded recovery prompt, writes `Stream completed` and exits 0.
 	mockAGY := filepath.Join(home, "mock-agy.sh")
 	markerFile := filepath.Join(home, "recovered.txt")
-	script := fmt.Sprintf(`#!/bin/zsh
+	script := fmt.Sprintf(`#!/bin/bash
 set -e
 LOG_FILE=""
 ADD_DIR=""
