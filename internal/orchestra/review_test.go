@@ -331,6 +331,18 @@ func TestReviewIDTruncation(t *testing.T) {
 	}
 }
 
+// Parent completion and reviewer archival are separate writes by the runner.
+func waitReviewArchived(e env, id string) (*Task, error) {
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		child, err := e.store.Get(id)
+		if err != nil || child.Status == Accepted || time.Now().After(deadline) {
+			return child, err
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
 func TestReviewPassAndWait(t *testing.T) {
 	e := setupReviewEnv(t)
 	t.Setenv("REVIEW_SLEEP", "0.3")
@@ -364,7 +376,7 @@ func TestReviewPassAndWait(t *testing.T) {
 	if done.Status != Receipt || done.ReviewVerdict != "pass" || done.ReviewTask != "T1-r1" || done.ReviewedRuns != 1 || !strings.Contains(done.ReviewText, "VERDICT: PASS") {
 		t.Fatalf("parent after pass: %+v", done)
 	}
-	child, err := e.store.Get("T1-r1")
+	child, err := waitReviewArchived(e, "T1-r1")
 	if err != nil || child.Status != Accepted || child.ReviewOf != "T1" || child.Project != "P1" {
 		t.Fatalf("child=%+v err=%v", child, err)
 	}
@@ -403,11 +415,11 @@ func TestReviewChangesAutoRework(t *testing.T) {
 	if log, err := os.ReadFile(e.args + ".prompts"); err != nil || !strings.Contains(string(log), AutoReworkLimits) {
 		t.Fatalf("auto rework prompt lacks the card limits: %v", err)
 	}
-	r1, err := e.store.Get("T1-r1")
+	r1, err := waitReviewArchived(e, "T1-r1")
 	if err != nil || r1.Status != Accepted {
 		t.Fatalf("r1=%+v err=%v", r1, err)
 	}
-	r2, err := e.store.Get("T1-r2")
+	r2, err := waitReviewArchived(e, "T1-r2")
 	if err != nil || r2.Status != Accepted {
 		t.Fatalf("r2=%+v err=%v", r2, err)
 	}
