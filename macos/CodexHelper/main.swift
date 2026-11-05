@@ -1,4 +1,5 @@
 import Cocoa
+import SwiftUI
 import ServiceManagement
 import Darwin
 
@@ -12,8 +13,18 @@ final class SessionItem: NSObject {
     init(_ session: HelperSession) { self.session = session }
 }
 
-final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutlineViewDataSource, NSOutlineViewDelegate, NSSearchFieldDelegate {
+final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSToolbarDelegate, NSOutlineViewDataSource, NSOutlineViewDelegate, NSSearchFieldDelegate {
     var window: NSWindow!
+    static let toolbarSidebarItemID = NSToolbarItem.Identifier("CodexHelperToolbarSidebar")
+    static let toolbarPrimary1ItemID = NSToolbarItem.Identifier("CodexHelperToolbarPrimary1")
+    static let toolbarPrimary2ItemID = NSToolbarItem.Identifier("CodexHelperToolbarPrimary2")
+    static let toolbarRefreshItemID = NSToolbarItem.Identifier("CodexHelperToolbarRefresh")
+    static let toolbarSettingsItemID = NSToolbarItem.Identifier("CodexHelperToolbarSettings")
+    let toolbarSidebarButton = NSButton(title: "导航边栏", target: nil, action: nil)
+    let toolbarPrimary1Button = NSButton(title: "启动 Codex", target: nil, action: nil)
+    let toolbarPrimary2Button = NSButton(title: "启动 AGY", target: nil, action: nil)
+    let toolbarRefreshButton = NSButton(title: "刷新", target: nil, action: nil)
+    let toolbarSettingsButton = NSButton(title: "设置", target: nil, action: nil)
     var snapshot: Snapshot?
     var visibleSessions: [HelperSession] = []
     var projects: [ProjectItem] = []
@@ -148,14 +159,21 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
     var resumeRevision = 0
     var lastResumeCheck = Date.distantPast
     var resumeProcess: Process?
+    let appModel = CodexHelperAppModel.shared
+    var sessionOutlineContainer: NSView?
+    var sessionOutlineScroll: NSScrollView?
     var backgroundEnabled: Bool { warmupReport?.enabled == true || resumeReport?.enabled == true || handoffReport?.hasAuthorization == true || handoffPendingKey != nil }
 
+    override convenience init() {
+        self.init(fixture: AppBootstrapConfig.shared.fixture, directory: AppBootstrapConfig.shared.directory)
+    }
 
     init(fixture: URL?, directory: URL) {
         self.fixture = fixture
         store = StateStore(directory: directory)
         state = store.load()
         super.init()
+        appModel.bind(assistant: self, orchestra: nil)
     }
 
     func label(_ text: String, size: CGFloat = 12, weight: NSFont.Weight = .regular,
@@ -206,31 +224,38 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
             let executable = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/codex-accounts")
             accountClient = AccountCenterClient(executable: executable)
         }
-        let mainMenu = NSMenu(), appMenu = NSMenu(), item = NSMenuItem()
-        appMenu.addItem(withTitle: "退出 Codex 小助手", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        item.submenu = appMenu; mainMenu.addItem(item)
-        let editItem = NSMenuItem(), editMenu = NSMenu(title: "编辑")
-        editMenu.addItem(withTitle: "拷贝", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
-        editMenu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
-        editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
-        editItem.submenu = editMenu; mainMenu.addItem(editItem); NSApp.mainMenu = mainMenu
+        if NSApp.mainMenu == nil {
+            let mainMenu = NSMenu(), appMenu = NSMenu(), item = NSMenuItem()
+            appMenu.addItem(withTitle: "设置…", action: #selector(openSettingsFromMenu), keyEquivalent: ",")
+            appMenu.addItem(NSMenuItem.separator())
+            appMenu.addItem(withTitle: "退出 Codex 小助手", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+            item.submenu = appMenu; mainMenu.addItem(item)
+            let editItem = NSMenuItem(), editMenu = NSMenu(title: "编辑")
+            editMenu.addItem(withTitle: "拷贝", action: #selector(NSText.copy(_:)), keyEquivalent: "c")
+            editMenu.addItem(withTitle: "粘贴", action: #selector(NSText.paste(_:)), keyEquivalent: "v")
+            editMenu.addItem(withTitle: "全选", action: #selector(NSText.selectAll(_:)), keyEquivalent: "a")
+            editItem.submenu = editMenu; mainMenu.addItem(editItem); NSApp.mainMenu = mainMenu
+        }
 
-        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 980, height: 840),
-                          styleMask: [.titled, .closable, .miniaturizable, .resizable], backing: .buffered, defer: false)
+        window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 1100, height: 760),
+                          styleMask: [.titled, .closable, .miniaturizable, .resizable, .fullSizeContentView], backing: .buffered, defer: false)
         window.title = "Codex 小助手"
-        window.titleVisibility = .hidden
+        window.titleVisibility = .visible
+        window.toolbarStyle = .unified
         window.minSize = NSSize(width: 820, height: 580)
         window.delegate = self
         window.isReleasedWhenClosed = false
-        window.titlebarAppearsTransparent = true
+        window.titlebarAppearsTransparent = false
         window.backgroundColor = .windowBackgroundColor
+        configureMainWindowToolbar()
         let content = NSView(); window.contentView = content
 
         let helperExec = Bundle.main.bundleURL.appendingPathComponent("Contents/MacOS/codex-helper")
         let orc = OrchestraWindowController(executable: helperExec, hostWindow: window)
         orchestraCenter = orc
-        orc.onNavigateHome = { [weak self] in self?.showMainOverview() }
-        orc.onSelectSidebarScope = { [weak self] in self?.showOrchestraWorkbench() }
+        appModel.bind(assistant: self, orchestra: orc)
+        orc.onNavigateHome = { [weak self] in self?.selectDestination(.overview) }
+        orc.onSelectSidebarScope = { [weak self] in self?.selectDestination(.projects) }
         orc.onSummaryChanged = { [weak self] projCount, taskCount, runningCount, runnerActive, paused in
             self?.updateOrchestraSummary(projCount: projCount, taskCount: taskCount, runningCount: runningCount, runnerActive: runnerActive, paused: paused)
         }
@@ -238,17 +263,21 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         let sidebarPanel = orc.makeSidebarView()
         let host = NSView()
         mainContentHost = host
-        content.addSubview(sidebarPanel); sidebarPanel.translatesAutoresizingMaskIntoConstraints = false
-        content.addSubview(host); host.translatesAutoresizingMaskIntoConstraints = false
+        sidebarPanel.isHidden = true
+        host.isHidden = true
+        // Legacy controls remain owned by their controllers, outside window layout.
+        sidebarPanel.translatesAutoresizingMaskIntoConstraints = false
+        host.translatesAutoresizingMaskIntoConstraints = false
+
+        let splitHost = NSHostingView(rootView: MainSplitView(model: appModel))
+        splitHost.sizingOptions = []
+        splitHost.translatesAutoresizingMaskIntoConstraints = false
+        content.addSubview(splitHost)
         NSLayoutConstraint.activate([
-            sidebarPanel.topAnchor.constraint(equalTo: content.topAnchor),
-            sidebarPanel.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            sidebarPanel.leadingAnchor.constraint(equalTo: content.leadingAnchor),
-            sidebarPanel.widthAnchor.constraint(equalToConstant: 226),
-            host.topAnchor.constraint(equalTo: content.topAnchor),
-            host.bottomAnchor.constraint(equalTo: content.bottomAnchor),
-            host.leadingAnchor.constraint(equalTo: sidebarPanel.trailingAnchor),
-            host.trailingAnchor.constraint(equalTo: content.trailingAnchor)
+            splitHost.topAnchor.constraint(equalTo: content.topAnchor),
+            splitHost.bottomAnchor.constraint(equalTo: content.bottomAnchor),
+            splitHost.leadingAnchor.constraint(equalTo: content.leadingAnchor),
+            splitHost.trailingAnchor.constraint(equalTo: content.trailingAnchor)
         ])
 
         outerScroll.hasVerticalScroller = true; outerScroll.autohidesScrollers = true
@@ -450,10 +479,9 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         table.setAccessibilityLabel("按项目分组的 Codex 会话")
         let scroll = NestedScrollView(); scroll.documentView = table; scroll.hasVerticalScroller = true; scroll.borderType = .noBorder
         scroll.autohidesScrollers = true; scroll.drawsBackground = true; scroll.backgroundColor = .controlBackgroundColor
-        tableHeight = scroll.heightAnchor.constraint(equalToConstant: 220); tableHeight.isActive = true
+        sessionOutlineScroll = scroll
         scroll.setContentHuggingPriority(.defaultLow, for: .vertical)
         sessionBox.addDivider()
-        sessionBox.add(scroll)
         emptyLabel.font = .systemFont(ofSize: 12); emptyLabel.textColor = .secondaryLabelColor
         emptyLabel.alignment = .center
         sessionBox.add(emptyLabel); emptyLabel.isHidden = true
@@ -543,7 +571,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         feedback.font = .systemFont(ofSize: 11); feedback.textColor = .secondaryLabelColor
         feedback.maximumNumberOfLines = 2
         if let visible = NSScreen.main?.visibleFrame {
-            window.setContentSize(NSSize(width: min(980, visible.width - 40), height: min(860, visible.height - 60)))
+            window.setContentSize(NSSize(width: min(1100, visible.width - 40), height: min(760, visible.height - 60)))
         }
         loginItem.target = self; loginItem.action = #selector(toggleLoginItem)
         loginStatus.font = .systemFont(ofSize: 11); loginStatus.textColor = .secondaryLabelColor
@@ -574,7 +602,15 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         if fixture == nil {
             orchestraCenter?.startBackgroundRefresh()
             orchestraCenter?.startRunnerIfConfigured()
+        } else {
+            applyFixtureOrchestraStatus()
+            if AppBootstrapConfig.shared.uiSmokeTest {
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) { [weak self] in
+                    self?.runUISmokeTestAndExit()
+                }
+            }
         }
+        appModel.notifyChanged()
     }
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { !backgroundEnabled }
@@ -631,6 +667,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
             clip.setBoundsOrigin(target)
             outerScroll.reflectScrolledClipView(clip)
         }
+        appModel.notifyChanged()
     }
 
     func scrollToSection(_ targetView: NSView?) {
@@ -776,6 +813,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         orchestraCenter?.setEmbeddedActive(false)
         collaborationButton?.title = "项目与协作"
         layoutDocument()
+        appModel.notifyChanged()
     }
 
     func showOrchestraWorkbench() {
@@ -784,6 +822,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         orchestraCenter?.rootView.isHidden = false
         orchestraCenter?.setEmbeddedActive(true)
         collaborationButton?.title = "返回总览"
+        appModel.notifyChanged()
     }
 
     func updateOrchestraSummary(projCount: Int, taskCount: Int, runningCount: Int, runnerActive: Bool, paused: Bool) {
@@ -792,6 +831,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         let sub = projCount > 0 ? "\(projCount) 个项目 · \(taskCount) 个任务" : "点击新建项目或切换工作群"
         orchestraOverviewCard?.isActiveCard = runningCount > 0 || runnerActive
         orchestraOverviewCard?.update(subtitle: sub, badgeText: badge, tint: tint)
+        appModel.notifyChanged()
     }
 
     @objc func openOrchestra() {
@@ -969,6 +1009,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
             clip.setBoundsOrigin(target)
             outerScroll.reflectScrolledClipView(clip)
         }
+        appModel.notifyChanged()
     }
 
     func renderAccountCards() {
@@ -1014,6 +1055,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
             clip.setBoundsOrigin(target)
             outerScroll.reflectScrolledClipView(clip)
         }
+        appModel.notifyChanged()
     }
 
     func updateWarmupUI() {
@@ -1063,6 +1105,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         resumeStopItem?.isEnabled = resumeReport?.enabled == true && !resumeBusy
         handoffStopItem?.isEnabled = (handoffReport?.hasAuthorization == true || handoffPendingKey != nil) && !handoffBusy
         layoutDocument()
+        appModel.notifyChanged()
     }
 
     func backgroundStatusCaption() -> String {
@@ -1285,6 +1328,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         else if total == 0 { emptyLabel.stringValue = "没有读取到会话，可检查 Codex 数据目录后刷新。" }
         else { emptyLabel.stringValue = "没有匹配的会话，可清除搜索或勾选「包括归档」。" }
         updateSelection(); layoutDocument()
+        appModel.notifyChanged()
     }
 
     func controlTextDidChange(_ obj: Notification) { filterChanged() }
@@ -1412,6 +1456,7 @@ final class Assistant: NSObject, NSApplicationDelegate, NSWindowDelegate, NSOutl
         observedRevision = state.observing ? session.updated_at : nil
         observationMessage = state.observing ? "等待新记录" : ""
         updateSelection(); layoutDocument()
+        appModel.notifyChanged()
     }
 
     @objc func clearTarget() {
@@ -1584,6 +1629,7 @@ extension Assistant {
         let sessionSub = selected.map { "已选：\($0.title)" } ?? "未选择会话 · 点击浏览"
         sessionOverviewCard?.update(subtitle: sessionSub, badgeText: chipText, tint: chipColor == .secondaryLabelColor ? .systemTeal : chipColor)
         updateResumeUI()
+        appModel.notifyChanged()
     }
     @objc func startCLIHandoff() {
         if state.activeScope == "desktop" { startDesktopHandoff(); return }
@@ -1769,6 +1815,7 @@ extension Assistant {
             quickLaunchFolderPopup.selectItem(at: 0)
             quickLaunchFolderPopup.toolTip = "点击启动按钮时弹出文件夹选择框"
         }
+        appModel.notifyChanged()
     }
 
     private var selectedQuickLaunchFolder: String? {
@@ -2048,6 +2095,7 @@ extension Assistant {
             agyGuardReasonLabel.toolTip = agyGuardReasonLabel.stringValue
         }
         layoutDocument()
+        appModel.notifyChanged()
     }
 
     private func agyLaunchButtonUpdate(guardEnabled: Bool) {
@@ -2106,6 +2154,426 @@ extension Assistant {
             }
         }
     }
+
+    // MARK: - Native SwiftUI Shell Integration
+
+    func configureMainWindowToolbar() {
+        for (button, symbol, title, action) in [
+            (toolbarSidebarButton, "sidebar.left", "切换边栏", #selector(handleToolbarSidebarToggle)),
+            (toolbarPrimary1Button, "play.fill", "启动 Codex", #selector(handleToolbarPrimary1)),
+            (toolbarPrimary2Button, "sparkles", "启动 AGY", #selector(handleToolbarPrimary2)),
+            (toolbarRefreshButton, "arrow.clockwise", "刷新", #selector(handleToolbarRefresh)),
+            (toolbarSettingsButton, "gearshape", "设置", #selector(handleToolbarSettings))
+        ] {
+            button.target = self
+            button.action = action
+            button.bezelStyle = .texturedRounded
+            button.title = title
+            button.image = NSImage(systemSymbolName: symbol, accessibilityDescription: title)
+            button.imagePosition = .imageLeading
+            button.controlSize = .regular
+            button.setAccessibilityLabel(title)
+        }
+        toolbarSidebarButton.imagePosition = .imageOnly
+        toolbarSidebarButton.toolTip = "显示或收起导航边栏"
+        toolbarSettingsButton.imagePosition = .imageOnly
+        toolbarSettingsButton.toolTip = "打开设置（⌘,）"
+
+        let toolbar = NSToolbar(identifier: "CodexHelperMainToolbar")
+        toolbar.delegate = self
+        toolbar.displayMode = .iconOnly
+        toolbar.allowsUserCustomization = false
+        toolbar.autosavesConfiguration = false
+        window.toolbar = toolbar
+        syncWindowToolbar()
+    }
+
+    func toolbarDefaultItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        [
+            Self.toolbarSidebarItemID,
+            .flexibleSpace,
+            Self.toolbarPrimary1ItemID,
+            Self.toolbarPrimary2ItemID,
+            Self.toolbarRefreshItemID,
+            Self.toolbarSettingsItemID
+        ]
+    }
+
+    func toolbarAllowedItemIdentifiers(_ toolbar: NSToolbar) -> [NSToolbarItem.Identifier] {
+        toolbarDefaultItemIdentifiers(toolbar)
+    }
+
+    func toolbar(_ toolbar: NSToolbar, itemForItemIdentifier itemIdentifier: NSToolbarItem.Identifier, willBeInsertedIntoToolbar flag: Bool) -> NSToolbarItem? {
+        let item = NSToolbarItem(itemIdentifier: itemIdentifier)
+        switch itemIdentifier {
+        case Self.toolbarSidebarItemID:
+            item.label = "边栏"
+            item.paletteLabel = "切换边栏"
+            item.view = toolbarSidebarButton
+        case Self.toolbarPrimary1ItemID:
+            item.label = "主操作"
+            item.paletteLabel = "当前页主操作"
+            item.view = toolbarPrimary1Button
+        case Self.toolbarPrimary2ItemID:
+            item.label = "次操作"
+            item.paletteLabel = "当前页次操作"
+            item.view = toolbarPrimary2Button
+        case Self.toolbarRefreshItemID:
+            item.label = "刷新"
+            item.paletteLabel = "刷新当前页"
+            item.view = toolbarRefreshButton
+        case Self.toolbarSettingsItemID:
+            item.label = "设置"
+            item.paletteLabel = "打开设置"
+            item.view = toolbarSettingsButton
+        default:
+            return nil
+        }
+        return item
+    }
+
+    func syncWindowToolbar() {
+        guard window != nil else { return }
+        let dest = appModel.selectedDestination
+        window.title = dest.title
+        window.subtitle = appModel.statusLine
+        switch dest {
+        case .overview:
+            toolbarPrimary1Button.title = "启动 Codex"
+            toolbarPrimary1Button.image = NSImage(systemSymbolName: "play.fill", accessibilityDescription: "启动 Codex")
+            toolbarPrimary1Button.toolTip = "在所选工作目录启动 Codex CLI"
+            toolbarPrimary1Button.isEnabled = true
+            toolbarPrimary2Button.title = "启动 AGY"
+            toolbarPrimary2Button.image = NSImage(systemSymbolName: "sparkles", accessibilityDescription: "启动 AGY")
+            toolbarPrimary2Button.toolTip = "在所选工作目录启动 AGY CLI"
+            toolbarPrimary2Button.isEnabled = true
+            toolbarRefreshButton.toolTip = "刷新账号额度与会话状态"
+            toolbarRefreshButton.isEnabled = !appModel.isLoading
+        case .accounts:
+            toolbarPrimary1Button.title = "添加 / 管理授权"
+            toolbarPrimary1Button.image = NSImage(systemSymbolName: "person.crop.circle.badge.plus", accessibilityDescription: "添加或管理授权")
+            toolbarPrimary1Button.toolTip = "打开原生账号授权管理中心"
+            toolbarPrimary1Button.isEnabled = true
+            toolbarPrimary2Button.title = "刷新预热状态"
+            toolbarPrimary2Button.image = NSImage(systemSymbolName: "flame", accessibilityDescription: "刷新预热状态")
+            toolbarPrimary2Button.toolTip = "刷新自动预热与额度评估状态"
+            toolbarPrimary2Button.isEnabled = appModel.canCheckWarmup
+            toolbarRefreshButton.toolTip = "刷新全部账号额度"
+            toolbarRefreshButton.isEnabled = !appModel.isLoading
+        case .sessions:
+            toolbarPrimary1Button.title = appModel.activeScope == "cli" ? "切至 Desktop" : "切至 CLI"
+            toolbarPrimary1Button.image = NSImage(systemSymbolName: "arrow.left.arrow.right", accessibilityDescription: "切换会话来源")
+            toolbarPrimary1Button.toolTip = "在 Desktop 与 CLI 会话记录间切换"
+            toolbarPrimary1Button.isEnabled = true
+            toolbarPrimary2Button.title = "在终端续跑"
+            toolbarPrimary2Button.image = NSImage(systemSymbolName: "terminal", accessibilityDescription: "在终端托管续跑")
+            toolbarPrimary2Button.toolTip = "在终端托管续跑当前选中会话"
+            toolbarPrimary2Button.isEnabled = appModel.canOpenManagedCLI
+            toolbarRefreshButton.toolTip = "刷新本机会话列表"
+            toolbarRefreshButton.isEnabled = !appModel.isLoading
+        case .projects:
+            toolbarPrimary1Button.title = "新建项目"
+            toolbarPrimary1Button.image = NSImage(systemSymbolName: "folder.badge.plus", accessibilityDescription: "新建项目")
+            toolbarPrimary1Button.toolTip = "新建协作项目与规则（⇧⌘N）"
+            toolbarPrimary1Button.isEnabled = appModel.canCreateProjectInOrchestra
+            toolbarPrimary2Button.title = "派发任务"
+            toolbarPrimary2Button.image = NSImage(systemSymbolName: "paperplane.fill", accessibilityDescription: "派发任务")
+            toolbarPrimary2Button.toolTip = "向当前项目派发任务（⌘N）"
+            toolbarPrimary2Button.isEnabled = appModel.canCreateTaskInOrchestra
+            toolbarRefreshButton.toolTip = "刷新项目与任务状态"
+            toolbarRefreshButton.isEnabled = true
+        }
+        for item in window.toolbar?.items ?? [] {
+            if item.itemIdentifier == Self.toolbarPrimary1ItemID {
+                item.label = toolbarPrimary1Button.title
+                item.paletteLabel = toolbarPrimary1Button.title
+            } else if item.itemIdentifier == Self.toolbarPrimary2ItemID {
+                item.label = toolbarPrimary2Button.title
+                item.paletteLabel = toolbarPrimary2Button.title
+            }
+        }
+        toolbarPrimary1Button.setAccessibilityLabel(toolbarPrimary1Button.title)
+        toolbarPrimary2Button.setAccessibilityLabel(toolbarPrimary2Button.title)
+        toolbarPrimary1Button.sizeToFit()
+        toolbarPrimary2Button.sizeToFit()
+        toolbarRefreshButton.sizeToFit()
+    }
+
+    @objc func handleToolbarSidebarToggle() {
+        appModel.toggleSidebar()
+    }
+
+    @objc func handleToolbarPrimary1() {
+        switch appModel.selectedDestination {
+        case .overview:
+            appModel.launchCodexCLI()
+        case .accounts:
+            appModel.openAuthorizationCenter()
+        case .sessions:
+            appModel.setSessionScope(appModel.activeScope == "cli" ? "desktop" : "cli")
+        case .projects:
+            appModel.createProject()
+        }
+    }
+
+    @objc func handleToolbarPrimary2() {
+        switch appModel.selectedDestination {
+        case .overview:
+            appModel.launchAgyCLI()
+        case .accounts:
+            appModel.checkWarmupNow()
+        case .sessions:
+            appModel.openManagedCLI()
+        case .projects:
+            appModel.createTask()
+        }
+    }
+
+    @objc func handleToolbarRefresh() {
+        appModel.refreshCurrentPage()
+    }
+
+    @objc func handleToolbarSettings() {
+        appModel.openSettingsWindow(tab: nil)
+    }
+
+    func selectDestination(_ destination: NavigationDestination) {
+        state.selectDestination(destination)
+        orchestraShowing = (destination == .projects)
+        if fixture == nil {
+            orchestraCenter?.setEmbeddedActive(destination == .projects)
+        }
+        save()
+        appModel.notifyChanged()
+    }
+
+    func selectQuickLaunchFolderFromUI(_ folder: String?) {
+        if let folder, !folder.isEmpty {
+            let standard = (folder as NSString).standardizingPath
+            state.launchFolder = standard
+            state.recordLaunchFolder(standard)
+            quickLaunchStatus.stringValue = "当前目录：\((standard as NSString).abbreviatingWithTildeInPath) · 点击启动按钮即可进入终端"
+        } else {
+            state.launchFolder = nil
+            quickLaunchStatus.stringValue = "未固定目录；点击启动按钮时将弹出文件夹选择框。"
+        }
+        save()
+        updateQuickLaunchFolders()
+    }
+
+    func focusSessionSearchField() {
+        appModel.notifyChanged()
+    }
+
+    @objc func openSettingsFromMenu() {
+        openSettingsSceneWindow()
+    }
+
+    func openSettingsSceneWindow() {
+        if let existing = NSApp.windows.first(where: { win in
+            win !== window && (
+                win.identifier?.rawValue.contains("Settings") == true ||
+                win.title.contains("设置") ||
+                win.title.contains("Settings")
+            )
+        }) {
+            existing.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            appModel.notifyChanged()
+            return
+        }
+        if let appMenu = NSApp.mainMenu?.items.first?.submenu,
+           let item = appMenu.items.first(where: { $0.keyEquivalent == "," }),
+           let action = item.action {
+            NSApp.sendAction(action, to: item.target, from: item)
+        } else {
+            _ = NSApp.sendAction(Selector(("showSettingsWindow:")), to: nil, from: nil)
+        }
+        NSApp.activate(ignoringOtherApps: true)
+        appModel.notifyChanged()
+    }
+
+    func makeOrReuseSessionOutlineContainer() -> NSView {
+        if let existing = sessionOutlineContainer {
+            return existing
+        }
+        let container = NSView()
+        if let scroll = sessionOutlineScroll {
+            scroll.removeFromSuperview()
+            scroll.translatesAutoresizingMaskIntoConstraints = false
+            container.addSubview(scroll)
+            NSLayoutConstraint.activate([
+                scroll.topAnchor.constraint(equalTo: container.topAnchor),
+                scroll.bottomAnchor.constraint(equalTo: container.bottomAnchor),
+                scroll.leadingAnchor.constraint(equalTo: container.leadingAnchor),
+                scroll.trailingAnchor.constraint(equalTo: container.trailingAnchor)
+            ])
+        }
+        sessionOutlineContainer = container
+        return container
+    }
+
+    func refreshSessionOutlineLayout() {
+        table.reloadData()
+        for item in projects {
+            let searching = !search.stringValue.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            if searching || state.expandedProjects.contains(item.group.key) {
+                table.expandItem(item)
+            } else {
+                table.collapseItem(item)
+            }
+        }
+        if let key = state.selectedKey, let item = sessionItems[key], table.row(forItem: item) >= 0 {
+            table.selectRowIndexes(IndexSet(integer: table.row(forItem: item)), byExtendingSelection: false)
+        }
+    }
+
+    func applyFixtureOrchestraStatus() {
+        struct FixtureOrchestraPayload: Decodable {
+            let agents: [OrchestraAgent]
+            let projects: [OrchestraProject]
+            let tasks: [OrchestraTask]
+        }
+        let sampleJSON = """
+        {
+          "agents": [
+            { "name": "codex", "label": "Codex", "available": true, "reason": null },
+            { "name": "agy", "label": "AGY", "available": true, "reason": null }
+          ],
+          "projects": [
+            {
+              "id": "proj-fixture",
+              "name": "Native UI Refresh",
+              "folder": "/tmp/fixture-workspace",
+              "executor": "agy",
+              "lead": "codex",
+              "reviewer": "codex",
+              "checks": ["go test ./..."],
+              "scope": ["macos/CodexHelper"],
+              "sync_agents_md": false,
+              "archived": false
+            }
+          ],
+          "tasks": [
+            {
+              "id": "task-101",
+              "lead": "codex",
+              "executor": "agy",
+              "folder": "/tmp/fixture-workspace",
+              "card": "Implement NavigationSplitView and Settings scene.",
+              "status": "running",
+              "session": "sess-running-101",
+              "updated": "2026-11-05T18:01:00Z",
+              "project": "proj-fixture",
+              "progress": {
+                "state": "running",
+                "summary": "正在更新 SwiftUI 导航与项目协作视图",
+                "latest_stage": "完成 State.swift 导航模型",
+                "stages": ["完成 State.swift 导航模型"],
+                "recent_actions": ["编辑 AppShell.swift"],
+                "steps": 3
+              }
+            },
+            {
+              "id": "task-102",
+              "lead": "codex",
+              "executor": "agy",
+              "folder": "/tmp/fixture-workspace",
+              "card": "Run smoke verification.",
+              "status": "queued",
+              "updated": "2026-11-05T18:02:00Z",
+              "project": "proj-fixture"
+            },
+            {
+              "id": "task-103",
+              "lead": "codex",
+              "executor": "agy",
+              "folder": "/tmp/fixture-workspace",
+              "card": "Verify receipt.",
+              "status": "receipt",
+              "session": "conv-103",
+              "updated": "2026-11-05T18:03:00Z",
+              "project": "proj-fixture",
+              "runs": [{ "receipt": "RECEIPT NATIVE-UI OK", "error": null }],
+              "review_verdict": "pass",
+              "review_text": "All checks passed."
+            }
+          ]
+        }
+        """
+        if let data = sampleJSON.data(using: .utf8),
+           let decoded = try? JSONDecoder().decode(FixtureOrchestraPayload.self, from: data) {
+            orchestraCenter?.applyFixtureData(
+                projects: decoded.projects,
+                tasks: decoded.tasks,
+                agents: decoded.agents,
+                selectedTaskID: "task-101"
+            )
+        }
+    }
+
+    func runUISmokeTestAndExit() {
+        guard let toolbar = window.toolbar, toolbar.isVisible, toolbar.items.count >= 5 else {
+            fputs("UI_SMOKE_TEST_FAIL: native window.toolbar missing or not visible (items=\(window.toolbar?.items.count ?? 0))\n", stderr)
+            exit(1)
+        }
+        handleToolbarSidebarToggle()
+        handleToolbarSidebarToggle()
+        for dest in NavigationDestination.allCases + [.overview, .projects] {
+            appModel.selectDestination(dest)
+            guard appModel.selectedDestination == dest, state.selectedDestination == dest else {
+                fputs("UI_SMOKE_TEST_FAIL: destination switch failed for \(dest.rawValue)\n", stderr)
+                exit(1)
+            }
+        }
+        let counts = appModel.orchestraTaskCounts
+        guard counts.runningCount == 1, counts.queuedCount == 1, counts.receiptCount == 1,
+              appModel.orchestraProjectGroups.count == 1,
+              appModel.orchestraNoticeText.isEmpty else {
+            fputs("UI_SMOKE_TEST_FAIL: unexpected orchestra state running=\(counts.runningCount) queued=\(counts.queuedCount) receipt=\(counts.receiptCount) groups=\(appModel.orchestraProjectGroups.count) notice=\(appModel.orchestraNoticeText)\n", stderr)
+            exit(1)
+        }
+        window.setContentSize(NSSize(width: 820, height: 580))
+        window.contentView?.layoutSubtreeIfNeeded()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+        let measuredWidth = window.contentView?.bounds.width ?? 0
+        guard abs(measuredWidth - 820) < 2, abs(appModel.windowWidth - measuredWidth) < 2 else {
+            fputs("UI_SMOKE_TEST_FAIL: actual width=\(measuredWidth), model=\(appModel.windowWidth)\n", stderr)
+            exit(1)
+        }
+        print("UI_GEOMETRY_OK actual_width=\(measuredWidth) model_width=\(appModel.windowWidth)")
+        appModel.selectOrchestraTask("task-103")
+        guard appModel.isCompactWidth, appModel.isCompactTaskDetailPresented else {
+            fputs("UI_SMOKE_TEST_FAIL: compact width collapse failed at 820x580\n", stderr)
+            exit(1)
+        }
+        appModel.dismissCompactTaskDetail()
+        window.setContentSize(NSSize(width: 1100, height: 760))
+        window.contentView?.layoutSubtreeIfNeeded()
+        RunLoop.current.run(until: Date().addingTimeInterval(0.2))
+        for tab in HelperSettingsTab.allCases {
+            appModel.openSettingsWindow(tab: tab)
+            guard appModel.selectedSettingsTab == tab else {
+                fputs("UI_SMOKE_TEST_FAIL: settings tab switch failed for \(tab.rawValue)\n", stderr)
+                exit(1)
+            }
+        }
+        handleToolbarSettings()
+        let settingsWindows = NSApp.windows.filter { win in
+            win !== window && win.isVisible && (
+                win.identifier?.rawValue.contains("Settings") == true ||
+                win.title.contains("设置") ||
+                win.title.contains("Settings")
+            )
+        }
+        guard settingsWindows.count <= 1 else {
+            fputs("UI_SMOKE_TEST_FAIL: duplicate settings windows found (\(settingsWindows.count))\n", stderr)
+            exit(1)
+        }
+        print("UI_SMOKE_TEST_OK toolbar_items=\(toolbar.items.count) destinations=4 settings_tabs=3 settings_windows=\(settingsWindows.count) running=\(counts.runningCount) queued=\(counts.queuedCount) receipt=\(counts.receiptCount)")
+        fflush(stdout)
+        exit(0)
+    }
 }
 
 let args = CommandLine.arguments
@@ -2117,9 +2585,10 @@ func argument(_ name: String) -> String? {
 }
 let fixture = (argument("--fixture") ?? ProcessInfo.processInfo.environment["CODEX_HELPER_FIXTURE"]).map { URL(fileURLWithPath: $0) }
 let directory = resolveHelperStateDirectory(arguments: args, environment: ProcessInfo.processInfo.environment)
+AppBootstrapConfig.shared.fixture = fixture
+AppBootstrapConfig.shared.directory = directory
+AppBootstrapConfig.shared.uiSmokeTest = args.contains("--ui-smoke-test")
 let app = NSApplication.shared
 if fixture != nil, ProcessInfo.processInfo.environment["CODEX_HELPER_TEST_APPEARANCE"] == "dark" { app.appearance = NSAppearance(named: .darkAqua) }
 app.setActivationPolicy(.regular)
-let delegate = Assistant(fixture: fixture, directory: directory)
-app.delegate = delegate
-app.run()
+CodexHelperSwiftUIApp.main()

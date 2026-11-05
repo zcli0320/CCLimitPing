@@ -226,6 +226,28 @@ enum Tests {
         precondition(resolveHelperStateDirectory(arguments: ["app"], environment: ["CODEX_HELPER_TEST_HOME": "/tmp/test-home"], defaultHome: defaultHome).path == "/tmp/test-home/Library/Application Support/CodexHelper-AccountPreview")
         precondition(resolveHelperStateDirectory(arguments: ["app"], environment: ["CODEX_HELPER_NATIVE_ACCOUNTS_DIR": "/tmp/iso/accounts"], defaultHome: defaultHome).path == "/tmp/iso/ui-state")
         precondition(resolveHelperStateDirectory(arguments: ["app"], environment: ["CODEX_HELPER_ORCHESTRA_DIR": "/tmp/iso/orchestra"], defaultHome: defaultHome).path == "/tmp/iso/ui-state")
+        var navState = SelectionState()
+        precondition(navState.selectedDestination == .overview, "First launch must default to overview destination")
+        precondition(NavigationDestination.allCases.map(\.title) == ["概览", "账号与额度", "会话与续跑", "项目协作"])
+        precondition(NavigationDestination.allCases.map(\.symbol) == ["rectangle.grid.2x2", "person.2", "bubble.left.and.bubble.right", "folder"])
+        precondition(HelperSettingsTab.allCases.map(\.title) == ["通用", "启动与恢复", "协作"])
+        precondition(!NavigationDestination.overview.canCreateTaskCommand && NavigationDestination.projects.canCreateTaskCommand)
+        precondition(!NavigationDestination.accounts.canCreateProjectCommand && NavigationDestination.projects.canCreateProjectCommand)
+        precondition(!NavigationDestination.projects.canFocusSearchCommand && NavigationDestination.sessions.canFocusSearchCommand)
+        navState.select("session-1")
+        for dest in NavigationDestination.allCases {
+            navState.selectDestination(dest)
+            precondition(!navState.observing && navState.selectedKey == "session-1" && !navState.agyGuardLaunchEnabled,
+                         "Destination switching must never enable automation or alter selected session")
+        }
+        navState.selectDestination(.projects)
+        navState.toggleObservation()
+        try store.save(navState)
+        let restoredNav = store.load()
+        precondition(restoredNav.selectedDestination == .projects && !restoredNav.observing && restoredNav.selectedKey == "session-1",
+                     "Restoring persisted destination must preserve destination without enabling observation")
+        try Data("{\"selectedKey\":\"legacy\",\"selectedDestination\":\"invalid\"}".utf8).write(to: store.file)
+        precondition(store.load().selectedDestination == .overview, "Invalid or legacy destination must fall back to overview")
         print("Selection, persistence and bridge checks passed")
     }
 }

@@ -85,6 +85,14 @@ import Cocoa
         if let idx = groups[0].tasks.firstIndex(where: { $0.id == "T2" }) {
             precondition(groups[0].tasks[idx + 1].id == "T2-review-1", "Review child task must be ordered directly after parent task")
         }
+        let counts = OrchestraTaskCounts(tasks: [reviewing, reviewed, reviewChild, unassignedTask])
+        precondition(counts.runningCount == 2 && counts.queuedCount == 1 && counts.receiptCount == 1 && counts.totalCount == 4,
+                     "queued tasks must never be counted as running (queued != running)")
+        precondition(unassignedTask.isQueued && !unassignedTask.isRunningOrReviewing)
+        precondition(unassignedTask.acceptDisabledReason != nil && unassignedTask.reworkDisabledReason != nil && unassignedTask.cancelDisabledReason == nil,
+                     "Disabled primary actions must expose clear disabled reasons")
+        precondition(unconfirmed.reworkDisabledReason?.contains("确认已停止") == true && unconfirmed.confirmStoppedDisabledReason == nil)
+        precondition(limited.resumeDisabledReason == nil && limited.acceptDisabledReason != nil)
         _ = NSApplication.shared
         let hostWin = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 960, height: 720), styleMask: [.titled], backing: .buffered, defer: false)
         let controller = OrchestraWindowController(executable: URL(fileURLWithPath: "/usr/bin/true"), hostWindow: hostWin)
@@ -96,6 +104,8 @@ import Cocoa
         controller.setEmbeddedActive(true)
         controller.selectSidebarScope(.project("p1"))
         precondition(controller.sidebarSelection == .project("p1"), "Selecting project scope must filter to p1")
+        controller.triggerSelectTask("T3")
+        precondition(controller.currentSelectedTask?.id == "T3", "Selecting task via adapter must update selected task")
         controller.selectSidebarScope(.unassigned)
         precondition(controller.sidebarSelection == .unassigned, "Selecting unassigned scope must filter to unassigned")
         hostWin.close()

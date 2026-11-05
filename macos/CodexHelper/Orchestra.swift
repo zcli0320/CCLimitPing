@@ -83,6 +83,66 @@ struct OrchestraTask: Decodable, Equatable {
     var canRework: Bool { (status == "receipt" || status == "failed" || status == "quota_exhausted") && unconfirmed != true }
     var canResume: Bool { status == "quota_exhausted" && !(session ?? "").isEmpty && unconfirmed != true }
     var canConfirmStopped: Bool { unconfirmed == true }
+    var boundSessionOrConversationID: String {
+        let s = (session ?? "").trimmingCharacters(in: .whitespacesAndNewlines)
+        return s.isEmpty ? (progress?.conversation_id ?? "").trimmingCharacters(in: .whitespacesAndNewlines) : s
+    }
+    var canCheckpointResume: Bool { canRework && !boundSessionOrConversationID.isEmpty }
+    var isRunningOrReviewing: Bool { status == "running" || status == "reviewing" }
+    var isQueued: Bool { status == "queued" }
+    var isActionable: Bool {
+        status == "receipt" || status == "failed" || status == "quota_exhausted" || unconfirmed == true
+    }
+    var acceptDisabledReason: String? {
+        canAccept ? nil : "当前状态为「\(statusLabel)」，仅待验收、审查中或失败的任务可验收"
+    }
+    var reworkDisabledReason: String? {
+        if canRework { return nil }
+        if unconfirmed == true { return "原执行进程异常中断未确认停止：请先点击「确认已停止」后再返工" }
+        return "当前状态为「\(statusLabel)」，仅待验收、失败或额度耗尽的任务可返工"
+    }
+    var resumeDisabledReason: String? {
+        if canResume { return nil }
+        if unconfirmed == true { return "请先点击「确认已停止」确认原进程已退出" }
+        if status != "quota_exhausted" { return "仅「额度耗尽」状态的任务可使用同会话额度恢复继续" }
+        return "该任务缺少已绑定的原会话 ID，请使用「返工」重新派发"
+    }
+    var cancelDisabledReason: String? {
+        canCancel ? nil : "当前状态为「\(statusLabel)」，仅排队中、执行中或审查中的任务可停止"
+    }
+    var confirmStoppedDisabledReason: String? {
+        canConfirmStopped ? nil : "仅异常中断且未确认退出的任务需要「确认已停止」"
+    }
+    var checkpointResumeDisabledReason: String? {
+        if canCheckpointResume { return nil }
+        if let reason = reworkDisabledReason { return reason }
+        return "该任务尚未绑定会话 ID，暂不可一键断点续跑"
+    }
+    var actionAvailabilitySummary: String {
+        if unconfirmed == true {
+            return "进程异常中断待确认：请先核查原进程已退出并点击「确认已停止」，之后才能返工或续跑。"
+        }
+        switch status {
+        case "queued":
+            return "任务在队列中等待执行器（排队中 ≠ 执行中）：可「停止」取消排队；待开始执行并交回回执后可验收或返工。"
+        case "running":
+            return "任务正在执行中：可「停止」中断运行；执行完成交回回执后可验收或返工。"
+        case "reviewing":
+            return "自动审查进行中：可直接「验收」或「停止」（一并取消审查子任务）；审查结束前暂不可返工。"
+        case "receipt":
+            return "已交回回执待验收：可「验收」通过或「返工」修改；因已非运行态，「停止」与「额度恢复继续」不可用。"
+        case "failed":
+            return "任务执行失败：可「返工」（或有绑定会话时「一键断点续跑」）重试，也可直接「验收」归档。"
+        case "quota_exhausted":
+            return "因额度耗尽暂停：有会话记录时可「继续」或「返工」；任务尚未完成故不可直接「验收」。"
+        case "accepted":
+            return "任务已验收完成：停止、验收、返工与继续操作均已禁用。"
+        case "cancelled":
+            return "任务已取消：停止、验收、返工与继续操作均已禁用。"
+        default:
+            return "请根据当前状态「\(statusLabel)」选择可用操作。"
+        }
+    }
     var lastResult: String {
         if let r = runs?.last?.receipt, !r.isEmpty { return r }
         if let e = runs?.last?.error, !e.isEmpty { return e }
@@ -133,6 +193,22 @@ struct OrchestraTask: Decodable, Equatable {
             lines.append("最近动作：" + actions.joined(separator: " → "))
         }
         return lines.joined(separator: "\n")
+    }
+}
+
+struct OrchestraTaskCounts: Equatable {
+    let runningCount: Int
+    let queuedCount: Int
+    let receiptCount: Int
+    let actionableCount: Int
+    let totalCount: Int
+
+    init(tasks: [OrchestraTask]) {
+        runningCount = tasks.filter { $0.isRunningOrReviewing }.count
+        queuedCount = tasks.filter { $0.isQueued }.count
+        receiptCount = tasks.filter { $0.status == "receipt" }.count
+        actionableCount = tasks.filter { $0.isActionable }.count
+        totalCount = tasks.count
     }
 }
 
@@ -342,6 +418,8 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
     var onSummaryChanged: ((Int, Int, Int, Bool, Bool) -> Void)?
     var onNavigateHome: (() -> Void)?
     var onSelectSidebarScope: (() -> Void)?
+    var onStateChanged: (() -> Void)?
+    var isFixtureMode = false
     private(set) var sidebarSelection: OrchestraSidebarSelection = .all
     private(set) var isEmbeddedActive = false
     private let sidebarTable = NSTableView()
@@ -676,6 +754,10 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
 
     func setEmbeddedActive(_ active: Bool) {
         isEmbeddedActive = active
+        guard !isFixtureMode else {
+            onStateChanged?()
+            return
+        }
         syncSidebarSelectionRows()
         if active {
             layoutContent()
@@ -687,6 +769,7 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
     }
 
     func startBackgroundRefresh() {
+        guard !isFixtureMode else { return }
         refresh(force: true)
         if timer == nil {
             timer = Timer.scheduledTimer(withTimeInterval: 4, repeats: true) { [weak self] _ in self?.refresh(force: true) }
@@ -798,13 +881,12 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
         ]
         for p in projects {
             let pTasks = allTasks.filter { $0.project == p.id }
-            let active = pTasks.filter { $0.status == "running" || $0.status == "reviewing" || $0.status == "queued" }.count
-            let receipt = pTasks.filter { $0.status == "receipt" }.count
-            rows.append(OrchestraSidebarRowItem(.projectItem(p, activeCount: active, receiptCount: receipt, totalCount: pTasks.count)))
+            let counts = OrchestraTaskCounts(tasks: pTasks)
+            rows.append(OrchestraSidebarRowItem(.projectItem(p, activeCount: counts.runningCount, receiptCount: counts.receiptCount, totalCount: counts.totalCount)))
         }
         let unassignedTasks = allTasks.filter { ($0.project ?? "").isEmpty }
-        let unassignedActive = unassignedTasks.filter { $0.status == "running" || $0.status == "reviewing" || $0.status == "queued" }.count
-        rows.append(OrchestraSidebarRowItem(.filterUnassigned(activeCount: unassignedActive, totalCount: unassignedTasks.count)))
+        let unassignedCounts = OrchestraTaskCounts(tasks: unassignedTasks)
+        rows.append(OrchestraSidebarRowItem(.filterUnassigned(activeCount: unassignedCounts.runningCount, totalCount: unassignedCounts.totalCount)))
         sidebarItems = rows
         renderingSidebar = true
         sidebarTable.reloadData()
@@ -894,8 +976,8 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
             icon.contentTintColor = .systemIndigo
             icon.setContentHuggingPriority(.required, for: .horizontal)
             let lbl = Theme.text("全部项目与任务", size: 12.5, weight: .medium, wraps: false)
-            let active = allTasks.filter { $0.status == "running" || $0.status == "reviewing" || $0.status == "queued" }.count
-            let chip = StatusChip(active > 0 ? "\(active) 进行中" : "\(allTasks.count)", tint: active > 0 ? .systemBlue : .secondaryLabelColor)
+            let counts = OrchestraTaskCounts(tasks: allTasks)
+            let chip = StatusChip(counts.runningCount > 0 ? "\(counts.runningCount) 执行中" : (counts.queuedCount > 0 ? "\(counts.queuedCount) 排队中" : "\(counts.totalCount)"), tint: counts.runningCount > 0 ? .systemBlue : (counts.queuedCount > 0 ? .systemTeal : .secondaryLabelColor))
             let rowView = Theme.hstack([icon, lbl, Theme.flexible(), chip], spacing: 7)
             cell.addSubview(rowView); rowView.translatesAutoresizingMaskIntoConstraints = false
             NSLayoutConstraint.activate([
@@ -968,7 +1050,8 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
     }
 
     func testSidebarRowCount() -> Int { sidebarItems.count }
-    func testInjectProjects(_ list: [OrchestraProject], tasks: [OrchestraTask] = []) {
+    func testInjectProjects(_ list: [OrchestraProject], tasks: [OrchestraTask] = [], agents: [OrchestraAgent] = []) {
+        if !agents.isEmpty { self.agents = agents }
         projects = list
         allProjects = list
         allTasks = tasks
@@ -978,6 +1061,7 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
         projectFilter.selectItem(at: 0)
         rebuildSidebarItems()
         applyProjectFilter()
+        render(selectedTaskID: tasks.first?.id, selectedGroupKey: list.first.map { "project:" + $0.id })
     }
 
     private func command(_ arguments: [String], input: String? = nil) throws -> Data {
@@ -995,6 +1079,10 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
     }
 
     func refresh(force: Bool = false) {
+        guard !isFixtureMode else {
+            onStateChanged?()
+            return
+        }
         let visible = isEmbeddedActive || (rootView.window?.isVisible == true) || (window?.isVisible == true)
         guard (force || visible), !refreshing else { return }
         refreshing = true
@@ -1042,8 +1130,8 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
                         }
                     }
                     self.allTasks = tasks.sorted { $0.updated > $1.updated }
-                    let runningCount = self.allTasks.filter { $0.status == "running" || $0.status == "reviewing" || $0.status == "queued" }.count
-                    self.onSummaryChanged?(projects.count, self.allTasks.count, runningCount, status.active, status.paused == true)
+                    let counts = OrchestraTaskCounts(tasks: self.allTasks)
+                    self.onSummaryChanged?(projects.count, self.allTasks.count, counts.runningCount, status.active, status.paused == true)
                     self.rebuildSidebarItems()
                     self.applyProjectFilter()
                     self.render(selectedTaskID: selectedTaskID, selectedGroupKey: selectedGroupKey)
@@ -1136,9 +1224,12 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
         let paused = runnerStatus?.paused == true
         runnerStatusChip.text = runnerActive ? (paused ? "已暂停" : "执行器运行中") : "未运行"
         runnerStatusChip.tint = runnerActive ? (paused ? .systemOrange : .systemGreen) : .secondaryLabelColor
-        let runningCount = allTasks.filter { $0.status == "running" || $0.status == "reviewing" || $0.status == "queued" }.count
-        taskCountChip.text = runningCount > 0 ? "\(projects.count) 个项目 · \(tasks.count) 个任务（\(runningCount) 进行中）" : "\(projects.count) 个项目 · \(tasks.count) 个任务"
-        taskCountChip.tint = runningCount > 0 ? .systemBlue : .secondaryLabelColor
+        let counts = OrchestraTaskCounts(tasks: allTasks)
+        var countSummary = "\(projects.count) 个项目 · \(tasks.count) 个任务"
+        if counts.runningCount > 0 { countSummary += "（\(counts.runningCount) 执行中）" }
+        else if counts.queuedCount > 0 { countSummary += "（\(counts.queuedCount) 排队中）" }
+        taskCountChip.text = countSummary
+        taskCountChip.tint = counts.runningCount > 0 ? .systemBlue : (counts.queuedCount > 0 ? .systemTeal : .secondaryLabelColor)
         runnerLabel.stringValue = runnerActive ? ((runner?.isRunning == true) ? "执行器运行中（由本小助手启动）" : "检测到其他执行器正在运行") : "执行器未运行"
         if let status = runnerStatus, (settings.account == "desktop" && status.account == "Desktop") || (settings.account == "separate" && status.account == "独立账号") {
             runnerLabel.stringValue += "\n\(status.account ?? "账号") 五小时剩余：" + (status.remaining.map { String(format: "%.1f%%", $0) } ?? "未知") + (status.paused == true ? " · 已暂停：\(status.reason ?? "额度未知")" : "")
@@ -1319,6 +1410,7 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
             let fallback = "选择项目查看工作群配置，或选择任务查看任务卡与执行回执。"
             if details.string != fallback { details.string = fallback }
         }
+        onStateChanged?()
     }
 
     private var monitoredTaskCandidate: OrchestraTask? {
@@ -1462,15 +1554,17 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
                 return cell
             }
             if key == "status" {
-                let activeCount = grp.tasks.filter { $0.status == "running" || $0.status == "reviewing" || $0.status == "queued" }.count
-                let receiptCount = grp.tasks.filter { $0.status == "receipt" }.count
+                let grpCounts = OrchestraTaskCounts(tasks: grp.tasks)
                 let label: String
                 let tint: NSColor
-                if activeCount > 0 {
-                    label = "\(activeCount) 进行中"
+                if grpCounts.runningCount > 0 {
+                    label = "\(grpCounts.runningCount) 执行中"
                     tint = .systemBlue
-                } else if receiptCount > 0 {
-                    label = "\(receiptCount) 待验收"
+                } else if grpCounts.queuedCount > 0 {
+                    label = "\(grpCounts.queuedCount) 排队中"
+                    tint = .systemTeal
+                } else if grpCounts.receiptCount > 0 {
+                    label = "\(grpCounts.receiptCount) 待验收"
                     tint = .systemTeal
                 } else {
                     label = "\(grp.tasks.count) 个任务"
@@ -2120,6 +2214,151 @@ final class OrchestraWindowController: NSWindowController, NSWindowDelegate, NSO
                 })
             }
         }
+    }
+
+    // MARK: - SwiftUI Adapter Accessors & Action Triggers
+    var currentAgents: [OrchestraAgent] { agents }
+    var currentProjects: [OrchestraProject] { projects }
+    var currentAllProjects: [OrchestraProject] { allProjects }
+    var currentAllTasks: [OrchestraTask] { allTasks }
+    var currentFilteredTasks: [OrchestraTask] { tasks }
+    var currentProjectGroups: [OrchestraProjectGroup] { groupItems.map(\.group) }
+    var currentCollapsedGroupKeys: Set<String> { collapsedGroupKeys }
+    var isRunnerActive: Bool { runnerActive }
+    var isOwnedRunnerRunning: Bool { runner?.isRunning == true }
+    var currentRunnerStatus: OrchestraRunnerStatus? { runnerStatus }
+    var currentSettings: OrchestraSettings { settings }
+    var currentLoginInfo: OrchestraLoginInfo? { loginInfo }
+    var isLoginBusy: Bool { loginBusy }
+    var isLoginCancelling: Bool { loginCancelling }
+    var currentLoginMessage: String { loginMessage.stringValue }
+    var currentLoginLabel: String { loginLabel.stringValue }
+    var currentLoginPath: String { loginPath.stringValue }
+    var isActionBusy: Bool { actionBusy }
+    var currentNotice: String { notice.stringValue }
+    var currentRunnerLabel: String { runnerLabel.stringValue }
+    var currentSelectedTask: OrchestraTask? { selected }
+    var currentSelectedGroup: OrchestraProjectGroup? { selectedGroup }
+    var currentActiveProject: OrchestraProject? { activeProject }
+    var currentMonitoredTask: OrchestraTask? { monitoredTaskCandidate }
+    var isEvidenceExpanded: Bool { showEvidence.state == .on }
+    var mcpConnectionText: String {
+        orchestraConnectionInstructions(executable: executable, stateDir: ProcessInfo.processInfo.environment["CODEX_HELPER_ORCHESTRA_DIR"])
+    }
+
+    func triggerSelectTask(_ taskID: String?) {
+        guard let tid = taskID, let tItem = taskItemsByID[tid] else {
+            renderingOutline = true
+            table.deselectAll(nil)
+            renderingOutline = false
+            updateButtons()
+            return
+        }
+        renderingOutline = true
+        if let parent = tItem.parent, !table.isItemExpanded(parent) {
+            collapsedGroupKeys.remove(parent.group.key)
+            table.expandItem(parent)
+        }
+        let row = table.row(forItem: tItem)
+        if row >= 0 { table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false) }
+        renderingOutline = false
+        updateButtons()
+    }
+
+    func triggerSelectGroup(_ groupKey: String?) {
+        guard let gKey = groupKey, let gItem = groupItemsByKey[gKey] else {
+            renderingOutline = true
+            table.deselectAll(nil)
+            renderingOutline = false
+            updateButtons()
+            return
+        }
+        renderingOutline = true
+        let row = table.row(forItem: gItem)
+        if row >= 0 { table.selectRowIndexes(IndexSet(integer: row), byExtendingSelection: false) }
+        renderingOutline = false
+        updateButtons()
+    }
+
+    func triggerToggleGroupCollapsed(_ groupKey: String) {
+        guard groupItems.count > 1, let gItem = groupItemsByKey[groupKey] else { return }
+        renderingOutline = true
+        if collapsedGroupKeys.contains(groupKey) {
+            collapsedGroupKeys.remove(groupKey)
+            table.expandItem(gItem)
+        } else {
+            collapsedGroupKeys.insert(groupKey)
+            table.collapseItem(gItem)
+        }
+        renderingOutline = false
+        onStateChanged?()
+    }
+
+    func triggerExpandAllGroups() { expandAllGroups(); onStateChanged?() }
+    func triggerCollapseAllGroups() { collapseAllGroups(); onStateChanged?() }
+    func triggerSetEvidenceExpanded(_ expanded: Bool) {
+        showEvidence.state = expanded ? .on : .off
+        updateButtons()
+    }
+    func triggerStartRunner() { startRunner() }
+    func triggerStopRunner() { stopRunnerAction() }
+    func triggerCreateProject() { createProject() }
+    func triggerEditProject() { editSelectedProject() }
+    func triggerArchiveProject() { archiveSelectedProject() }
+    func triggerRevealInFinder() { revealProjectFolder() }
+    func triggerOpenProjectRules() { openSelectedProjectRules() }
+    func triggerCreateTask() { createTask() }
+    func triggerAssignSelectedTask() { assignSelectedTaskToProject() }
+    func triggerAcceptSelectedTask() { acceptSelected() }
+    func triggerReworkSelectedTask() { reworkSelected() }
+    func triggerCheckpointResumeTask() { checkpointResumeSelected() }
+    func triggerResumeSelectedTask() { resumeSelected() }
+    func triggerCancelSelectedTask() { cancelSelected() }
+    func triggerConfirmStoppedSelectedTask() { confirmStoppedSelected() }
+    func triggerBeginLogin() { beginLogin() }
+    func triggerCancelLogin() { cancelLogin() }
+    func triggerConfirmLogout() { confirmLogout() }
+    func triggerCopyMCPInstructions() { copyMCPInstructions(); onStateChanged?() }
+    func triggerAckAutoSwitch() { ackAutoSwitch() }
+    func triggerSetAccountMode(_ mode: String) {
+        accountMode.selectItem(at: mode == "separate" ? 1 : 0)
+        changeAccountMode()
+    }
+    func triggerSetReworkLimit(_ limit: Int) {
+        reworkLimit.selectItem(at: max(0, min(2, limit)))
+        changeReworkLimit()
+    }
+    func triggerSetAutoSwitch(_ enabled: Bool) {
+        autoSwitch.state = enabled ? .on : .off
+        changeAutoSwitch()
+    }
+    func triggerSetAutoStartRunner(_ enabled: Bool) {
+        autoStartRunner.state = enabled ? .on : .off
+        changeAutoStartRunner()
+    }
+
+    func applyFixtureData(projects: [OrchestraProject], tasks: [OrchestraTask], agents: [OrchestraAgent], selectedTaskID: String?) {
+        self.isFixtureMode = true
+        self.timer?.invalidate()
+        self.timer = nil
+        self.notice.stringValue = ""
+        self.allProjects = projects
+        self.projects = projects.filter { $0.archived != true }
+        self.projectFilterBuilt = true
+        self.projectFilter.removeAllItems()
+        self.projectFilter.addItems(withTitles: ["全部项目与任务"] + self.projects.map { "\($0.name)（\($0.id)）" } + ["未归入项目"])
+        self.projectFilter.selectItem(at: 0)
+        self.sidebarSelection = .all
+        self.allTasks = tasks
+        self.agents = agents
+        self.runnerLabel.stringValue = "Fixture 离线模式（不启动真实执行器）"
+        self.loginLabel.stringValue = "Fixture 模拟账号（不读取真实账号）"
+        let counts = OrchestraTaskCounts(tasks: self.allTasks)
+        self.onSummaryChanged?(self.projects.count, self.allTasks.count, counts.runningCount, false, false)
+        self.rebuildSidebarItems()
+        self.applyProjectFilter()
+        self.render(selectedTaskID: selectedTaskID, selectedGroupKey: nil)
+        self.onStateChanged?()
     }
 }
 

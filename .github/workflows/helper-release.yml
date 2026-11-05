@@ -1,0 +1,33 @@
+name: Codex Helper release
+
+on:
+  push:
+    tags: ["codex-helper-v*"]
+
+permissions:
+  contents: write
+
+jobs:
+  macos-app:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Prepare Rust
+        run: rustup toolchain install stable --profile minimal
+      - name: Build native application
+        run: bash scripts/build-macos-helper.sh
+      - name: Package application
+        run: |
+          version="${GITHUB_REF_NAME#codex-helper-v}"
+          package="dist/CodexHelper-${version}-macos-$(uname -m).zip"
+          ditto -c -k --sequesterRsrc --keepParent "dist/Codex 小助手.app" "$package"
+          shasum -a 256 "$package" > "$package.sha256"
+      - name: Publish application
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" dist/CodexHelper-*.zip dist/CodexHelper-*.sha256 --title "Codex 小助手 0.5.0 / build 48" --notes-file docs/releases/codex-helper-0.5.0.md

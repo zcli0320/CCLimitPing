@@ -377,7 +377,74 @@ struct Snapshot: Decodable {
 
 // Observation is a separate concept from permission to switch accounts. The
 // first iteration has no execution adapter and can never grant that permission.
+enum NavigationDestination: String, Codable, CaseIterable, Identifiable {
+    case overview
+    case accounts
+    case sessions
+    case projects
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .overview: return "概览"
+        case .accounts: return "账号与额度"
+        case .sessions: return "会话与续跑"
+        case .projects: return "项目协作"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .overview: return "rectangle.grid.2x2"
+        case .accounts: return "person.2"
+        case .sessions: return "bubble.left.and.bubble.right"
+        case .projects: return "folder"
+        }
+    }
+
+    var shortcutKey: Character {
+        switch self {
+        case .overview: return "1"
+        case .accounts: return "2"
+        case .sessions: return "3"
+        case .projects: return "4"
+        }
+    }
+
+    var canCreateTaskCommand: Bool { self == .projects }
+    var canCreateProjectCommand: Bool { self == .projects }
+    var canFocusSearchCommand: Bool { self == .sessions }
+}
+
+enum HelperSettingsTab: String, Codable, CaseIterable, Identifiable {
+    case general
+    case launchAndRecovery
+    case collaboration
+
+    var id: String { rawValue }
+
+    var title: String {
+        switch self {
+        case .general: return "通用"
+        case .launchAndRecovery: return "启动与恢复"
+        case .collaboration: return "协作"
+        }
+    }
+
+    var symbol: String {
+        switch self {
+        case .general: return "gearshape"
+        case .launchAndRecovery: return "bolt.shield"
+        case .collaboration: return "person.2.badge.gearshape"
+        }
+    }
+
+    var systemImage: String { symbol }
+}
+
 struct SelectionState: Codable {
+    var selectedDestination: NavigationDestination = .overview
     var selectedKey: String?
     var observing = false
     var expandedProjects: [String] = []
@@ -390,9 +457,15 @@ struct SelectionState: Codable {
     var agyGuardLaunchEnabled = false
 
     init() {}
-    enum CodingKeys: String, CodingKey { case selectedKey, observing, expandedProjects, projectLayoutInitialized, activeScope, selectedByScope, initializedScopes, launchFolder, recentLaunchFolders, agyGuardLaunchEnabled }
+    enum CodingKeys: String, CodingKey { case selectedDestination, selectedKey, observing, expandedProjects, projectLayoutInitialized, activeScope, selectedByScope, initializedScopes, launchFolder, recentLaunchFolders, agyGuardLaunchEnabled }
     init(from decoder: Decoder) throws {
         let values = try decoder.container(keyedBy: CodingKeys.self)
+        if let rawDest = try values.decodeIfPresent(String.self, forKey: .selectedDestination),
+           let dest = NavigationDestination(rawValue: rawDest) {
+            selectedDestination = dest
+        } else {
+            selectedDestination = .overview
+        }
         selectedKey = try values.decodeIfPresent(String.self, forKey: .selectedKey)
         observing = try values.decodeIfPresent(Bool.self, forKey: .observing) ?? false
         expandedProjects = try values.decodeIfPresent([String].self, forKey: .expandedProjects) ?? []
@@ -404,6 +477,10 @@ struct SelectionState: Codable {
         launchFolder = try values.decodeIfPresent(String.self, forKey: .launchFolder)
         recentLaunchFolders = try values.decodeIfPresent([String].self, forKey: .recentLaunchFolders) ?? []
         agyGuardLaunchEnabled = try values.decodeIfPresent(Bool.self, forKey: .agyGuardLaunchEnabled) ?? false
+    }
+
+    mutating func selectDestination(_ destination: NavigationDestination) {
+        selectedDestination = destination
     }
 
     mutating func addRecentLaunchFolder(_ folder: String?) {
